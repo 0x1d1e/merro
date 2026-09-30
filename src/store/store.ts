@@ -56,6 +56,15 @@ export class MerroStore {
   }
 
   createWorkItem(item: WorkItem): void {
+    const hasBlockedMetadata = item.blockedReason !== null || item.blockedResumeState !== null;
+    if (item.state === "Blocked") {
+      if (item.blockedReason === null || item.blockedResumeState === null) {
+        throw new Error("Blocked WorkItem requires BlockReason and resume state");
+      }
+    } else if (hasBlockedMetadata) {
+      throw new Error("non-Blocked WorkItem cannot carry Blocked metadata");
+    }
+
     const timestamp = now();
     this.#db.prepare(`
       INSERT INTO work_items(
