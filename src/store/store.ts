@@ -1,5 +1,14 @@
 import { DatabaseSync } from "node:sqlite";
-import type { Objective, Project, TaskOutcome, TaskRole, WorkItem, WorkItemState } from "../domain/model.js";
+import type {
+  BlockReason,
+  FlowWorkItemState,
+  Objective,
+  Project,
+  TaskOutcome,
+  TaskRole,
+  WorkItem,
+  WorkItemState,
+} from "../domain/model.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
 import { MIGRATION_1, SCHEMA_VERSION } from "./schema.js";
 
@@ -51,8 +60,8 @@ export class MerroStore {
     this.#db.prepare(`
       INSERT INTO work_items(
         id, project_slug, source_type, source_ref, generation, state, priority,
-        ready_since, blocked_reason, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ready_since, blocked_reason, blocked_resume_state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       item.id,
       item.projectSlug,
@@ -63,6 +72,7 @@ export class MerroStore {
       item.priority,
       item.readySince,
       item.blockedReason,
+      item.blockedResumeState,
       timestamp,
       timestamp,
     );
@@ -87,20 +97,44 @@ export class MerroStore {
       state: row.state as WorkItemState,
       priority: row.priority as WorkItem["priority"],
       readySince: row.ready_since === null ? null : String(row.ready_since),
-      blockedReason: row.blocked_reason === null ? null : String(row.blocked_reason),
+      blockedReason: row.blocked_reason === null ? null : row.blocked_reason as BlockReason,
+      blockedResumeState: row.blocked_resume_state === null ? null : row.blocked_resume_state as FlowWorkItemState,
     };
   }
 
-  transitionWorkItem(id: string, to: WorkItemState, blockedReason: string | null = null): void {
+  transitionWorkItem(id: string, to: WorkItemState, blockedReason: BlockReason | null = null): void {
     const item = this.getWorkItem(id);
     if (!item) throw new Error(`unknown WorkItem: ${id}`);
-    assertWorkItemTransition(item.state, to);
-    const readySince = to === "Ready" && item.state !== "Ready" ? now() : item.readySince;
+
+    if (to === "Blocked" && blockedReason === null) {
+      throw new Error("Blocked WorkItem requires a BlockReason");
+    }
+    if (to !== "Blocked" && blockedReason !== null) {
+      throw new Error("BlockReason is only valid when entering or updating Blocked");
+    }
+
+    assertWorkItemTransition(item.state, to, item.blockedResumeState);
+
+    let nextBlockedReason: BlockReason | null = null;
+    let nextBlockedResumeState: FlowWorkItemState | null = null;
+    if (to === "Blocked") {
+      nextBlockedReason = blockedReason;
+      nextBlockedResumeState = item.state === "Blocked"
+        ? item.blockedResumeState
+        : item.state as FlowWorkItemState;
+      if (nextBlockedResumeState === null) {
+        throw new Error("Blocked WorkItem requires a resume state");
+      }
+    }
+
+    const readySince = to === "Ready" && item.state !== "Ready" && item.state !== "Blocked"
+      ? now()
+      : item.readySince;
     this.#db.prepare(`
       UPDATE work_items
-      SET state = ?, ready_since = ?, blocked_reason = ?, updated_at = ?
+      SET state = ?, ready_since = ?, blocked_reason = ?, blocked_resume_state = ?, updated_at = ?
       WHERE id = ?
-    `).run(to, readySince, blockedReason, now(), id);
+    `).run(to, readySince, nextBlockedReason, nextBlockedResumeState, now(), id);
   }
 
   createTask(input: { id: string; workItemId: string; role: TaskRole; attempt: number }): void {
