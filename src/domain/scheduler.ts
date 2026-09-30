@@ -35,30 +35,33 @@ function requirementsSatisfied(item: WorkItem, byId: ReadonlyMap<string, WorkIte
   return true;
 }
 
-function conflictFree(item: WorkItem, byId: ReadonlyMap<string, WorkItem>, relations: readonly Relation[]): boolean {
-  const activeStates = new Set(["Implementing", "Reviewing"]);
+function conflictsWithAny(itemId: string, peerIds: ReadonlySet<string>, relations: readonly Relation[]): boolean {
   for (const relation of relations) {
     if (relation.kind !== "Conflicts") continue;
-    const peer = relation.from === item.id ? relation.to : relation.to === item.id ? relation.from : null;
-    if (peer && activeStates.has(byId.get(peer)?.state ?? "")) return false;
+    const peer = relation.from === itemId ? relation.to : relation.to === itemId ? relation.from : null;
+    if (peer && peerIds.has(peer)) return true;
   }
-  return true;
+  return false;
 }
 
 export function schedule(input: SchedulingInput): ScheduleResult {
   const relations = effectiveRelations(input.relations);
   const cycle = findRequiresCycle(relations);
-  if (cycle) return { selected: [], cycle };
-
   const byId = new Map(input.workItems.map((item) => [item.id, item]));
   const available = input.maxConcurrentTasks === "unlimited"
     ? Number.POSITIVE_INFINITY
     : Math.max(0, input.maxConcurrentTasks - input.activeTaskCount);
 
-  const selected = input.workItems
+  const activeIds = new Set(
+    input.workItems
+      .filter((item) => item.state === "Implementing" || item.state === "Reviewing")
+      .map((item) => item.id),
+  );
+
+  const candidates = input.workItems
     .filter((item) => item.state === "Ready")
     .filter((item) => requirementsSatisfied(item, byId, relations))
-    .filter((item) => conflictFree(item, byId, relations))
+    .filter((item) => !conflictsWithAny(item.id, activeIds, relations))
     .sort((left, right) => {
       const priority = priorityRank(left.priority) - priorityRank(right.priority);
       if (priority !== 0) return priority;
@@ -69,8 +72,16 @@ export function schedule(input: SchedulingInput): ScheduleResult {
       const ready = leftReady.localeCompare(rightReady);
       if (ready !== 0) return ready;
       return left.id.localeCompare(right.id);
-    })
-    .slice(0, available);
+    });
 
-  return { selected, cycle: null };
+  const selected: WorkItem[] = [];
+  const selectedIds = new Set<string>();
+  for (const candidate of candidates) {
+    if (selected.length >= available) break;
+    if (conflictsWithAny(candidate.id, selectedIds, relations)) continue;
+    selected.push(candidate);
+    selectedIds.add(candidate.id);
+  }
+
+  return { selected, cycle };
 }
