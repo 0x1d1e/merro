@@ -1,16 +1,12 @@
-import type { WorkItemState } from "./model.js";
-import { TERMINAL_WORK_ITEM_STATES } from "./model.js";
+import type { FlowWorkItemState, WorkItemState } from "./model.js";
+import { FLOW_WORK_ITEM_STATES, TERMINAL_WORK_ITEM_STATES } from "./model.js";
 
-const allowedTransitions: Readonly<Record<WorkItemState, ReadonlySet<WorkItemState>>> = {
+const allowedTransitions: Readonly<Record<FlowWorkItemState, ReadonlySet<WorkItemState>>> = {
   Planned: new Set(["Ready", "Blocked", "Obsolete", "Cancelled"]),
   Ready: new Set(["Implementing", "Blocked", "Obsolete", "Cancelled"]),
   Implementing: new Set(["Reviewing", "Blocked"]),
   Reviewing: new Set(["Implementing", "AwaitingMerge", "Blocked"]),
   AwaitingMerge: new Set(["Done", "Blocked"]),
-  Blocked: new Set(["Planned", "Ready", "Implementing", "Reviewing", "AwaitingMerge", "Obsolete", "Cancelled"]),
-  Done: new Set(),
-  Obsolete: new Set(),
-  Cancelled: new Set(),
 };
 
 export class InvalidWorkItemTransitionError extends Error {
@@ -20,9 +16,23 @@ export class InvalidWorkItemTransitionError extends Error {
   }
 }
 
-export function assertWorkItemTransition(from: WorkItemState, to: WorkItemState): void {
+export function assertWorkItemTransition(
+  from: WorkItemState,
+  to: WorkItemState,
+  blockedResumeState: FlowWorkItemState | null = null,
+): void {
   if (from === to) return;
-  if (TERMINAL_WORK_ITEM_STATES.has(from) || !allowedTransitions[from].has(to)) {
+  if (TERMINAL_WORK_ITEM_STATES.has(from)) {
+    throw new InvalidWorkItemTransitionError(from, to);
+  }
+
+  if (from === "Blocked") {
+    if (to === "Obsolete" || to === "Cancelled") return;
+    if (blockedResumeState !== null && to === blockedResumeState) return;
+    throw new InvalidWorkItemTransitionError(from, to);
+  }
+
+  if (!FLOW_WORK_ITEM_STATES.has(from) || !allowedTransitions[from as FlowWorkItemState].has(to)) {
     throw new InvalidWorkItemTransitionError(from, to);
   }
 }
