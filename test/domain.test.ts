@@ -23,6 +23,10 @@ function requires(from: string, to: string): Relation {
   return { kind: "Requires", from, to, confidence: "explicit", rationale: "test", evidence: "test" };
 }
 
+function conflicts(left: string, right: string): Relation {
+  return { kind: "Conflicts", from: left, to: right, confidence: "high", rationale: "test", evidence: "test" };
+}
+
 test("terminal WorkItems cannot reactivate", () => {
   assert.throws(() => assertWorkItemTransition("Done", "Ready"), /invalid WorkItem transition/);
   assert.doesNotThrow(() => assertWorkItemTransition("Reviewing", "Implementing"));
@@ -65,13 +69,36 @@ test("scheduler orders priority, downstream unblock count, age, then ID", () => 
   assert.deepEqual(result.selected.map((entry) => entry.id), ["high-root", "high-leaf"]);
 });
 
-test("scheduler returns cycle instead of selecting work", () => {
+test("scheduler never selects conflicting Ready WorkItems together", () => {
   const result = schedule({
-    workItems: [item("a", "Ready"), item("b", "Ready")],
+    workItems: [
+      item("first", "Ready", "high", "2026-01-01T00:00:00Z"),
+      item("second", "Ready", "high", "2026-01-02T00:00:00Z"),
+    ],
+    relations: [conflicts("first", "second")],
+    activeTaskCount: 0,
+    maxConcurrentTasks: 2,
+  });
+  assert.deepEqual(result.selected.map((entry) => entry.id), ["first"]);
+});
+
+test("scheduler blocks a conflict against an already active WorkItem", () => {
+  const result = schedule({
+    workItems: [item("ready", "Ready"), item("active", "Implementing")],
+    relations: [conflicts("ready", "active")],
+    activeTaskCount: 1,
+    maxConcurrentTasks: 2,
+  });
+  assert.deepEqual(result.selected, []);
+});
+
+test("Requires cycle does not stall unrelated Ready work", () => {
+  const result = schedule({
+    workItems: [item("a", "Ready"), item("b", "Ready"), item("unrelated", "Ready")],
     relations: [requires("a", "b"), requires("b", "a")],
     activeTaskCount: 0,
     maxConcurrentTasks: 3,
   });
-  assert.equal(result.selected.length, 0);
+  assert.deepEqual(result.selected.map((entry) => entry.id), ["unrelated"]);
   assert.ok(result.cycle);
 });
