@@ -33,6 +33,13 @@ test("terminal WorkItems cannot reactivate", () => {
   assert.doesNotThrow(() => assertWorkItemTransition("AwaitingMerge", "Done"));
 });
 
+test("active WorkItems cannot become Obsolete before their Task finishes", () => {
+  assert.throws(() => assertWorkItemTransition("Implementing", "Obsolete"), /invalid WorkItem transition/);
+  assert.throws(() => assertWorkItemTransition("Reviewing", "Obsolete"), /invalid WorkItem transition/);
+  assert.throws(() => assertWorkItemTransition("AwaitingMerge", "Obsolete"), /invalid WorkItem transition/);
+  assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Obsolete"));
+});
+
 test("Conflicts are canonicalized symmetrically", () => {
   const relation = normalizeRelation({ kind: "Conflicts", from: "z", to: "a", confidence: "high", rationale: "x", evidence: "x" });
   assert.equal(relation.from, "a");
