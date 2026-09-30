@@ -45,6 +45,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS work_items_one_live_generation
 ON work_items(project_slug, source_type, source_ref)
 WHERE state NOT IN ('Done', 'Obsolete', 'Cancelled');
 
+CREATE TRIGGER IF NOT EXISTS terminal_work_items_core_immutable_update
+BEFORE UPDATE ON work_items
+WHEN OLD.state IN ('Done', 'Obsolete', 'Cancelled')
+  AND (
+    NEW.id IS NOT OLD.id
+    OR NEW.project_slug IS NOT OLD.project_slug
+    OR NEW.source_type IS NOT OLD.source_type
+    OR NEW.source_ref IS NOT OLD.source_ref
+    OR NEW.generation IS NOT OLD.generation
+    OR NEW.state IS NOT OLD.state
+    OR NEW.priority IS NOT OLD.priority
+    OR NEW.ready_since IS NOT OLD.ready_since
+    OR NEW.blocked_reason IS NOT OLD.blocked_reason
+    OR NEW.created_at IS NOT OLD.created_at
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'terminal WorkItem core fields are immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS objective_work_items (
   objective_id TEXT NOT NULL REFERENCES objectives(id),
   work_item_id TEXT NOT NULL REFERENCES work_items(id),
