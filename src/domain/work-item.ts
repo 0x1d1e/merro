@@ -9,6 +9,10 @@ const allowedTransitions: Readonly<Record<FlowWorkItemState, ReadonlySet<WorkIte
   AwaitingMerge: new Set(["Done", "Blocked"]),
 };
 
+function isFlowWorkItemState(state: WorkItemState): state is FlowWorkItemState {
+  return FLOW_WORK_ITEM_STATES.has(state as FlowWorkItemState);
+}
+
 export class InvalidWorkItemTransitionError extends Error {
   constructor(from: WorkItemState, to: WorkItemState) {
     super(`invalid WorkItem transition: ${from} -> ${to}`);
@@ -32,7 +36,7 @@ export function assertWorkItemTransition(
     throw new InvalidWorkItemTransitionError(from, to);
   }
 
-  if (!FLOW_WORK_ITEM_STATES.has(from) || !allowedTransitions[from as FlowWorkItemState].has(to)) {
+  if (!isFlowWorkItemState(from) || !allowedTransitions[from].has(to)) {
     throw new InvalidWorkItemTransitionError(from, to);
   }
 }
