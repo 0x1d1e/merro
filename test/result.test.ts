@@ -24,6 +24,30 @@ test("successful implement result rejects failing command verification", () => {
   }), /failing verification/);
 });
 
+test("failed implement result requires commit and validates it", () => {
+  assert.throws(() => parseImplementResult({
+    task_id: "t1",
+    status: "failed",
+    summary: "could not finish",
+    reason: "verification failed",
+    verification: [],
+  }), /commit/);
+
+  const result = parseImplementResult({
+    task_id: "t1",
+    status: "failed",
+    summary: "could not finish",
+    commit: "abc",
+    reason: "verification failed",
+    verification: [],
+  });
+
+  assert.throws(
+    () => assertResultMatchesTask({ expectedTaskId: "t1", expectedCommit: "def", result }),
+    /commit mismatch/,
+  );
+});
+
 test("review pass cannot contain blocking findings", () => {
   assert.throws(() => parseReviewResult({
     task_id: "t2",
