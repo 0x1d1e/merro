@@ -95,6 +95,27 @@ function stringArray(value: unknown): string[] {
   return value.filter((entry): entry is string => typeof entry === "string");
 }
 
+function statusCheckNames(value: unknown): string[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+  const checks = value as Record<string, unknown>;
+  return [
+    ...stringArray(checks.contexts),
+    ...(Array.isArray(checks.checks)
+      ? checks.checks.flatMap((check) => {
+        if (typeof check !== "object" || check === null) return [];
+        const row = check as Record<string, unknown>;
+        const name = typeof row.context === "string" ? row.context : row.name;
+        return typeof name === "string" ? [name] : [];
+      })
+      : []),
+  ];
+}
+
+function isNotFound(error: unknown): boolean {
+  const text = error instanceof CommandError ? `${error.message} ${error.stderr}` : String(error);
+  return /\b404\b/i.test(text);
+}
+
 function parseRepository(value: unknown): GitHubRepository {
   const row = object(value, "gh repo view");
   const branch = object(row.defaultBranchRef, "gh repo view.defaultBranchRef");
@@ -131,11 +152,14 @@ function parseReview(value: unknown): GitHubReview {
   const author = typeof row.author === "object" && row.author !== null
     ? nullableString((row.author as Record<string, unknown>).login)
     : null;
+  const commitId = typeof row.commit === "object" && row.commit !== null
+    ? nullableString((row.commit as Record<string, unknown>).oid)
+    : nullableString(row.commit);
   return {
     author: author ?? "",
     state: typeof row.state === "string" ? row.state : "",
     submittedAt: nullableString(row.submittedAt),
-    commitId: nullableString(row.commit),
+    commitId,
   };
 }
 
@@ -275,38 +299,58 @@ export class GitHubClient {
 
   async branchProtection(project: Project): Promise<BranchPolicy> {
     const repository = await this.repository(project.baseRemote);
-    const path = `repos/${repository.nameWithOwner}/branches/${encodeURIComponent(project.defaultBranch)}/protection`;
+    const branch = encodeURIComponent(project.defaultBranch);
+    const classicPath = `repos/${repository.nameWithOwner}/branches/${branch}/protection`;
+    const rulesPath = `repos/${repository.nameWithOwner}/rules/branches/${branch}`;
+    let classicChecks: string[] = [];
+    let classicApprovals = 0;
+    let classicCodeOwners = false;
+
     try {
-      const result = await this.#commands.run("gh", ["api", path], { cwd: project.path });
+      const result = await this.#commands.run("gh", ["api", classicPath], { cwd: project.path });
       const row = object(parseJson(result.stdout, "gh api branch protection"), "gh api branch protection");
-      const statusChecks = row.required_status_checks;
-      const statusCheckObject = typeof statusChecks === "object" && statusChecks !== null
-        ? statusChecks as Record<string, unknown>
-        : {};
-      const requiredStatusChecks = [
-        ...stringArray(statusCheckObject.contexts),
-        ...(Array.isArray(statusCheckObject.checks)
-          ? statusCheckObject.checks.flatMap((check) => {
-            if (typeof check !== "object" || check === null) return [];
-            const name = (check as Record<string, unknown>).context;
-            return typeof name === "string" ? [name] : [];
-          })
-          : []),
-      ];
-      const pullRequestReview = typeof row.required_pull_request_reviews === "object" && row.required_pull_request_reviews !== null
+      classicChecks = statusCheckNames(row.required_status_checks);
+      const reviews = typeof row.required_pull_request_reviews === "object" && row.required_pull_request_reviews !== null
         ? row.required_pull_request_reviews as Record<string, unknown>
         : {};
+      classicApprovals = typeof reviews.required_approving_review_count === "number"
+        ? reviews.required_approving_review_count
+        : 0;
+      classicCodeOwners = reviews.require_code_owner_reviews === true;
+    } catch (error) {
+      if (!isNotFound(error)) return { known: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+
+    try {
+      const result = await this.#commands.run("gh", ["api", rulesPath], { cwd: project.path });
+      const rules = parseJson(result.stdout, "gh api branch rules");
+      if (!Array.isArray(rules)) throw new Error("gh api branch rules returned a non-array value");
+      const requiredStatusChecks = [...classicChecks];
+      let requiredApprovingReviewCount = classicApprovals;
+      let requireCodeOwnerReviews = classicCodeOwners;
+      for (const value of rules) {
+        const rule = object(value, "gh api branch rule");
+        const parameters = typeof rule.parameters === "object" && rule.parameters !== null
+          ? rule.parameters as Record<string, unknown>
+          : {};
+        if (rule.type === "required_status_checks") {
+          requiredStatusChecks.push(...statusCheckNames({ checks: parameters.required_status_checks }));
+        } else if (rule.type === "pull_request") {
+          if (typeof parameters.required_approving_review_count === "number") {
+            requiredApprovingReviewCount = Math.max(requiredApprovingReviewCount, parameters.required_approving_review_count);
+          }
+          requireCodeOwnerReviews ||= parameters.require_code_owner_review === true
+            || parameters.require_code_owner_reviews === true;
+        }
+      }
       return {
         known: true,
         requiredStatusChecks: [...new Set(requiredStatusChecks)],
-        requiredApprovingReviewCount: typeof pullRequestReview.required_approving_review_count === "number"
-          ? pullRequestReview.required_approving_review_count
-          : 0,
-        requireCodeOwnerReviews: pullRequestReview.require_code_owner_reviews === true,
+        requiredApprovingReviewCount,
+        requireCodeOwnerReviews,
       };
     } catch (error) {
-      const reason = error instanceof CommandError ? error.message : String(error);
-      return { known: false, reason };
+      return { known: false, reason: error instanceof Error ? error.message : String(error) };
     }
   }
 

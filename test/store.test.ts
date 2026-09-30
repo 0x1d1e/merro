@@ -41,8 +41,10 @@ test("store enforces one active Task per WorkItem and immutable finalization", (
     store.createWorkItem({ id: "w", projectSlug: "p", sourceType: "local", sourceRef: "w", generation: 1, state: "Implementing", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
     store.createTask({ id: "t1", workItemId: "w", role: "implement", attempt: 1 });
     assert.throws(() => store.createTask({ id: "t2", workItemId: "w", role: "review", attempt: 1 }));
+    assert.throws(() => store.transitionWorkItem("w", "Obsolete"), /active Task/);
     store.finalizeTask({ id: "t1", outcome: "success", summary: "done", resultJson: "{}", commitSha: "abc" });
     assert.equal(store.getTask("t1")?.outcome, "success");
+    store.transitionWorkItem("w", "Obsolete");
     assert.throws(() => store.finalizeTask({ id: "t1", outcome: "failed", summary: "changed", resultJson: "{}" }), /already finalized/);
   } finally {
     store.close();

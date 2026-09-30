@@ -4,9 +4,9 @@ import { FLOW_WORK_ITEM_STATES, TERMINAL_WORK_ITEM_STATES } from "./model.js";
 const allowedTransitions: Readonly<Record<FlowWorkItemState, ReadonlySet<WorkItemState>>> = {
   Planned: new Set(["Ready", "Blocked", "Obsolete", "Cancelled"]),
   Ready: new Set(["Planned", "Implementing", "Blocked", "Obsolete", "Cancelled"]),
-  Implementing: new Set(["Reviewing", "Blocked"]),
-  Reviewing: new Set(["Implementing", "AwaitingMerge", "Blocked"]),
-  AwaitingMerge: new Set(["Reviewing", "Done", "Blocked"]),
+  Implementing: new Set(["Reviewing", "Blocked", "Obsolete"]),
+  Reviewing: new Set(["Implementing", "AwaitingMerge", "Blocked", "Obsolete"]),
+  AwaitingMerge: new Set(["Implementing", "Reviewing", "Done", "Blocked", "Obsolete"]),
 };
 
 function isFlowWorkItemState(state: WorkItemState): state is FlowWorkItemState {

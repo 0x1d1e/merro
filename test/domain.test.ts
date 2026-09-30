@@ -34,11 +34,12 @@ test("terminal WorkItems cannot reactivate", () => {
   assert.doesNotThrow(() => assertWorkItemTransition("AwaitingMerge", "Done"));
 });
 
-test("active WorkItems cannot become Obsolete before their Task finishes", () => {
-  assert.throws(() => assertWorkItemTransition("Implementing", "Obsolete"), /invalid WorkItem transition/);
-  assert.throws(() => assertWorkItemTransition("Reviewing", "Obsolete"), /invalid WorkItem transition/);
-  assert.throws(() => assertWorkItemTransition("AwaitingMerge", "Obsolete"), /invalid WorkItem transition/);
+test("unfinished WorkItems can become Obsolete when no Objective owns them", () => {
+  assert.doesNotThrow(() => assertWorkItemTransition("Implementing", "Obsolete"));
+  assert.doesNotThrow(() => assertWorkItemTransition("Reviewing", "Obsolete"));
+  assert.doesNotThrow(() => assertWorkItemTransition("AwaitingMerge", "Obsolete"));
   assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Obsolete"));
+  assert.doesNotThrow(() => assertWorkItemTransition("AwaitingMerge", "Implementing"));
 });
 
 test("Blocked WorkItems resume only to their persisted previous flow state", () => {

@@ -546,6 +546,13 @@ export class MerroStore {
     }
   }
 
+  hasActiveObjectiveForWorkItem(workItemId: string): boolean {
+    return this.#db.prepare(`
+      SELECT 1 FROM objective_work_items ow JOIN objectives o ON o.id = ow.objective_id
+      WHERE ow.work_item_id = ? AND o.state = 'Active' LIMIT 1
+    `).get(workItemId) !== undefined;
+  }
+
   getWorkItem(id: string): WorkItem | null {
     const row = this.#db.prepare(`
       SELECT w.*, s.guidance FROM work_items w
@@ -567,6 +574,9 @@ export class MerroStore {
     }
 
     assertWorkItemTransition(item.state, to, item.blockedResumeState);
+    if (to === "Obsolete" && this.activeTask(id)) {
+      throw new Error(`cannot obsolete WorkItem with an active Task: ${id}`);
+    }
 
     let nextBlockedReason: BlockReason | null = null;
     let nextBlockedResumeState: FlowWorkItemState | null = null;
@@ -688,9 +698,34 @@ export class MerroStore {
     return Object.fromEntries(tables.map((table) => [table, this.#db.prepare(`SELECT * FROM ${table}`).all()]));
   }
 
-  stopActiveObjectives(): number {
-    const result = this.#db.prepare("UPDATE objectives SET state = 'Stopped', updated_at = ? WHERE state = 'Active'").run(now());
-    return Number(result.changes);
+  stopActiveObjectives(objectiveId?: string): number {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const requested = objectiveId === undefined ? null : this.getObjective(objectiveId);
+      if (objectiveId !== undefined && !requested) throw new Error(`unknown Objective: ${objectiveId}`);
+      const objectives = requested
+        ? requested.state === "Active" ? [requested] : []
+        : this.listObjectives().filter((objective) => objective.state === "Active");
+      const affectedWorkItemIds = new Set(objectives.flatMap((objective) =>
+        this.listWorkItems(objective.id).map((item) => item.id),
+      ));
+      for (const objective of objectives) this.setObjectiveState(objective.id, "Stopped");
+
+      for (const workItemId of affectedWorkItemIds) {
+        const item = this.getWorkItem(workItemId);
+        if (!item || item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled"
+          || this.activeTask(item.id) || this.hasActiveObjectiveForWorkItem(item.id)) continue;
+        this.transitionWorkItem(item.id, "Obsolete");
+        for (const decision of this.pendingDecisions()) {
+          if (decision.kind === "merge" && decision.subjectId === item.id) this.resolveDecision(decision.id, "resolved");
+        }
+      }
+      this.#db.exec("COMMIT");
+      return objectives.length;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   appendEvent(entityType: string, entityId: string, eventType: string, payload: unknown): void {

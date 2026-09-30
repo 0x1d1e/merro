@@ -58,10 +58,13 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
   });
 
   pi.registerCommand("stop", {
-    description: "Soft-stop active Merro objectives",
-    async handler(_args, ctx) {
-      const stopped = await withStore(cwd, (store) => store.stopActiveObjectives());
-      report(ctx, `Stopped ${stopped} active objective(s). Active Tasks are not killed.`);
+    description: "Soft-stop active Merro objectives, optionally by Objective ID",
+    async handler(args, ctx) {
+      const objectiveId = args.trim() || undefined;
+      const stopped = main
+        ? await main.stopObjectives(objectiveId)
+        : await withStore(cwd, (store) => store.stopActiveObjectives(objectiveId));
+      report(ctx, `Stopped ${stopped} active objective(s). Exclusive unfinished WorkItems are obsolete; active Tasks are not killed.`);
     },
   });
 

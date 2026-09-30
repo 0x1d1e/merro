@@ -51,11 +51,11 @@ function sourceId(projectSlug: string, number: number, generation: number): stri
   return `${projectSlug}:issue-${number}:g${generation}`;
 }
 
-function branchName(issue: GitHubIssue): string {
+function branchName(issue: GitHubIssue, generation: number): string {
   const kind = issue.labels.some((label) => /bug|defect/i.test(label)) ? "fix"
     : issue.labels.some((label) => /feature|enhancement/i.test(label)) ? "feat" : "chore";
   const slug = issue.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 44) || "work";
-  return `${kind}/${slug}-${issue.number}`;
+  return `${kind}/${slug}-${issue.number}-g${generation}`;
 }
 
 function verificationText(entries: readonly Verification[]): string {
@@ -72,6 +72,15 @@ function issueBody(item: WorkItem, summary: string, verification: string): strin
 
 function terminal(item: WorkItem): boolean {
   return item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled";
+}
+
+function requiredCheckFailed(pullRequest: GitHubPullRequest, policy: BranchPolicy): boolean {
+  if (!policy.known) return false;
+  const failures = new Set(["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE"]);
+  return policy.requiredStatusChecks.some((name) => pullRequest.checks.some((check) =>
+    check.name === name
+      && (failures.has(check.state.toUpperCase()) || (check.conclusion !== null && failures.has(check.conclusion.toUpperCase()))),
+  ));
 }
 
 function satisfiesBranchPolicy(pullRequest: GitHubPullRequest, policy: BranchPolicy): boolean {
@@ -227,6 +236,12 @@ export class MainOrchestrator {
     });
   }
 
+  async stopObjectives(objectiveId?: string): Promise<number> {
+    const stopped = await this.#withStore((store) => store.stopActiveObjectives(objectiveId));
+    await this.runPass();
+    return stopped;
+  }
+
   async continueWorkItem(workItemId: string): Promise<void> {
     await this.#withStore((store) => {
       const item = store.getWorkItem(workItemId);
@@ -332,7 +347,7 @@ export class MainOrchestrator {
       const active = tasks.filter((task) => task.status === "active");
       const items = store.listWorkItems();
       const result = schedule({
-        workItems: items,
+        workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id)),
         relations: store.listRelations(),
         activeTaskCount: active.length,
         activeWorkItemIds: active.map((task) => task.workItemId),
@@ -376,7 +391,7 @@ export class MainOrchestrator {
     try {
       if (!runtime.clonePath || !runtime.branchName) {
         const issue = await this.#github.issue(project, Number(item.sourceRef));
-        const branch = branchName(issue);
+        const branch = branchName(issue, item.generation);
         const clonePath = join(this.#workRoot, project.slug, item.id);
         const clone = await this.#git.createWorkItemClone(project, clonePath, branch);
         runtime = { ...runtime, branchName: clone.branchName, clonePath: clone.path, baseCommit: clone.baseCommit };
@@ -500,14 +515,17 @@ export class MainOrchestrator {
         text = await readFile(runtime.resultPath, "utf8");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-          this.#block(store, item, "task_failed", `Cannot read Task result: ${errorText(error)}`);
           store.finalizeTask({ id: task.id, outcome: "failed", summary: "Invalid result file", resultJson: JSON.stringify({ error: errorText(error) }) });
+          if (!this.#obsoleteIfUnowned(store, item)) {
+            this.#block(store, item, "task_failed", `Cannot read Task result: ${errorText(error)}`);
+          }
           continue;
         }
         const presence = await this.#workers.inspect(runtime, task.id);
         if (presence.alive && presence.identityMatches) continue;
         const reason = presence.reason ?? "worker exited without a result";
         store.finalizeTask({ id: task.id, outcome: "failed", summary: reason, resultJson: JSON.stringify({ taskId: task.id, reason }) });
+        if (this.#obsoleteIfUnowned(store, item)) continue;
         if (presence.alive && !presence.identityMatches) {
           this.#block(store, item, "task_failed", `Worker identity check failed: ${reason}`);
           continue;
@@ -539,8 +557,10 @@ export class MainOrchestrator {
           result = reviewResult;
         }
       } catch (error) {
-        this.#block(store, item, "task_failed", `Task result validation failed: ${errorText(error)}`);
         store.finalizeTask({ id: task.id, outcome: "failed", summary: "Task result validation failed", resultJson: text });
+        if (!this.#obsoleteIfUnowned(store, item)) {
+          this.#block(store, item, "task_failed", `Task result validation failed: ${errorText(error)}`);
+        }
         continue;
       }
       await this.#consumeResult(store, item, task, result, runtime, workRuntime);
@@ -555,23 +575,26 @@ export class MainOrchestrator {
       const implementResult = result as ImplementSuccessResult | ImplementFailedResult;
       if (implementResult.status === "failed") {
         store.finalizeTask({ id: task.id, outcome: "failed", summary: implementResult.summary, resultJson: JSON.stringify(implementResult) });
-        this.#block(store, item, "task_failed", `${implementResult.reason}${implementResult.diagnostics ? `: ${implementResult.diagnostics}` : ""}`);
+        if (!this.#obsoleteIfUnowned(store, item)) {
+          this.#block(store, item, "task_failed", `${implementResult.reason}${implementResult.diagnostics ? `: ${implementResult.diagnostics}` : ""}`);
+        }
         return;
       }
       const typed = implementResult;
       store.finalizeTask({ id: task.id, outcome: "success", summary: typed.summary, resultJson: JSON.stringify(typed), commitSha: typed.commit });
-      store.transitionWorkItem(item.id, "Reviewing");
+      if (!this.#obsoleteIfUnowned(store, item)) store.transitionWorkItem(item.id, "Reviewing");
       return;
     }
 
     const reviewResult = result as ReviewResult | ReviewFailedResult;
     if (reviewResult.status === "failed") {
       store.finalizeTask({ id: task.id, outcome: "failed", summary: reviewResult.summary, resultJson: JSON.stringify(reviewResult), reviewedCommit: reviewResult.reviewed_commit });
-      this.#block(store, item, "task_failed", `${reviewResult.reason}`);
+      if (!this.#obsoleteIfUnowned(store, item)) this.#block(store, item, "task_failed", `${reviewResult.reason}`);
       return;
     }
     const review = reviewResult;
     store.finalizeTask({ id: task.id, outcome: review.status, summary: review.summary, resultJson: JSON.stringify(review), reviewedCommit: review.reviewed_commit });
+    if (this.#obsoleteIfUnowned(store, item)) return;
     if (review.status === "reject") {
       workRuntime.reviewRound += 1;
       store.saveWorkItemRuntime(workRuntime);
@@ -610,7 +633,7 @@ export class MainOrchestrator {
     for (let item of store.listWorkItems()) {
       const recovering = item.state === "Blocked"
         && item.blockedResumeState === "AwaitingMerge"
-        && (item.blockedReason === "github_unavailable" || item.blockedReason === "pr_closed");
+        && (item.blockedReason === "github_unavailable" || item.blockedReason === "policy_unknown");
       if (item.state !== "AwaitingMerge" && !recovering) continue;
       const runtime = store.getWorkItemRuntime(item.id);
       const project = store.getProject(item.projectSlug);
@@ -683,11 +706,25 @@ export class MainOrchestrator {
         }
         const policy = await this.#github.branchProtection(project);
         if (!policy.known) {
-          if (recovering) {
+          if (recovering && item.blockedReason !== "policy_unknown") {
             store.transitionWorkItem(item.id, item.blockedResumeState!);
             item = store.getWorkItem(item.id) ?? item;
           }
           this.#block(store, item, "policy_unknown", policy.reason);
+          continue;
+        }
+        if (recovering) {
+          store.transitionWorkItem(item.id, item.blockedResumeState!);
+          item = store.getWorkItem(item.id) ?? item;
+        }
+        if (pullRequest.reviewDecision?.toUpperCase() === "CHANGES_REQUESTED" || requiredCheckFailed(pullRequest, policy)) {
+          this.#resolveMergeDecisions(store, item.id);
+          if (!runtime.clonePath || !runtime.branchName || !this.#git.syncBranchHead) {
+            throw new Error("cannot rework pull request: WorkItem branch runtime is incomplete");
+          }
+          await this.#git.syncBranchHead(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
+          store.transitionWorkItem(item.id, "Implementing");
+          this.#notify(`Pull request ${pullRequest.url} has a failed required check or change request; scheduling fresh implementation and review.`, "warning");
           continue;
         }
         const latestReview = store.listTasks(item.id).reverse()
@@ -698,12 +735,10 @@ export class MainOrchestrator {
             throw new Error("cannot re-review pull request head: WorkItem branch runtime is incomplete");
           }
           await this.#git.syncBranchHead(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
-          if (recovering) store.transitionWorkItem(item.id, item.blockedResumeState!);
           store.transitionWorkItem(item.id, "Reviewing");
           this.#notify(`Pull request ${pullRequest.url} changed since its last review; scheduling a fresh review.`, "warning");
           continue;
         }
-        if (recovering) store.transitionWorkItem(item.id, item.blockedResumeState!);
         if (!satisfiesBranchPolicy(pullRequest, policy)) {
           this.#resolveMergeDecisions(store, item.id);
           continue;
@@ -746,6 +781,17 @@ export class MainOrchestrator {
     store.saveWorkItemRuntime(runtime);
   }
 
+  #obsoleteIfUnowned(store: MerroStore, item: WorkItem): boolean {
+    if (store.hasActiveObjectiveForWorkItem(item.id)) return false;
+    const current = store.getWorkItem(item.id);
+    if (current && !terminal(current) && !store.activeTask(item.id)) {
+      store.transitionWorkItem(item.id, "Obsolete");
+      this.#resolveMergeDecisions(store, item.id);
+      this.#notify(`WorkItem ${item.id} is obsolete because no active Objective owns it.`);
+    }
+    return true;
+  }
+
   #deriveReady(store: MerroStore): void {
     const items = store.listWorkItems();
     const byId = new Map(items.map((item) => [item.id, item]));
@@ -755,6 +801,10 @@ export class MainOrchestrator {
     if (cycle) this.#blockCycle(store, cycle, active);
     for (const item of store.listWorkItems()) {
       if ((item.state !== "Planned" && item.state !== "Ready") || active.has(item.id)) continue;
+      if (!store.hasActiveObjectiveForWorkItem(item.id)) {
+        store.transitionWorkItem(item.id, "Obsolete");
+        continue;
+      }
       const requirements = relations.filter((relation) => relation.kind === "Requires" && relation.from === item.id);
       const ready = requirements.every((relation) => byId.get(relation.to)?.state === "Done");
       if (item.state === "Planned" && ready) store.transitionWorkItem(item.id, "Ready");

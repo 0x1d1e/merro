@@ -71,6 +71,43 @@ test("branch protection is unknown on GitHub API failure", async () => {
   if (!policy.known) assert.match(policy.reason, /permission denied/);
 });
 
+test("pull request parsing reads review commit OIDs from gh's object shape", async () => {
+  const head = "b".repeat(40);
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    {
+      stdout: JSON.stringify({
+        number: 22,
+        title: "Approval shape",
+        body: "",
+        url: "https://github.com/acme/widget/pull/22",
+        state: "OPEN",
+        isDraft: false,
+        mergedAt: null,
+        mergeCommit: null,
+        mergeable: "MERGEABLE",
+        headRefName: "feature",
+        baseRefName: "main",
+        headRefOid: head,
+        baseRefOid: "c".repeat(40),
+        reviewDecision: "APPROVED",
+        reviews: [{
+          author: { login: "maintainer" },
+          state: "APPROVED",
+          submittedAt: "2026-01-01T00:00:00Z",
+          commit: { oid: head },
+        }],
+        statusCheckRollup: [],
+      }),
+      stderr: "",
+    },
+  ]);
+
+  const pullRequest = await new GitHubClient(commands).pullRequest(project, 22);
+  assert.equal(pullRequest.reviews[0]?.commitId, head);
+  assert.equal(pullRequest.reviews[0]?.author, "maintainer");
+});
+
 test("pull request parsing includes the exact merged commit SHA", async () => {
   const commands = new FakeCommands([
     { stdout: repository("acme/widget"), stderr: "" },
@@ -152,7 +189,7 @@ test("squash merge requires the approved pull request head commit", async () => 
   await assert.rejects(new GitHubClient(new FakeCommands([])).mergeSquash(project, 23, "bad-sha"), /invalid expected/);
 });
 
-test("branch protection reports exact required checks and review count", async () => {
+test("branch protection combines classic settings with active rulesets", async () => {
   const commands = new FakeCommands([
     { stdout: repository("acme/widget"), stderr: "" },
     {
@@ -165,12 +202,66 @@ test("branch protection reports exact required checks and review count", async (
       }),
       stderr: "",
     },
+    {
+      stdout: JSON.stringify([
+        {
+          type: "required_status_checks",
+          parameters: { required_status_checks: [{ context: "ruleset-ci", integration_id: 1 }] },
+        },
+        {
+          type: "pull_request",
+          parameters: { required_approving_review_count: 3, require_code_owner_review: false },
+        },
+      ]),
+      stderr: "",
+    },
   ]);
   const policy = await new GitHubClient(commands).branchProtection(project);
   assert.deepEqual(policy, {
     known: true,
-    requiredStatusChecks: ["ci", "lint"],
-    requiredApprovingReviewCount: 2,
+    requiredStatusChecks: ["ci", "lint", "ruleset-ci"],
+    requiredApprovingReviewCount: 3,
     requireCodeOwnerReviews: true,
+  });
+});
+
+test("an unprotected branch is known when classic protection returns 404 and no ruleset applies", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 404: Branch not protected"),
+    { stdout: "[]", stderr: "" },
+  ]);
+
+  const policy = await new GitHubClient(commands).branchProtection(project);
+
+  assert.deepEqual(policy, {
+    known: true,
+    requiredStatusChecks: [],
+    requiredApprovingReviewCount: 0,
+    requireCodeOwnerReviews: false,
+  });
+  assert.equal(commands.calls[2]?.args[1], "repos/acme/widget/rules/branches/main");
+});
+
+test("branch rulesets remain authoritative when classic protection returns 404", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 404: Branch not protected"),
+    {
+      stdout: JSON.stringify([{
+        type: "required_status_checks",
+        parameters: { required_status_checks: [{ context: "ruleset-ci" }] },
+      }]),
+      stderr: "",
+    },
+  ]);
+
+  const policy = await new GitHubClient(commands).branchProtection(project);
+
+  assert.deepEqual(policy, {
+    known: true,
+    requiredStatusChecks: ["ruleset-ci"],
+    requiredApprovingReviewCount: 0,
+    requireCodeOwnerReviews: false,
   });
 });

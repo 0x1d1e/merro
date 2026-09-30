@@ -142,6 +142,64 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.equal(await exists(record.resultPath), false);
 });
 
+for (const sandbox of ["docker", "none"] as const) {
+  test(`failed ${sandbox} worker startup removes token-bearing launch material`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), `merro-worker-secret-${sandbox}-`));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const workspacePath = join(root, "runtime");
+    const projectPath = join(root, "source-project");
+    const clonePath = join(root, "worker-clone");
+    await Promise.all([mkdir(projectPath), mkdir(clonePath)]);
+    const project: Project = {
+      slug: `secret-${sandbox}`,
+      path: projectPath,
+      baseRemote: "https://github.com/example/project.git",
+      pushRemote: "https://github.com/example/project.git",
+      defaultBranch: "main",
+    };
+    const commands: CommandRunner = {
+      async run(file, args) {
+        if (file === "gh") return { stdout: "ghp_launch-secret\n", stderr: "" };
+        if (file === "pi") return { stdout: "0.99.1\n", stderr: "" };
+        if (file === "docker" && args[0] === "image") throw new Error("image not present");
+        if (file === "docker" && args[0] === "build") return { stdout: "", stderr: "" };
+        if (file === "tmux") {
+          if (args[0] === "has-session") throw new Error("no such session");
+          if (args[0] === "new-window") throw new Error("tmux startup failed");
+          return { stdout: "", stderr: "" };
+        }
+        throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+      },
+    };
+    const runtime = new WorkerRuntime({
+      workspacePath,
+      config: { ...DEFAULT_CONFIG, sandbox, worker_github: "on", pi_config: "clean" },
+      commands,
+      piConfigPath: join(root, "missing-pi-config"),
+    });
+
+    await assert.rejects(runtime.launch({
+      taskId: `failed-${sandbox}`,
+      workItemId: "work-1",
+      role: "implement",
+      project,
+      clonePath,
+      taskFile: "Implement this issue.",
+      expectedCommit: "b".repeat(40),
+      projectSettings: {
+        guidance: "",
+        image: null,
+        setupCommand: null,
+        sandbox,
+        network: "on",
+        workerGithub: true,
+      },
+    }), /tmux startup failed/);
+
+    assert.deepEqual(await readdir(join(workspacePath, ".merro", "launch-secrets")), []);
+  });
+}
+
 test("sandbox none launches Pi with host paths and no Docker dependency", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-worker-host-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -251,5 +309,6 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
     join(taskRoot, "merro-runtime", "tools", "worker-result.js"),
     "--", `@${join(clonePath, ".merro-task.md")}`,
   ]);
+  assert.equal(await exists(workerScript), false);
   assert.ok(!calls.some((call) => call.file === "docker"));
 });

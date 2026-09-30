@@ -100,7 +100,7 @@ function parseDockerInspect(text: string): Record<string, unknown> {
 
 function shellScript(environment: Record<string, string>, command: string): string {
   const exports = Object.entries(environment).map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n");
-  return `#!/bin/sh\nset -eu\n${exports}\nrm -- "$0"\nexec ${command}\n`;
+  return `#!/bin/sh\nset -eu\nrm -- "$0"\n${exports}\nexec ${command}\n`;
 }
 
 async function copyTree(source: string, target: string, omitted = new Set<string>()): Promise<void> {
@@ -239,106 +239,116 @@ export class WorkerRuntime {
     let processPid: number | null = null;
     let processStartedAt: string | null = null;
     let launchCommand: string;
+    let launchSecretPath: string | null = null;
+    let launchSucceeded = false;
 
-    if (sandbox === "docker") {
-      const image = await this.#resolveImage(input.project, input.projectSettings);
-      await mkdir(dirname(cidPath), { recursive: true, mode: 0o700 });
-      await rm(cidPath, { force: true });
-      const environmentPath = join(secretRoot, `${safeName(input.taskId)}.env`);
-      await mkdir(secretRoot, { recursive: true, mode: 0o700 });
-      await writeFile(environmentPath, `${Object.entries(environment).map(([key, value]) => `${key}=${value}`).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
-      const dependencyVolumes = (input.dependencies ?? []).flatMap((dependency) => {
-        const checkoutPath = resolve(dependency.checkoutPath);
-        const checkoutRelative = relative(scratchPath, checkoutPath);
-        if (!checkoutRelative || checkoutRelative === ".." || checkoutRelative.startsWith(`..${sep}`) || isAbsolute(checkoutRelative)) {
-          throw new Error(`dependency checkout must be inside Task scratch: ${checkoutPath}`);
-        }
-        if (!/^\/merro-dependencies\/[1-9][0-9]*$/.test(dependency.mountPath)) {
-          throw new Error(`invalid dependency mount path: ${dependency.mountPath}`);
-        }
-        return ["--volume", `${checkoutPath}:${dependency.mountPath}:ro`];
-      });
-      const dockerArgs = [
-        "run", "--rm", "--cidfile", cidPath,
-        "--name", `merro-${safeName(input.taskId)}`,
-        "--label", `merro.task_id=${input.taskId}`,
-        "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
-        "--workdir", CLONE_MOUNT,
-        "--volume", `${resolve(input.clonePath)}:${CLONE_MOUNT}${input.role === "review" ? ":ro" : ""}`,
-        "--volume", `${scratchPath}:${TASK_MOUNT}`,
-        ...dependencyVolumes,
-        "--network", network === "off" ? "none" : "bridge",
-        "--read-only", "--tmpfs", "/tmp:rw,nosuid,size=1g",
-        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--pids-limit", "256", "--env-file", environmentPath,
-        image,
-        ...piArgs,
-      ];
-      launchCommand = ["docker", ...dockerArgs].map(shellQuote).join(" ");
-    } else {
-      const hostEnvironment = {
-        ...environment,
-        HOME: homePath,
-        PI_CODING_AGENT_DIR: scratchConfigPath,
-        MERRO_RESULT_PATH: resultPath,
-      };
-      const hostArgs = [
-        "pi", "--no-session", "--print", "--extension",
-        join(extensionRoot, "tools", "worker-result.js"),
-        "--", `@${taskFilePath}`,
-      ];
-      const command = hostArgs.map(shellQuote).join(" ");
-      const scriptPath = join(secretRoot, `${safeName(input.taskId)}.sh`);
-      await mkdir(secretRoot, { recursive: true, mode: 0o700 });
-      await writeFile(scriptPath, shellScript(hostEnvironment, command), { encoding: "utf8", mode: 0o700 });
-      await chmod(scriptPath, 0o700);
-      launchCommand = shellQuote(scriptPath);
-    }
-
-    const paneResult = await this.#commands.run("tmux", [
-      "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session,
-      "-n", window, "-c", sandbox === "none" ? resolve(input.clonePath) : input.project.path,
-      launchCommand,
-    ]);
-    const paneId = paneResult.stdout.trim();
-    if (!paneId) throw new Error(`tmux did not return a pane ID for Task ${input.taskId}`);
-
-    if (sandbox === "docker") {
-      containerId = await this.#waitForContainerId(cidPath);
-      await rm(join(secretRoot, `${safeName(input.taskId)}.env`), { force: true });
-      try {
-        const inspect = parseDockerInspect((await this.#commands.run("docker", ["inspect", containerId])).stdout);
-        const state = typeof inspect.State === "object" && inspect.State !== null
-          ? inspect.State as Record<string, unknown>
-          : {};
-        processPid = 1;
-        processStartedAt = typeof state.StartedAt === "string" ? state.StartedAt : startedAt;
-      } catch {
-        processPid = 1;
-        processStartedAt = startedAt;
+    try {
+      if (sandbox === "docker") {
+        const image = await this.#resolveImage(input.project, input.projectSettings);
+        await mkdir(dirname(cidPath), { recursive: true, mode: 0o700 });
+        await rm(cidPath, { force: true });
+        const environmentPath = join(secretRoot, `${safeName(input.taskId)}.env`);
+        launchSecretPath = environmentPath;
+        await mkdir(secretRoot, { recursive: true, mode: 0o700 });
+        await writeFile(environmentPath, `${Object.entries(environment).map(([key, value]) => `${key}=${value}`).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+        const dependencyVolumes = (input.dependencies ?? []).flatMap((dependency) => {
+          const checkoutPath = resolve(dependency.checkoutPath);
+          const checkoutRelative = relative(scratchPath, checkoutPath);
+          if (!checkoutRelative || checkoutRelative === ".." || checkoutRelative.startsWith(`..${sep}`) || isAbsolute(checkoutRelative)) {
+            throw new Error(`dependency checkout must be inside Task scratch: ${checkoutPath}`);
+          }
+          if (!/^\/merro-dependencies\/[1-9][0-9]*$/.test(dependency.mountPath)) {
+            throw new Error(`invalid dependency mount path: ${dependency.mountPath}`);
+          }
+          return ["--volume", `${checkoutPath}:${dependency.mountPath}:ro`];
+        });
+        const dockerArgs = [
+          "run", "--rm", "--cidfile", cidPath,
+          "--name", `merro-${safeName(input.taskId)}`,
+          "--label", `merro.task_id=${input.taskId}`,
+          "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
+          "--workdir", CLONE_MOUNT,
+          "--volume", `${resolve(input.clonePath)}:${CLONE_MOUNT}${input.role === "review" ? ":ro" : ""}`,
+          "--volume", `${scratchPath}:${TASK_MOUNT}`,
+          ...dependencyVolumes,
+          "--network", network === "off" ? "none" : "bridge",
+          "--read-only", "--tmpfs", "/tmp:rw,nosuid,size=1g",
+          "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+          "--pids-limit", "256", "--env-file", environmentPath,
+          image,
+          ...piArgs,
+        ];
+        launchCommand = ["docker", ...dockerArgs].map(shellQuote).join(" ");
+      } else {
+        const hostEnvironment = {
+          ...environment,
+          HOME: homePath,
+          PI_CODING_AGENT_DIR: scratchConfigPath,
+          MERRO_RESULT_PATH: resultPath,
+        };
+        const hostArgs = [
+          "pi", "--no-session", "--print", "--extension",
+          join(extensionRoot, "tools", "worker-result.js"),
+          "--", `@${taskFilePath}`,
+        ];
+        const command = hostArgs.map(shellQuote).join(" ");
+        const scriptPath = join(secretRoot, `${safeName(input.taskId)}.sh`);
+        launchSecretPath = scriptPath;
+        await mkdir(secretRoot, { recursive: true, mode: 0o700 });
+        await writeFile(scriptPath, shellScript(hostEnvironment, command), { encoding: "utf8", mode: 0o700 });
+        await chmod(scriptPath, 0o700);
+        launchCommand = shellQuote(scriptPath);
       }
-    } else {
-      const pane = (await this.#commands.run("tmux", ["display-message", "-p", "-t", paneId, "#{pane_pid} #{pane_start_time}"])).stdout.trim().split(/\s+/);
-      processPid = Number(pane[0]);
-      processStartedAt = timestampFromEpoch(pane[1] ?? "") ?? startedAt;
-      if (!Number.isSafeInteger(processPid) || processPid < 1) processPid = null;
-    }
 
-    return {
-      taskId: input.taskId,
-      runtimeKind: sandbox === "docker" ? "docker" : "host",
-      tmuxSession: session,
-      tmuxWindow: window,
-      paneId,
-      containerId,
-      processPid,
-      processStartedAt,
-      clonePath: resolve(input.clonePath),
-      taskFilePath,
-      resultPath,
-      expectedCommit: input.expectedCommit,
-      startedAt,
-    };
+      const paneResult = await this.#commands.run("tmux", [
+        "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session,
+        "-n", window, "-c", sandbox === "none" ? resolve(input.clonePath) : input.project.path,
+        launchCommand,
+      ]);
+      const paneId = paneResult.stdout.trim();
+      if (!paneId) throw new Error(`tmux did not return a pane ID for Task ${input.taskId}`);
+
+      if (sandbox === "docker") {
+        containerId = await this.#waitForContainerId(cidPath);
+        try {
+          const inspect = parseDockerInspect((await this.#commands.run("docker", ["inspect", containerId])).stdout);
+          const state = typeof inspect.State === "object" && inspect.State !== null
+            ? inspect.State as Record<string, unknown>
+            : {};
+          processPid = 1;
+          processStartedAt = typeof state.StartedAt === "string" ? state.StartedAt : startedAt;
+        } catch {
+          processPid = 1;
+          processStartedAt = startedAt;
+        }
+      } else {
+        const pane = (await this.#commands.run("tmux", ["display-message", "-p", "-t", paneId, "#{pane_pid} #{pane_start_time}"])).stdout.trim().split(/\s+/);
+        processPid = Number(pane[0]);
+        processStartedAt = timestampFromEpoch(pane[1] ?? "") ?? startedAt;
+        if (!Number.isSafeInteger(processPid) || processPid < 1) processPid = null;
+      }
+
+      launchSucceeded = true;
+      return {
+        taskId: input.taskId,
+        runtimeKind: sandbox === "docker" ? "docker" : "host",
+        tmuxSession: session,
+        tmuxWindow: window,
+        paneId,
+        containerId,
+        processPid,
+        processStartedAt,
+        clonePath: resolve(input.clonePath),
+        taskFilePath,
+        resultPath,
+        expectedCommit: input.expectedCommit,
+        startedAt,
+      };
+    } finally {
+      if (launchSecretPath !== null && (!launchSucceeded || sandbox === "docker")) {
+        await rm(launchSecretPath, { force: true });
+      }
+    }
   }
 
   async inspect(record: TaskRuntimeRecord, taskId: string): Promise<WorkerPresence> {
