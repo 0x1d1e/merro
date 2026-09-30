@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { MIGRATION_1 } from "../src/store/schema.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { MIGRATION_1, SCHEMA_VERSION } from "../src/store/schema.js";
 import { MerroStore } from "../src/store/store.js";
 
 function makeStore(): MerroStore {
@@ -166,5 +169,43 @@ test("SQLite rejects Blocked WorkItems without reason and resume state", () => {
     );
   } finally {
     db.close();
+  }
+});
+
+test("store migrates v1 state without losing WorkItems", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "merro-migration-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "state.db");
+  const legacy = new DatabaseSync(path);
+  try {
+    legacy.exec(MIGRATION_1);
+    legacy.prepare("INSERT INTO schema_meta(version) VALUES (1)").run();
+    legacy.prepare(`
+      INSERT INTO projects(slug, path, base_remote, push_remote, default_branch, created_at)
+      VALUES ('p', '/tmp/p', 'origin', 'origin', 'main', '2026-01-01T00:00:00Z')
+    `).run();
+    legacy.prepare(`
+      INSERT INTO work_items(
+        id, project_slug, source_type, source_ref, generation, state, priority,
+        ready_since, blocked_reason, blocked_resume_state, created_at, updated_at
+      ) VALUES ('legacy', 'p', 'issue', '1', 1, 'Ready', 'normal', NULL, NULL, NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+    `).run();
+  } finally {
+    legacy.close();
+  }
+
+  const store = new MerroStore(path);
+  try {
+    assert.equal(store.getWorkItem("legacy")?.state, "Ready");
+  } finally {
+    store.close();
+  }
+
+  const migrated = new DatabaseSync(path);
+  try {
+    assert.equal(Number(migrated.prepare("SELECT version FROM schema_meta").get()?.version), SCHEMA_VERSION);
+    assert.doesNotThrow(() => migrated.prepare("SELECT runtime_kind FROM task_runtime").all());
+  } finally {
+    migrated.close();
   }
 });

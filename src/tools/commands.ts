@@ -1,6 +1,8 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { MerroStore } from "../store/store.js";
+import { MainAlreadyRunningError, MainLock } from "../runtime/main-lock.js";
+import type { MainOrchestrator } from "../runtime/main.js";
 
 interface CommandContext {
   ui?: { notify(message: string, level?: "info" | "warning" | "error"): void };
@@ -18,18 +20,25 @@ function report(ctx: CommandContext, message: string, level: "info" | "warning" 
   else console.log(message);
 }
 
-async function withStore<T>(cwd: string, action: (store: MerroStore) => T): Promise<T> {
+async function withStore<T>(cwd: string, action: (store: MerroStore) => T | Promise<T>): Promise<T> {
   const dir = join(cwd, ".merro");
   await mkdir(dir, { recursive: true });
-  const store = new MerroStore(join(dir, "state.db"));
+  const lock = new MainLock(join(dir, "main.lock.db"));
+  await lock.acquire();
+  let store: MerroStore | undefined;
   try {
-    return action(store);
+    store = new MerroStore(join(dir, "state.db"));
+    return await action(store);
   } finally {
-    store.close();
+    try {
+      store?.close();
+    } finally {
+      await lock.release();
+    }
   }
 }
 
-export function registerCommands(pi: PiExtensionLike, cwd = process.cwd()): void {
+export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?: MainOrchestrator): void {
   pi.registerCommand("status", {
     description: "Show Merro workspace status",
     async handler(_args, ctx) {
@@ -55,4 +64,54 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd()): void
       report(ctx, `Stopped ${stopped} active objective(s). Active Tasks are not killed.`);
     },
   });
+
+  pi.registerCommand("unlock", {
+    description: "Clear stale Merro lock metadata if Main is not running",
+    async handler(_args, ctx) {
+      const dir = join(cwd, ".merro");
+      await mkdir(dir, { recursive: true });
+      const lock = new MainLock(join(dir, "main.lock.db"));
+      try {
+        await lock.acquire();
+        await lock.release();
+        report(ctx, "Merro lock is clear.");
+      } catch (error) {
+        if (error instanceof MainAlreadyRunningError) {
+          report(ctx, error.message, "warning");
+          return;
+        }
+        throw error;
+      }
+    },
+  });
+
+  if (main) {
+    for (const [name, approved] of [["merro-approve", true], ["merro-reject", false]] as const) {
+      pi.registerCommand(name, {
+        description: approved ? "Approve a pending Merro merge Decision" : "Reject a pending Merro merge Decision",
+        async handler(args, ctx) {
+          const decisionId = args.trim();
+          if (!decisionId || /\s/.test(decisionId)) throw new Error(`Usage: /${name} <Decision ID>`);
+          await main.resolveMergeDecision(decisionId, approved);
+          report(ctx, `Merge Decision ${decisionId} ${approved ? "approved" : "rejected"}.`);
+        },
+      });
+    }
+    pi.registerCommand("merro-continue", {
+      description: "Continue a Blocked Merro WorkItem after fixing its cause",
+      async handler(args, ctx) {
+        const workItemId = args.trim();
+        if (!workItemId || /\s/.test(workItemId)) throw new Error("Usage: /merro-continue <WorkItem ID>");
+        await main.continueWorkItem(workItemId);
+        report(ctx, `Continued WorkItem ${workItemId}.`);
+      },
+    });
+    pi.registerCommand("merro-run", {
+      description: "Reconcile Merro Tasks and pull requests, then schedule available work",
+      async handler(_args, ctx) {
+        await main.runPass();
+        report(ctx, "Merro reconciliation and scheduling pass completed.");
+      },
+    });
+  }
 }

@@ -23,7 +23,7 @@ Escape hatches (commands): `status`, `stop`, `unlock`, `export` (SQLite to JSON)
 
 ## Requirements
 
-`git`, `gh` (authenticated), `docker`, `tmux`, Node with `node:sqlite` (verify against Pi's runtime).
+`git`, `gh` (authenticated), `docker`, `tmux`, Node.js >=22.13.0 for unflagged `node:sqlite` (verify against Pi's runtime).
 
 ## Config
 

@@ -1,19 +1,106 @@
 import { DatabaseSync } from "node:sqlite";
 import type {
   BlockReason,
+  Decision,
   FlowWorkItemState,
   Objective,
   Project,
+  Relation,
+  ReviewRoundLimit,
+  Task,
   TaskOutcome,
   TaskRole,
   WorkItem,
   WorkItemState,
 } from "../domain/model.js";
+import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
-import { MIGRATION_1, SCHEMA_VERSION } from "./schema.js";
+import type { ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function projectFromRow(row: Record<string, unknown>): Project {
+  return {
+    slug: String(row.slug),
+    path: String(row.path),
+    baseRemote: String(row.base_remote),
+    pushRemote: String(row.push_remote),
+    defaultBranch: String(row.default_branch),
+  };
+}
+
+function reviewRoundLimit(value: unknown): ReviewRoundLimit | null {
+  if (value === null || value === undefined) return null;
+  if (value === "unlimited") return "unlimited";
+  const limit = Number(value);
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error(`invalid stored review-round limit: ${String(value)}`);
+  return limit;
+}
+
+function workItemFromRow(row: Record<string, unknown>): WorkItem {
+  return {
+    id: String(row.id),
+    projectSlug: String(row.project_slug),
+    sourceType: row.source_type === "issue" ? "issue" : "local",
+    sourceRef: String(row.source_ref),
+    generation: Number(row.generation),
+    state: row.state as WorkItemState,
+    priority: row.priority as WorkItem["priority"],
+    readySince: row.ready_since === null ? null : String(row.ready_since),
+    blockedReason: row.blocked_reason === null ? null : row.blocked_reason as BlockReason,
+    blockedResumeState: row.blocked_resume_state === null ? null : row.blocked_resume_state as FlowWorkItemState,
+    guidance: typeof row.guidance === "string" ? row.guidance : "",
+  };
+}
+
+function taskFromRow(row: Record<string, unknown>): Task {
+  return {
+    id: String(row.id),
+    workItemId: String(row.work_item_id),
+    role: row.role as TaskRole,
+    attempt: Number(row.attempt),
+    status: row.status as Task["status"],
+    outcome: row.outcome === null ? null : row.outcome as TaskOutcome,
+    startedAt: String(row.started_at),
+    finalizedAt: row.finalized_at === null ? null : String(row.finalized_at),
+    commitSha: row.commit_sha === null ? null : String(row.commit_sha),
+    reviewedCommit: row.reviewed_commit === null ? null : String(row.reviewed_commit),
+    summary: row.summary === null ? null : String(row.summary),
+    resultJson: row.result_json === null ? null : String(row.result_json),
+  };
+}
+
+function relationFromRow(row: Record<string, unknown>): Relation {
+  return {
+    kind: row.kind as Relation["kind"],
+    from: String(row.from_work_item_id),
+    to: String(row.to_work_item_id),
+    confidence: row.confidence as Relation["confidence"],
+    rationale: String(row.rationale),
+    evidence: String(row.evidence),
+  };
+}
+
+function decisionFromRow(row: Record<string, unknown>): Decision {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(String(row.payload_json));
+  } catch (error) {
+    throw new Error(`invalid Decision payload for ${String(row.id)}`, { cause: error });
+  }
+  return {
+    id: String(row.id),
+    subjectType: String(row.subject_type),
+    subjectId: String(row.subject_id),
+    kind: String(row.kind),
+    state: row.state as Decision["state"],
+    payload,
+    createdAt: String(row.created_at),
+    resolvedAt: row.resolved_at === null ? null : String(row.resolved_at),
+  };
 }
 
 export class MerroStore {
@@ -30,13 +117,65 @@ export class MerroStore {
 
   #migrate(): void {
     this.#db.exec(MIGRATION_1);
-    const row = this.#db.prepare("SELECT version FROM schema_meta LIMIT 1").get();
+    let row = this.#db.prepare("SELECT version FROM schema_meta LIMIT 1").get();
     if (!row) {
-      this.#db.prepare("INSERT INTO schema_meta(version) VALUES (?)").run(SCHEMA_VERSION);
-      return;
+      this.#db.prepare("INSERT INTO schema_meta(version) VALUES (1)").run();
+      row = { version: 1 };
     }
-    if (Number(row.version) !== SCHEMA_VERSION) {
-      throw new Error(`unsupported Merro schema version ${String(row.version)}; expected ${SCHEMA_VERSION}`);
+    let version = Number(row.version);
+    if (!Number.isSafeInteger(version) || version < 1 || version > SCHEMA_VERSION) {
+      throw new Error(`unsupported Merro schema version ${String(row.version)}; expected 1-${SCHEMA_VERSION}`);
+    }
+    if (version < 2) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_2);
+        this.#db.prepare("UPDATE schema_meta SET version = 2").run();
+        this.#db.exec("COMMIT");
+        version = 2;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version < 3) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_3);
+        this.#db.prepare("UPDATE schema_meta SET version = 3").run();
+        this.#db.exec("COMMIT");
+        version = 3;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version < 4) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_4);
+        this.#db.prepare("UPDATE schema_meta SET version = 4").run();
+        this.#db.exec("COMMIT");
+        version = 4;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version < 5) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_5);
+        this.#db.prepare("UPDATE schema_meta SET version = 5").run();
+        this.#db.exec("COMMIT");
+        version = 5;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version !== SCHEMA_VERSION) {
+      throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
   }
 
@@ -45,14 +184,272 @@ export class MerroStore {
       INSERT INTO projects(slug, path, base_remote, push_remote, default_branch, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(project.slug, project.path, project.baseRemote, project.pushRemote, project.defaultBranch, now());
+    this.appendEvent("Project", project.slug, "created", project);
+  }
+
+  getProject(slug: string): Project | null {
+    const row = this.#db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug);
+    return row ? projectFromRow(row) : null;
+  }
+
+  listProjects(): Project[] {
+    return this.#db.prepare("SELECT * FROM projects ORDER BY slug").all().map(projectFromRow);
+  }
+
+  saveProjectSettings(slug: string, settings: ProjectSettingsRecord): void {
+    this.#db.prepare(`
+      INSERT INTO project_settings(project_slug, guidance, image, setup_command, sandbox, network, worker_github)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(project_slug) DO UPDATE SET
+        guidance = excluded.guidance,
+        image = excluded.image,
+        setup_command = excluded.setup_command,
+        sandbox = excluded.sandbox,
+        network = excluded.network,
+        worker_github = excluded.worker_github
+    `).run(
+      slug,
+      settings.guidance,
+      settings.image,
+      settings.setupCommand,
+      settings.sandbox,
+      settings.network,
+      settings.workerGithub === null ? null : Number(settings.workerGithub),
+    );
+    this.appendEvent("Project", slug, "settings_changed", settings);
+  }
+
+  getProjectSettings(slug: string): ProjectSettingsRecord | null {
+    const row = this.#db.prepare("SELECT * FROM project_settings WHERE project_slug = ?").get(slug);
+    if (!row) return null;
+    return {
+      guidance: String(row.guidance),
+      image: row.image === null ? null : String(row.image),
+      setupCommand: row.setup_command === null ? null : String(row.setup_command),
+      sandbox: row.sandbox === null ? null : row.sandbox as ProjectSettingsRecord["sandbox"],
+      network: row.network === null ? null : row.network as ProjectSettingsRecord["network"],
+      workerGithub: row.worker_github === null ? null : Number(row.worker_github) === 1,
+    };
   }
 
   createObjective(objective: Objective): void {
+    if (objective.projectSlugs.length === 0) throw new Error("Objective requires at least one Project");
     const timestamp = now();
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare(`
+        INSERT INTO objectives(id, goal, priority, state, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(objective.id, objective.goal, objective.priority, objective.state, timestamp, timestamp);
+      const attach = this.#db.prepare("INSERT INTO objective_projects(objective_id, project_slug) VALUES (?, ?)");
+      for (const slug of [...new Set(objective.projectSlugs)]) attach.run(objective.id, slug);
+      if (objective.maxReviewRounds !== undefined && objective.maxReviewRounds !== null) {
+        this.#db.prepare("INSERT INTO objective_settings(objective_id, max_review_rounds) VALUES (?, ?)")
+          .run(objective.id, String(objective.maxReviewRounds));
+      }
+      this.appendEvent("Objective", objective.id, "created", objective);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getObjective(id: string): Objective | null {
+    const row = this.#db.prepare(`
+      SELECT o.*, s.max_review_rounds
+      FROM objectives o LEFT JOIN objective_settings s ON s.objective_id = o.id
+      WHERE o.id = ?
+    `).get(id);
+    return row ? this.#objectiveFromRow(row) : null;
+  }
+
+  listObjectives(): Objective[] {
+    return this.#db.prepare(`
+      SELECT o.*, s.max_review_rounds
+      FROM objectives o LEFT JOIN objective_settings s ON s.objective_id = o.id
+      ORDER BY o.created_at, o.id
+    `).all().map((row) => this.#objectiveFromRow(row));
+  }
+
+  saveObjectiveSettings(id: string, settings: ObjectiveSettingsRecord): void {
     this.#db.prepare(`
-      INSERT INTO objectives(id, goal, priority, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(objective.id, objective.goal, objective.priority, objective.state, timestamp, timestamp);
+      INSERT INTO objective_settings(objective_id, max_review_rounds) VALUES (?, ?)
+      ON CONFLICT(objective_id) DO UPDATE SET max_review_rounds = excluded.max_review_rounds
+    `).run(id, settings.maxReviewRounds === null ? null : String(settings.maxReviewRounds));
+    this.appendEvent("Objective", id, "settings_changed", settings);
+  }
+
+  setObjectiveState(id: string, state: Objective["state"]): void {
+    const row = this.#db.prepare("SELECT state FROM objectives WHERE id = ?").get(id);
+    if (!row) throw new Error(`unknown Objective: ${id}`);
+    const from = row.state as Objective["state"];
+    this.#db.prepare("UPDATE objectives SET state = ?, updated_at = ? WHERE id = ?").run(state, now(), id);
+    this.appendEvent("Objective", id, "state_changed", { from, to: state });
+  }
+
+  replaceRelations(relations: readonly Relation[]): void {
+    const effective = effectiveRelations(relations.map(normalizeRelation));
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare("UPDATE relations SET active = 0 WHERE active = 1").run();
+      const upsert = this.#db.prepare(`
+        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(kind, from_work_item_id, to_work_item_id) DO UPDATE SET
+          confidence = excluded.confidence,
+          rationale = excluded.rationale,
+          evidence = excluded.evidence,
+          active = 1
+      `);
+      for (const relation of effective) {
+        upsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence, now());
+      }
+      this.appendEvent("Relations", "workspace", "replaced", effective);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listRelations(includeInactive = false): Relation[] {
+    const where = includeInactive ? "" : "WHERE active = 1";
+    return this.#db.prepare(`SELECT * FROM relations ${where} ORDER BY id`).all().map(relationFromRow);
+  }
+
+  createDecision(input: Omit<Decision, "createdAt" | "resolvedAt" | "state"> & { state?: Decision["state"] }): Decision {
+    const decision: Decision = {
+      ...input,
+      state: input.state ?? "pending",
+      createdAt: now(),
+      resolvedAt: null,
+    };
+    this.#db.prepare(`
+      INSERT INTO decisions(id, subject_type, subject_id, kind, state, payload_json, created_at, resolved_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      decision.id,
+      decision.subjectType,
+      decision.subjectId,
+      decision.kind,
+      decision.state,
+      JSON.stringify(decision.payload),
+      decision.createdAt,
+      decision.resolvedAt,
+    );
+    this.appendEvent("Decision", decision.id, "created", decision);
+    return decision;
+  }
+
+  getDecision(id: string): Decision | null {
+    const row = this.#db.prepare("SELECT * FROM decisions WHERE id = ?").get(id);
+    return row ? decisionFromRow(row) : null;
+  }
+
+  pendingDecisions(): Decision[] {
+    return this.#db.prepare("SELECT * FROM decisions WHERE state = 'pending' ORDER BY created_at, id")
+      .all().map(decisionFromRow);
+  }
+
+  resolveDecision(id: string, state: Exclude<Decision["state"], "pending">): void {
+    const decision = this.getDecision(id);
+    if (!decision) throw new Error(`unknown Decision: ${id}`);
+    if (decision.state !== "pending") throw new Error(`Decision already resolved: ${id}`);
+    const resolvedAt = now();
+    this.#db.prepare("UPDATE decisions SET state = ?, resolved_at = ? WHERE id = ?").run(state, resolvedAt, id);
+    this.appendEvent("Decision", id, "resolved", { state, resolvedAt });
+  }
+
+  getWorkItemRuntime(workItemId: string): WorkItemRuntimeRecord | null {
+    const row = this.#db.prepare("SELECT * FROM work_item_runtime WHERE work_item_id = ?").get(workItemId);
+    if (!row) return null;
+    return {
+      workItemId,
+      branchName: row.branch_name === null ? null : String(row.branch_name),
+      clonePath: row.clone_path === null ? null : String(row.clone_path),
+      baseCommit: row.base_commit === null ? null : String(row.base_commit),
+      pullRequestNumber: row.pull_request_number === null ? null : Number(row.pull_request_number),
+      pullRequestUrl: row.pull_request_url === null ? null : String(row.pull_request_url),
+      pullRequestState: row.pull_request_state === null ? null : String(row.pull_request_state),
+      pullRequestHeadSha: row.pull_request_head_sha === null ? null : String(row.pull_request_head_sha),
+      pullRequestBaseSha: row.pull_request_base_sha === null ? null : String(row.pull_request_base_sha),
+      mergedCommitSha: row.merged_commit_sha === null ? null : String(row.merged_commit_sha),
+      reviewRound: Number(row.review_round),
+      infrastructureRetries: Number(row.infrastructure_retries),
+      implementationAttempt: Number(row.implementation_attempt),
+      lastReconciledAt: row.last_reconciled_at === null ? null : String(row.last_reconciled_at),
+    };
+  }
+
+  saveWorkItemRuntime(record: WorkItemRuntimeRecord): void {
+    this.#db.prepare(`
+      INSERT INTO work_item_runtime(
+        work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
+        pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, review_round,
+        infrastructure_retries, implementation_attempt, last_reconciled_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(work_item_id) DO UPDATE SET
+        branch_name = excluded.branch_name, clone_path = excluded.clone_path, base_commit = excluded.base_commit,
+        pull_request_number = excluded.pull_request_number, pull_request_url = excluded.pull_request_url,
+        pull_request_state = excluded.pull_request_state, pull_request_head_sha = excluded.pull_request_head_sha,
+        pull_request_base_sha = excluded.pull_request_base_sha, merged_commit_sha = excluded.merged_commit_sha,
+        review_round = excluded.review_round, infrastructure_retries = excluded.infrastructure_retries,
+        implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at
+    `).run(
+      record.workItemId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
+      record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
+      record.mergedCommitSha, record.reviewRound, record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt,
+    );
+  }
+
+  getTaskRuntime(taskId: string): TaskRuntimeRecord | null {
+    const row = this.#db.prepare("SELECT * FROM task_runtime WHERE task_id = ?").get(taskId);
+    if (!row) return null;
+    return {
+      taskId,
+      runtimeKind: row.runtime_kind === "docker" || row.runtime_kind === "host" ? row.runtime_kind : null,
+      tmuxSession: String(row.tmux_session),
+      tmuxWindow: String(row.tmux_window),
+      paneId: row.pane_id === null ? null : String(row.pane_id),
+      containerId: row.container_id === null ? null : String(row.container_id),
+      processPid: row.process_pid === null ? null : Number(row.process_pid),
+      processStartedAt: row.process_started_at === null ? null : String(row.process_started_at),
+      clonePath: String(row.clone_path),
+      taskFilePath: String(row.task_file_path),
+      resultPath: String(row.result_path),
+      expectedCommit: String(row.expected_commit),
+      startedAt: String(row.started_at),
+    };
+  }
+
+  saveTaskRuntime(record: TaskRuntimeRecord): void {
+    this.#db.prepare(`
+      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, pane_id, container_id, process_pid, process_started_at, clone_path, task_file_path, result_path, expected_commit, started_at, runtime_kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET
+        tmux_session = excluded.tmux_session, tmux_window = excluded.tmux_window, pane_id = excluded.pane_id,
+        container_id = excluded.container_id, process_pid = excluded.process_pid, process_started_at = excluded.process_started_at,
+        clone_path = excluded.clone_path, task_file_path = excluded.task_file_path,
+        result_path = excluded.result_path, expected_commit = excluded.expected_commit, started_at = excluded.started_at,
+        runtime_kind = excluded.runtime_kind
+    `).run(record.taskId, record.tmuxSession, record.tmuxWindow, record.paneId, record.containerId,
+      record.processPid, record.processStartedAt, record.clonePath, record.taskFilePath, record.resultPath, record.expectedCommit, record.startedAt, record.runtimeKind);
+  }
+
+  #objectiveFromRow(row: Record<string, unknown>): Objective {
+    const id = String(row.id);
+    const projectSlugs = this.#db.prepare(`
+      SELECT project_slug FROM objective_projects WHERE objective_id = ? ORDER BY project_slug
+    `).all(id).map((link) => String(link.project_slug));
+    return {
+      id,
+      goal: String(row.goal),
+      priority: row.priority as Objective["priority"],
+      state: row.state as Objective["state"],
+      projectSlugs,
+      maxReviewRounds: reviewRoundLimit(row.max_review_rounds),
+    };
   }
 
   createWorkItem(item: WorkItem): void {
@@ -66,49 +463,96 @@ export class MerroStore {
     }
 
     const timestamp = now();
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare(`
+        INSERT INTO work_items(
+          id, project_slug, source_type, source_ref, generation, state, priority,
+          ready_since, blocked_reason, blocked_resume_state, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        item.id, item.projectSlug, item.sourceType, item.sourceRef, item.generation, item.state,
+        item.priority, item.readySince, item.blockedReason, item.blockedResumeState, timestamp, timestamp,
+      );
+      this.#db.prepare("INSERT INTO work_item_settings(work_item_id, guidance) VALUES (?, ?)")
+        .run(item.id, item.guidance ?? "");
+      this.#db.prepare("INSERT INTO work_item_runtime(work_item_id) VALUES (?)").run(item.id);
+      this.appendEvent("WorkItem", item.id, "created", item);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  findNonTerminalWorkItem(projectSlug: string, sourceType: WorkItem["sourceType"], sourceRef: string): WorkItem | null {
+    const row = this.#db.prepare(`
+      SELECT w.*, s.guidance FROM work_items w
+      LEFT JOIN work_item_settings s ON s.work_item_id = w.id
+      WHERE w.project_slug = ? AND w.source_type = ? AND w.source_ref = ?
+        AND w.state NOT IN ('Done', 'Obsolete', 'Cancelled')
+      ORDER BY w.generation DESC LIMIT 1
+    `).get(projectSlug, sourceType, sourceRef);
+    return row ? workItemFromRow(row) : null;
+  }
+
+  setWorkItemPriority(id: string, priority: WorkItem["priority"]): void {
+    const item = this.getWorkItem(id);
+    if (!item) throw new Error(`unknown WorkItem: ${id}`);
+    if (item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled") return;
+    this.#db.prepare("UPDATE work_items SET priority = ?, updated_at = ? WHERE id = ?").run(priority, now(), id);
+    this.appendEvent("WorkItem", id, "priority_changed", { from: item.priority, to: priority });
+  }
+
+  nextGeneration(projectSlug: string, sourceType: WorkItem["sourceType"], sourceRef: string): number {
+    const row = this.#db.prepare(`
+      SELECT COALESCE(MAX(generation), 0) AS generation FROM work_items
+      WHERE project_slug = ? AND source_type = ? AND source_ref = ?
+    `).get(projectSlug, sourceType, sourceRef);
+    return Number(row?.generation ?? 0) + 1;
+  }
+
+  listWorkItems(objectiveId?: string): WorkItem[] {
+    const rows = objectiveId === undefined
+      ? this.#db.prepare(`
+          SELECT w.*, s.guidance FROM work_items w
+          LEFT JOIN work_item_settings s ON s.work_item_id = w.id
+          ORDER BY w.created_at, w.id
+        `).all()
+      : this.#db.prepare(`
+          SELECT w.*, s.guidance FROM work_items w
+          LEFT JOIN work_item_settings s ON s.work_item_id = w.id
+          JOIN objective_work_items ow ON ow.work_item_id = w.id
+          WHERE ow.objective_id = ? ORDER BY w.created_at, w.id
+        `).all(objectiveId);
+    return rows.map(workItemFromRow);
+  }
+
+  saveWorkItemGuidance(id: string, guidance: string): void {
     this.#db.prepare(`
-      INSERT INTO work_items(
-        id, project_slug, source_type, source_ref, generation, state, priority,
-        ready_since, blocked_reason, blocked_resume_state, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      item.id,
-      item.projectSlug,
-      item.sourceType,
-      item.sourceRef,
-      item.generation,
-      item.state,
-      item.priority,
-      item.readySince,
-      item.blockedReason,
-      item.blockedResumeState,
-      timestamp,
-      timestamp,
-    );
+      INSERT INTO work_item_settings(work_item_id, guidance) VALUES (?, ?)
+      ON CONFLICT(work_item_id) DO UPDATE SET guidance = excluded.guidance
+    `).run(id, guidance);
+    this.appendEvent("WorkItem", id, "guidance_changed", { guidance });
   }
 
   attachWorkItem(objectiveId: string, workItemId: string): void {
-    this.#db.prepare(`
+    const result = this.#db.prepare(`
       INSERT OR IGNORE INTO objective_work_items(objective_id, work_item_id)
       VALUES (?, ?)
     `).run(objectiveId, workItemId);
+    if (Number(result.changes) > 0) {
+      this.appendEvent("WorkItem", workItemId, "attached_to_objective", { objectiveId });
+    }
   }
 
   getWorkItem(id: string): WorkItem | null {
-    const row = this.#db.prepare("SELECT * FROM work_items WHERE id = ?").get(id);
-    if (!row) return null;
-    return {
-      id: String(row.id),
-      projectSlug: String(row.project_slug),
-      sourceType: row.source_type === "issue" ? "issue" : "local",
-      sourceRef: String(row.source_ref),
-      generation: Number(row.generation),
-      state: row.state as WorkItemState,
-      priority: row.priority as WorkItem["priority"],
-      readySince: row.ready_since === null ? null : String(row.ready_since),
-      blockedReason: row.blocked_reason === null ? null : row.blocked_reason as BlockReason,
-      blockedResumeState: row.blocked_resume_state === null ? null : row.blocked_resume_state as FlowWorkItemState,
-    };
+    const row = this.#db.prepare(`
+      SELECT w.*, s.guidance FROM work_items w
+      LEFT JOIN work_item_settings s ON s.work_item_id = w.id
+      WHERE w.id = ?
+    `).get(id);
+    return row ? workItemFromRow(row) : null;
   }
 
   transitionWorkItem(id: string, to: WorkItemState, blockedReason: BlockReason | null = null): void {
@@ -144,13 +588,31 @@ export class MerroStore {
       SET state = ?, ready_since = ?, blocked_reason = ?, blocked_resume_state = ?, updated_at = ?
       WHERE id = ?
     `).run(to, readySince, nextBlockedReason, nextBlockedResumeState, now(), id);
+    this.appendEvent("WorkItem", id, "state_changed", {
+      from: item.state,
+      to,
+      blockedReason: nextBlockedReason,
+      blockedResumeState: nextBlockedResumeState,
+    });
   }
 
-  createTask(input: { id: string; workItemId: string; role: TaskRole; attempt: number }): void {
-    this.#db.prepare(`
-      INSERT INTO tasks(id, work_item_id, role, attempt, status, started_at)
-      VALUES (?, ?, ?, ?, 'active', ?)
-    `).run(input.id, input.workItemId, input.role, input.attempt, now());
+  createTask(input: { id: string; workItemId: string; role: TaskRole; attempt: number; runtime?: TaskRuntimeRecord }): void {
+    if (input.runtime && input.runtime.taskId !== input.id) {
+      throw new Error("Task runtime identity does not match Task ID");
+    }
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.prepare(`
+        INSERT INTO tasks(id, work_item_id, role, attempt, status, started_at)
+        VALUES (?, ?, ?, ?, 'active', ?)
+      `).run(input.id, input.workItemId, input.role, input.attempt, now());
+      if (input.runtime) this.saveTaskRuntime(input.runtime);
+      this.appendEvent("Task", input.id, "created", { ...input, runtime: undefined });
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   finalizeTask(input: {
@@ -183,10 +645,24 @@ export class MerroStore {
       input.resultJson,
       input.id,
     );
+    this.appendEvent("Task", input.id, "finalized", input);
   }
 
-  getTask(id: string): Record<string, unknown> | null {
-    return this.#db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) ?? null;
+  getTask(id: string): Task | null {
+    const row = this.#db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
+    return row ? taskFromRow(row) : null;
+  }
+
+  listTasks(workItemId?: string): Task[] {
+    const rows = workItemId === undefined
+      ? this.#db.prepare("SELECT * FROM tasks ORDER BY started_at, id").all()
+      : this.#db.prepare("SELECT * FROM tasks WHERE work_item_id = ? ORDER BY started_at, id").all(workItemId);
+    return rows.map(taskFromRow);
+  }
+
+  activeTask(workItemId: string): Task | null {
+    const row = this.#db.prepare("SELECT * FROM tasks WHERE work_item_id = ? AND status = 'active'").get(workItemId);
+    return row ? taskFromRow(row) : null;
   }
 
   statusSummary(): { projects: number; objectives: number; workItems: number; activeTasks: number; blockedWorkItems: number } {
@@ -204,7 +680,11 @@ export class MerroStore {
   }
 
   snapshot(): Record<string, Array<Record<string, unknown>>> {
-    const tables = ["projects", "objectives", "work_items", "objective_work_items", "relations", "tasks", "decisions", "event_log"];
+    const tables = [
+      "projects", "project_settings", "objectives", "objective_projects", "objective_settings",
+      "work_items", "work_item_settings", "work_item_runtime", "objective_work_items",
+      "relations", "tasks", "task_runtime", "decisions", "event_log",
+    ];
     return Object.fromEntries(tables.map((table) => [table, this.#db.prepare(`SELECT * FROM ${table}`).all()]));
   }
 

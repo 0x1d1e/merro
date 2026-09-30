@@ -24,6 +24,8 @@ export type TaskRole = "implement" | "review";
 export type TaskOutcome = "success" | "failed" | "cancelled" | "pass" | "reject";
 export type RelationKind = "Requires" | "Conflicts";
 export type RelationConfidence = "explicit" | "high";
+export type ReviewRoundLimit = number | "unlimited";
+export type DecisionState = "pending" | "approved" | "rejected" | "resolved";
 
 export interface Project {
   slug: string;
@@ -38,6 +40,8 @@ export interface Objective {
   goal: string;
   priority: Priority;
   state: ObjectiveState;
+  projectSlugs: string[];
+  maxReviewRounds?: ReviewRoundLimit | null;
 }
 
 export interface WorkItem {
@@ -51,6 +55,33 @@ export interface WorkItem {
   readySince: string | null;
   blockedReason: BlockReason | null;
   blockedResumeState: FlowWorkItemState | null;
+  guidance?: string;
+}
+
+export interface Task {
+  id: string;
+  workItemId: string;
+  role: TaskRole;
+  attempt: number;
+  status: "active" | "finalized";
+  outcome: TaskOutcome | null;
+  startedAt: string;
+  finalizedAt: string | null;
+  commitSha: string | null;
+  reviewedCommit: string | null;
+  summary: string | null;
+  resultJson: string | null;
+}
+
+export interface Decision {
+  id: string;
+  subjectType: string;
+  subjectId: string;
+  kind: string;
+  state: DecisionState;
+  payload: unknown;
+  createdAt: string;
+  resolvedAt: string | null;
 }
 
 export interface Relation {
@@ -67,6 +98,7 @@ export interface SchedulingInput {
   relations: readonly Relation[];
   activeTaskCount: number;
   maxConcurrentTasks: number | "unlimited";
+  activeWorkItemIds?: readonly string[];
 }
 
 export const FLOW_WORK_ITEM_STATES = new Set<FlowWorkItemState>([

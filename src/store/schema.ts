@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 5;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -170,4 +170,74 @@ CREATE TABLE IF NOT EXISTS event_log (
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+`;
+
+export const MIGRATION_2 = `
+CREATE TABLE IF NOT EXISTS objective_projects (
+  objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+  project_slug TEXT NOT NULL REFERENCES projects(slug),
+  PRIMARY KEY (objective_id, project_slug)
+);
+
+CREATE TABLE IF NOT EXISTS project_settings (
+  project_slug TEXT PRIMARY KEY REFERENCES projects(slug) ON DELETE CASCADE,
+  guidance TEXT NOT NULL DEFAULT '',
+  image TEXT,
+  setup_command TEXT,
+  sandbox TEXT CHECK (sandbox IN ('docker', 'none')),
+  network TEXT CHECK (network IN ('on', 'off')),
+  worker_github INTEGER CHECK (worker_github IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS objective_settings (
+  objective_id TEXT PRIMARY KEY REFERENCES objectives(id) ON DELETE CASCADE,
+  max_review_rounds TEXT CHECK (max_review_rounds = 'unlimited' OR CAST(max_review_rounds AS INTEGER) > 0)
+);
+
+CREATE TABLE IF NOT EXISTS work_item_settings (
+  work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+  guidance TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS work_item_runtime (
+  work_item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+  branch_name TEXT,
+  clone_path TEXT,
+  base_commit TEXT,
+  pull_request_number INTEGER,
+  pull_request_url TEXT,
+  pull_request_state TEXT,
+  pull_request_head_sha TEXT,
+  pull_request_base_sha TEXT,
+  review_round INTEGER NOT NULL DEFAULT 0 CHECK (review_round >= 0),
+  infrastructure_retries INTEGER NOT NULL DEFAULT 0 CHECK (infrastructure_retries >= 0),
+  implementation_attempt INTEGER NOT NULL DEFAULT 0 CHECK (implementation_attempt >= 0),
+  last_reconciled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_runtime (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  tmux_session TEXT NOT NULL,
+  tmux_window TEXT NOT NULL,
+  pane_id TEXT,
+  container_id TEXT,
+  process_pid INTEGER,
+  process_started_at TEXT,
+  clone_path TEXT NOT NULL,
+  task_file_path TEXT NOT NULL,
+  result_path TEXT NOT NULL,
+  started_at TEXT NOT NULL
+);
+`;
+
+export const MIGRATION_3 = `
+ALTER TABLE task_runtime ADD COLUMN expected_commit TEXT NOT NULL DEFAULT '';
+`;
+
+export const MIGRATION_4 = `
+ALTER TABLE task_runtime ADD COLUMN runtime_kind TEXT CHECK (runtime_kind IN ('docker', 'host'));
+`;
+
+export const MIGRATION_5 = `
+ALTER TABLE work_item_runtime ADD COLUMN merged_commit_sha TEXT;
 `;

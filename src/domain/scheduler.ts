@@ -52,14 +52,13 @@ export function schedule(input: SchedulingInput): ScheduleResult {
     ? Number.POSITIVE_INFINITY
     : Math.max(0, input.maxConcurrentTasks - input.activeTaskCount);
 
-  const activeIds = new Set(
-    input.workItems
-      .filter((item) => item.state === "Implementing" || item.state === "Reviewing")
-      .map((item) => item.id),
-  );
+  const activeIds = input.activeWorkItemIds
+    ? new Set(input.activeWorkItemIds)
+    : new Set(input.workItems.filter((item) => item.state === "Implementing" || item.state === "Reviewing").map((item) => item.id));
 
   const candidates = input.workItems
-    .filter((item) => item.state === "Ready")
+    .filter((item) => item.state === "Ready" || item.state === "Implementing" || item.state === "Reviewing")
+    .filter((item) => !activeIds.has(item.id))
     .filter((item) => requirementsSatisfied(item, byId, relations))
     .filter((item) => !conflictsWithAny(item.id, activeIds, relations))
     .sort((left, right) => {
