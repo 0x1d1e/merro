@@ -6,7 +6,7 @@ Workers run in Docker containers, one per Task, inside tmux windows. GitHub only
 ## Use
 
 ```sh
-git clone <merro-repo> && cd merro && pi
+git clone https://github.com/PrightCord/Merro && cd merro && pi
 ```
 
 Talk to Main in natural language:
