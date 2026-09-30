@@ -33,14 +33,5 @@ jobs:
         with:
           node-version: "22.5.0"
 
-      - name: Install dependencies
-        run: npm install --ignore-scripts --no-audit --no-fund
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test
+      - name: Run CI
+        run: scripts/run-ci.sh

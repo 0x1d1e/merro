@@ -12,8 +12,9 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "ci": "bash scripts/run-ci.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "node scripts/check-boundaries.mjs && npm run typecheck",
+    "lint": "node scripts/check-boundaries.mjs",
     "test": "npm run build && node --test dist/test/*.test.js"
   },
   "devDependencies": {

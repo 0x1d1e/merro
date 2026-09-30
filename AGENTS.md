@@ -6,7 +6,7 @@
 - Before reversing a decision, read the matching ADR in `docs/adr/` and supersede it, don't edit it.
 - `domain/` must not import git, github, docker, tmux, or sqlite modules.
 - Tests cross the same interface callers use. Bug fixes get a regression test that fails on the old behavior.
-- Verify: `npm test`, `npm run lint`, `npm run typecheck`.
+- Verify with `scripts/run-ci.sh`. Use `--skip-install` only when dependencies are already current.
 - `docs/archive/` is historical. Do not update it.
 
 ## Module ownership
