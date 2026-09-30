@@ -23,6 +23,7 @@ export interface ImplementFailedResult {
   task_id: string;
   status: "failed";
   summary: string;
+  commit: string;
   reason: string;
   diagnostics?: string;
   verification: Verification[];
@@ -162,6 +163,7 @@ export function parseImplementResult(value: unknown): ImplementSuccessResult | I
       task_id,
       status: "failed",
       summary,
+      commit: text(row.commit, "commit"),
       reason: text(row.reason, "reason"),
       verification,
     };
