@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import { MIGRATION_1 } from "../src/store/schema.js";
 import { MerroStore } from "../src/store/store.js";
 
 function makeStore(): MerroStore {
@@ -41,5 +43,35 @@ test("store enforces one active Task per WorkItem and immutable finalization", (
     assert.throws(() => store.finalizeTask({ id: "t1", outcome: "failed", summary: "changed", resultJson: "{}" }), /already finalized/);
   } finally {
     store.close();
+  }
+});
+
+test("SQLite trigger protects terminal WorkItem core fields", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(MIGRATION_1);
+    db.prepare(`
+      INSERT INTO projects(slug, path, base_remote, push_remote, default_branch, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run("p", "/tmp/p", "origin", "origin", "main", "2026-01-01T00:00:00Z");
+    db.prepare(`
+      INSERT INTO work_items(
+        id, project_slug, source_type, source_ref, generation, state, priority,
+        ready_since, blocked_reason, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("done", "p", "issue", "1", 1, "Done", "normal", null, null, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+
+    assert.throws(
+      () => db.prepare("UPDATE work_items SET priority = 'high' WHERE id = 'done'").run(),
+      /terminal WorkItem core fields are immutable/,
+    );
+    assert.throws(
+      () => db.prepare("UPDATE work_items SET state = 'Ready' WHERE id = 'done'").run(),
+      /terminal WorkItem core fields are immutable/,
+    );
+
+    assert.doesNotThrow(() => db.prepare("UPDATE work_items SET updated_at = ? WHERE id = 'done'").run("2026-01-02T00:00:00Z"));
+  } finally {
+    db.close();
   }
 });
