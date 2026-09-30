@@ -153,6 +153,17 @@ test("SQLite rejects Blocked WorkItems without reason and resume state", () => {
         "UPDATE work_items SET state = 'Blocked', blocked_reason = 'not_a_reason', blocked_resume_state = 'Ready' WHERE id = 'ready'",
       ).run(),
     );
+
+    db.prepare(
+      "UPDATE work_items SET state = 'Blocked', blocked_reason = 'task_failed', blocked_resume_state = 'Ready' WHERE id = 'ready'",
+    ).run();
+
+    assert.throws(
+      () => db.prepare(
+        "UPDATE work_items SET state = 'Reviewing', blocked_reason = NULL, blocked_resume_state = NULL WHERE id = 'ready'",
+      ).run(),
+      /must resume previous flow state/,
+    );
   } finally {
     db.close();
   }
