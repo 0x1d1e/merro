@@ -6,16 +6,16 @@ import { priorityRank, type Objective, type Priority, type Project, type Relatio
 import { findRequiresCycle } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
 import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
-import { GitHubClient, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
+import { GitHubClient, GitHubMergeError, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
 import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, WorkItemRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
 import { MainLock } from "./main-lock.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { WorkerRuntime } from "./worker-runtime.js";
-import { GitClient } from "../vcs/git.js";
+import { GitBaseMergeConflictError, GitClient } from "../vcs/git.js";
 
-type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch">
+type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchAndMergeBase">
   & Partial<Pick<GitClient, "remoteBranchCommit" | "syncBranchHead" | "ensureWorkItemClone" | "createReadOnlyCheckout">>;
 type GitHubAdapter = Pick<GitHubClient, "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "mergeSquash">
   & Partial<Pick<GitHubClient, "findPullRequest">>;
@@ -44,7 +44,7 @@ const emptyRuntime = (workItemId: string): WorkItemRuntimeRecord => ({
   workItemId, branchName: null, clonePath: null, baseCommit: null,
   pullRequestNumber: null, pullRequestUrl: null, pullRequestState: null,
   pullRequestHeadSha: null, pullRequestBaseSha: null, mergedCommitSha: null, reviewRound: 0,
-  infrastructureRetries: 0, implementationAttempt: 0, lastReconciledAt: null,
+  infrastructureRetries: 0, implementationAttempt: 0, lastReworkTrigger: null, lastReconciledAt: null,
 });
 
 function sourceId(projectSlug: string, number: number, generation: number): string {
@@ -84,7 +84,7 @@ function requiredCheckFailed(pullRequest: GitHubPullRequest, policy: BranchPolic
 }
 
 function satisfiesBranchPolicy(pullRequest: GitHubPullRequest, policy: BranchPolicy): boolean {
-  if (!policy.known) return false;
+  if (!policy.known || pullRequest.reviewDecision?.toUpperCase() === "CHANGES_REQUESTED") return false;
   const checksReady = policy.requiredStatusChecks.every((name) => pullRequest.checks.some((check) =>
     check.name === name && ((check.state.toUpperCase() === "COMPLETED" && check.conclusion?.toUpperCase() === "SUCCESS") || check.state.toUpperCase() === "SUCCESS"),
   ));
@@ -95,6 +95,24 @@ function satisfiesBranchPolicy(pullRequest: GitHubPullRequest, policy: BranchPol
     && (!policy.requireCodeOwnerReviews || pullRequest.reviewDecision === "APPROVED");
   return pullRequest.state === "OPEN" && !pullRequest.isDraft
     && pullRequest.mergeable === "MERGEABLE" && checksReady && reviewsReady;
+}
+
+function changeRequestTrigger(pullRequest: GitHubPullRequest): string | null {
+  if (pullRequest.reviewDecision?.toUpperCase() !== "CHANGES_REQUESTED") return null;
+  const latestReview = pullRequest.reviews
+    .map((review, index) => ({ review, index }))
+    .filter(({ review }) => review.state.toUpperCase() === "CHANGES_REQUESTED")
+    .sort((left, right) => (left.review.submittedAt ?? "").localeCompare(right.review.submittedAt ?? "") || left.index - right.index)
+    .at(-1)?.review;
+  if (!latestReview) return null;
+  const identity = latestReview.id ?? JSON.stringify([
+    latestReview.author,
+    latestReview.submittedAt,
+    latestReview.commitId,
+    latestReview.state.toUpperCase(),
+  ]);
+  if (!latestReview.id && !latestReview.author && !latestReview.submittedAt && !latestReview.commitId) return null;
+  return `review:${pullRequest.number}:${identity}:head:${latestReview.commitId ?? "unknown"}`;
 }
 
 function errorText(error: unknown): string {
@@ -267,6 +285,8 @@ export class MainOrchestrator {
         throw new Error(`merge Decision ${decisionId} no longer matches an AwaitingMerge WorkItem`);
       }
 
+      let mergeAttempted = false;
+      let mergeCommandSucceeded = false;
       try {
         let pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
         this.#savePullRequest(store, runtime, pullRequest);
@@ -318,7 +338,9 @@ export class MainOrchestrator {
           return;
         }
 
+        mergeAttempted = true;
         await this.#github.mergeSquash(project, runtime.pullRequestNumber, expectedHead);
+        mergeCommandSucceeded = true;
         pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
         if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
         if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("GitHub did not report a valid merged commit SHA");
@@ -331,7 +353,10 @@ export class MainOrchestrator {
         this.#notify(`WorkItem ${item.id} merged and Done.`);
       } catch (error) {
         store.resolveDecision(decisionId, "resolved");
-        this.#block(store, item, "github_unavailable", `Merge reconciliation failed: ${errorText(error)}`);
+        const unavailable = !mergeAttempted || mergeCommandSucceeded
+          || (error instanceof GitHubMergeError && error.kind === "unavailable");
+        const reason = unavailable ? "github_unavailable" : "merge_failed";
+        this.#block(store, item, reason, `Merge ${unavailable ? "reconciliation failed" : "was rejected"}: ${errorText(error)}`);
       }
       this.#finishObjectives(store);
     });
@@ -634,10 +659,13 @@ export class MainOrchestrator {
       const recovering = item.state === "Blocked"
         && item.blockedResumeState === "AwaitingMerge"
         && (item.blockedReason === "github_unavailable" || item.blockedReason === "policy_unknown");
-      if (item.state !== "AwaitingMerge" && !recovering) continue;
       const runtime = store.getWorkItemRuntime(item.id);
       const project = store.getProject(item.projectSlug);
       if (!runtime || !project) continue;
+      const hasPullRequestIdentity = runtime.pullRequestNumber !== null || runtime.branchName !== null;
+      const terminalOnly = item.state === "Blocked" && !recovering && hasPullRequestIdentity;
+      if (item.state !== "AwaitingMerge" && !recovering && !terminalOnly) continue;
+      const previousBaseSha = runtime.pullRequestBaseSha;
       try {
         let pullRequest: GitHubPullRequest | null = null;
         if (runtime.pullRequestNumber) {
@@ -660,21 +688,25 @@ export class MainOrchestrator {
           }
           runtime.mergedCommitSha = pullRequest.mergeCommitSha;
           store.saveWorkItemRuntime(runtime);
-          if (recovering) store.transitionWorkItem(item.id, item.blockedResumeState!);
-          this.#resolveMergeDecisions(store, item.id);
-          store.transitionWorkItem(item.id, "Done");
+          this.#resolvePullRequestDecisions(store, item.id);
+          if (item.state === "Blocked") store.completeWorkItemAfterExternalMerge(item.id);
+          else store.transitionWorkItem(item.id, "Done");
           continue;
         }
         if (pullRequest.state === "CLOSED") {
-          if (item.state === "Blocked" && item.blockedReason === "pr_closed") continue;
-          if (recovering) {
-            store.transitionWorkItem(item.id, item.blockedResumeState!);
-            item = store.getWorkItem(item.id) ?? item;
+          if (item.state === "Blocked") {
+            if (item.blockedReason !== "pr_closed") {
+              this.#resolvePullRequestDecisions(store, item.id);
+              this.#block(store, item, "pr_closed", "Pull request was closed without merging");
+            }
+            continue;
           }
-          this.#resolveMergeDecisions(store, item.id);
+          this.#resolvePullRequestDecisions(store, item.id);
           this.#block(store, item, "pr_closed", "Pull request was closed without merging");
           continue;
         }
+        if (terminalOnly) continue;
+        if (store.pendingDecisions().some((decision) => decision.subjectId === item.id && decision.kind === "merge_conflict")) continue;
         if (runtime.branchName && this.#git.remoteBranchCommit) {
           const remoteHead = await this.#git.remoteBranchCommit(project, runtime.branchName);
           if (!remoteHead) {
@@ -717,14 +749,77 @@ export class MainOrchestrator {
           store.transitionWorkItem(item.id, item.blockedResumeState!);
           item = store.getWorkItem(item.id) ?? item;
         }
-        if (pullRequest.reviewDecision?.toUpperCase() === "CHANGES_REQUESTED" || requiredCheckFailed(pullRequest, policy)) {
+
+        const baseMoved = previousBaseSha !== null && pullRequest.baseRefOid !== previousBaseSha;
+        if (baseMoved || pullRequest.mergeable === "CONFLICTING") {
+          if (!runtime.clonePath || !runtime.branchName) throw new Error("cannot merge the updated base: WorkItem branch runtime is incomplete");
+          let baseMerge: Awaited<ReturnType<GitClient["fetchAndMergeBase"]>>;
+          try {
+            baseMerge = await this.#git.fetchAndMergeBase(runtime.clonePath, pullRequest.baseRefName);
+          } catch (error) {
+            if (!(error instanceof GitBaseMergeConflictError)) throw error;
+            this.#resolveMergeDecisions(store, item.id);
+            const pending = store.pendingDecisions().find((decision) => decision.subjectId === item.id);
+            if (!pending) {
+              const decision = store.createDecision({
+                id: randomUUID(), subjectType: "WorkItem", subjectId: item.id, kind: "merge_conflict",
+                payload: {
+                  pullRequest: pullRequest.number,
+                  url: pullRequest.url,
+                  baseRefName: pullRequest.baseRefName,
+                  baseCommit: error.baseCommit,
+                  conflictingPaths: error.conflictingPaths,
+                  detail: error.message,
+                },
+              });
+              this.#notify(`Base merge conflict requires a decision for ${pullRequest.url} (Decision ${decision.id}).`, "warning");
+            }
+            continue;
+          }
+          runtime.pullRequestBaseSha = baseMerge.baseCommit;
+          if (baseMerge.merged) {
+            runtime.pullRequestHeadSha = baseMerge.headCommit;
+            store.saveWorkItemRuntime(runtime);
+            this.#resolveMergeDecisions(store, item.id);
+            await this.#git.pushBranch(project, runtime.clonePath, runtime.branchName);
+            store.transitionWorkItem(item.id, "Reviewing");
+            this.#notify(`Merged the updated base into ${pullRequest.url}; scheduling a fresh review.`, "warning");
+            continue;
+          }
+          store.saveWorkItemRuntime(runtime);
+          pullRequest = await this.#github.pullRequest(project, pullRequest.number);
+          this.#savePullRequest(store, runtime, pullRequest);
+          if (pullRequest.mergeable === "CONFLICTING") {
+            const decision = store.createDecision({
+              id: randomUUID(), subjectType: "WorkItem", subjectId: item.id, kind: "merge_conflict",
+              payload: {
+                pullRequest: pullRequest.number,
+                url: pullRequest.url,
+                baseRefName: pullRequest.baseRefName,
+                baseCommit: baseMerge.baseCommit,
+                detail: "Git reports the base is already merged, but GitHub still reports conflicts.",
+              },
+            });
+            this.#notify(`Base merge conflict requires a decision for ${pullRequest.url} (Decision ${decision.id}).`, "warning");
+            continue;
+          }
+        }
+
+        const reviewTrigger = changeRequestTrigger(pullRequest);
+        const newChangeRequest = reviewTrigger !== null && reviewTrigger !== runtime.lastReworkTrigger;
+        if (newChangeRequest || requiredCheckFailed(pullRequest, policy)) {
           this.#resolveMergeDecisions(store, item.id);
           if (!runtime.clonePath || !runtime.branchName || !this.#git.syncBranchHead) {
             throw new Error("cannot rework pull request: WorkItem branch runtime is incomplete");
           }
           await this.#git.syncBranchHead(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
-          store.transitionWorkItem(item.id, "Implementing");
-          this.#notify(`Pull request ${pullRequest.url} has a failed required check or change request; scheduling fresh implementation and review.`, "warning");
+          if (newChangeRequest && reviewTrigger) {
+            runtime.lastReworkTrigger = reviewTrigger;
+            store.markPullRequestRework(runtime);
+          } else {
+            store.transitionWorkItem(item.id, "Implementing");
+          }
+          this.#notify(`Pull request ${pullRequest.url} has a failed required check or a new change-request review; scheduling fresh implementation and review.`, "warning");
           continue;
         }
         const latestReview = store.listTasks(item.id).reverse()
@@ -758,7 +853,7 @@ export class MainOrchestrator {
         });
         this.#notify(`Merge approval required for ${pullRequest.url} (Decision ${decision.id}).`);
       } catch (error) {
-        if (!recovering) this.#block(store, item, "github_unavailable", `GitHub reconciliation failed: ${errorText(error)}`);
+        if (!recovering && item.state !== "Blocked") this.#block(store, item, "github_unavailable", `GitHub reconciliation failed: ${errorText(error)}`);
       }
     }
   }
@@ -768,6 +863,12 @@ export class MainOrchestrator {
       if (decision.kind === "merge" && decision.subjectId === workItemId) {
         store.resolveDecision(decision.id, "resolved");
       }
+    }
+  }
+
+  #resolvePullRequestDecisions(store: MerroStore, workItemId: string): void {
+    for (const decision of store.pendingDecisions()) {
+      if (decision.subjectId === workItemId) store.resolveDecision(decision.id, "resolved");
     }
   }
 

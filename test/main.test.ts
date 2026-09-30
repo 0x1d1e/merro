@@ -7,8 +7,9 @@ import { tmpdir } from "node:os";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { MerroStore } from "../src/store/store.js";
 import type { Project, Relation } from "../src/domain/model.js";
-import type { GitHubIssue, GitHubPullRequest } from "../src/github/client.js";
+import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../src/github/client.js";
 import { MainOrchestrator } from "../src/runtime/main.js";
+import { GitBaseMergeConflictError } from "../src/vcs/git.js";
 import type { WorkerLaunchInput, WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
@@ -24,6 +25,8 @@ interface HarnessOptions {
   branchPolicyAvailable?: boolean;
   failAfterPullRequestCreate?: boolean;
   remoteBranchExists?: boolean;
+  baseMergeConflict?: boolean;
+  mergeError?: Error;
   localCloneMissing?: boolean;
   inspect?: () => Promise<WorkerPresence>;
   result?: (input: WorkerLaunchInput, launchNumber: number, defaultResult: Record<string, unknown>) => Record<string, unknown> | null;
@@ -38,9 +41,11 @@ interface MainHarness {
   pullRequests: Map<number, GitHubPullRequest>;
   notifications: string[];
   synchronizedHeads: string[];
+  baseMerges: Array<{ path: string; defaultBranch: string }>;
   restoredClones: Array<{ projectSlug: string; branchName: string; headCommit: string }>;
   setPullRequest(number: number, update: Partial<GitHubPullRequest>): void;
   setBranchPolicyAvailable(available: boolean): void;
+  setRemoteBranchExists(exists: boolean): void;
 }
 
 async function createHarness(t: test.TestContext, options: HarnessOptions = {}): Promise<MainHarness> {
@@ -82,6 +87,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   const notifications: string[] = [];
   const pullRequests = new Map<number, GitHubPullRequest>();
   let branchPolicyAvailable = options.branchPolicyAvailable ?? true;
+  let remoteBranchExists = options.remoteBranchExists ?? true;
+  const baseMerges: Array<{ path: string; defaultBranch: string }> = [];
   let nextPullRequest = 13;
   const github = {
     async repositoryInDirectory(path: string) {
@@ -150,6 +157,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       };
     },
     async mergeSquash(_project: Project, number: number, expectedHead: string) {
+      if (options.mergeError) throw options.mergeError;
       const pullRequest = pullRequests.get(number);
       if (!pullRequest) throw new Error(`pull request ${number} not found`);
       if (pullRequest.headRefOid !== expectedHead) throw new Error("pull request head changed before merge");
@@ -187,19 +195,26 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         pullRequests.set(existing.number, {
           ...existing,
           headRefOid: heads.get(path) ?? existing.headRefOid,
-          reviewDecision: null,
-          reviews: [],
           checks: [],
         });
       }
     },
     async remoteBranchCommit(_project: Project, branchName: string) {
-      if (options.remoteBranchExists === false) return null;
+      if (!remoteBranchExists) return null;
       return [...pullRequests.values()].find((candidate) => candidate.headRefName === branchName)?.headRefOid ?? "branch-present";
     },
     async syncBranchHead(_project: Project, path: string, _branchName: string, expectedCommit: string) {
       heads.set(path, expectedCommit);
       synchronizedHeads.push(expectedCommit);
+    },
+    async fetchAndMergeBase(path: string, defaultBranch: string) {
+      baseMerges.push({ path, defaultBranch });
+      if (options.baseMergeConflict) {
+        throw new GitBaseMergeConflictError("d".repeat(40), ["src/conflict.ts"]);
+      }
+      const headCommit = "f".repeat(40);
+      heads.set(path, headCommit);
+      return { baseCommit: "d".repeat(40), headCommit, merged: true };
     },
     async createReadOnlyCheckout(_project: Project, path: string, commit: string) {
       await mkdir(path, { recursive: true });
@@ -284,8 +299,12 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       assert.ok(current, `unknown pull request ${number}`);
       pullRequests.set(number, { ...current, ...update });
     },
+    baseMerges,
     setBranchPolicyAvailable(available) {
       branchPolicyAvailable = available;
+    },
+    setRemoteBranchExists(exists) {
+      remoteBranchExists = exists;
     },
   };
 }
@@ -337,6 +356,7 @@ test("a current-head GitHub approval satisfies the external branch policy", asyn
   harness.setPullRequest(number, {
     reviewDecision: "APPROVED",
     reviews: [{
+      id: "approval-1",
       author: "maintainer",
       state: "APPROVED",
       submittedAt: "2026-01-01T00:00:00Z",
@@ -385,7 +405,6 @@ test("reopened issue generations use distinct branches and pull requests", async
 
 const reworkScenarios: Array<{ name: string; update: Partial<GitHubPullRequest> }> = [
   { name: "failed required CI", update: { checks: [{ name: "CI", state: "COMPLETED", conclusion: "FAILURE", detailsUrl: null }] } },
-  { name: "change-request review", update: { reviewDecision: "CHANGES_REQUESTED" } },
 ];
 
 for (const scenario of reworkScenarios) {
@@ -414,6 +433,171 @@ for (const scenario of reworkScenarios) {
     assert.equal(harness.pullRequests.get(number)?.reviewDecision, null);
   });
 }
+
+test("persistent CHANGES_REQUESTED reworks only once for the same review and reviewed head", async (t) => {
+  const harness = await createHarness(t, { requireExternalApproval: true });
+  const workItemId = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const [number, original] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number && original);
+  harness.setPullRequest(number, {
+    reviewDecision: "CHANGES_REQUESTED",
+    reviews: [{
+      id: "changes-request-1",
+      author: "maintainer",
+      state: "CHANGES_REQUESTED",
+      submittedAt: "2026-01-02T00:00:00Z",
+      commitId: original.headRefOid,
+    }],
+  });
+
+  await harness.main.runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    const trigger = store.getWorkItemRuntime(workItemId)?.lastReworkTrigger;
+    assert.ok(trigger?.includes("changes-request-1"));
+    assert.ok(trigger?.includes(original.headRefOid));
+  } finally {
+    store.close();
+  }
+
+  await harness.main.runPass();
+  await harness.main.runPass();
+  let state = await harness.main.statusSnapshot();
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement", "review"]);
+  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.decisions.length, 0);
+  assert.equal(harness.pullRequests.get(number)?.reviewDecision, "CHANGES_REQUESTED");
+  assert.notEqual(harness.pullRequests.get(number)?.headRefOid, original.headRefOid);
+
+  await harness.main.runPass();
+  state = await harness.main.statusSnapshot();
+  assert.equal(harness.launches.length, 4);
+  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.decisions.length, 0);
+});
+
+test("base movement merges the base into the PR branch and schedules a fresh review", async (t) => {
+  const harness = await createHarness(t);
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const [number, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number && pullRequest);
+
+  harness.setPullRequest(number, { baseRefOid: "d".repeat(40) });
+  await harness.main.runPass();
+
+  assert.deepEqual(harness.baseMerges, [{ path: join(harness.workspacePath, "workers", "example", "example:issue-7:g1"), defaultBranch: "main" }]);
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "review"]);
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Reviewing");
+  assert.equal((await harness.main.statusSnapshot()).decisions.length, 0);
+});
+
+test("base merge conflicts create one merge_conflict Decision", async (t) => {
+  const harness = await createHarness(t, { baseMergeConflict: true });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const [number, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number && pullRequest);
+
+  harness.setPullRequest(number, { baseRefOid: "d".repeat(40) });
+  await harness.main.runPass();
+  let state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.decisions.length, 1);
+  assert.equal(state.decisions[0]?.kind, "merge_conflict");
+
+  await harness.main.runPass();
+  state = await harness.main.statusSnapshot();
+  assert.equal(harness.baseMerges.length, 1);
+  assert.equal(state.decisions.length, 1);
+  assert.equal(state.decisions[0]?.kind, "merge_conflict");
+});
+
+test("permanent squash-merge rejection blocks without an automatic retry", async (t) => {
+  const harness = await createHarness(t, {
+    mergeError: new GitHubMergeError("rejected", "Squash merging is disabled"),
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const decision = (await harness.main.statusSnapshot()).decisions[0];
+  assert.ok(decision);
+
+  await harness.main.resolveMergeDecision(decision.id, true);
+  let state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems[0]?.state, "Blocked");
+  assert.equal(state.workItems[0]?.blockedReason, "merge_failed");
+  assert.equal(state.decisions.length, 0);
+  const taskCount = state.tasks.length;
+
+  await harness.main.runPass();
+  state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems[0]?.blockedReason, "merge_failed");
+  assert.equal(state.decisions.length, 0);
+  assert.equal(state.tasks.length, taskCount);
+});
+
+test("manual merge completes a blocked PR-backed WorkItem with a different resume state", async (t) => {
+  const harness = await createHarness(t);
+  const workItemId = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const pullRequestNumber = [...harness.pullRequests.keys()][0];
+  assert.ok(pullRequestNumber);
+
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    store.transitionWorkItem(workItemId, "Implementing");
+    store.transitionWorkItem(workItemId, "Blocked", "task_failed");
+  } finally {
+    store.close();
+  }
+  harness.setPullRequest(pullRequestNumber, {
+    state: "CLOSED",
+    mergedAt: "2026-01-03T00:00:00Z",
+    mergeCommitSha: "f".repeat(40),
+  });
+
+  await harness.main.runPass();
+  const state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems[0]?.state, "Done");
+  assert.equal(state.objectives[0]?.state, "Done");
+  assert.equal(state.decisions.length, 0);
+});
+
+test("stopping a high-priority Objective recomputes shared WorkItem priority", async (t) => {
+  const harness = await createHarness(t);
+  const normal = await harness.main.startObjective({
+    goal: "Normal priority owner",
+    projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }],
+    priority: "normal",
+  });
+  const high = await harness.main.startObjective({
+    goal: "High priority owner",
+    projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }],
+    priority: "high",
+  });
+  assert.equal(high.workItems[0]?.priority, "high");
+
+  await harness.main.stopObjectives(high.objective.id);
+
+  const state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems[0]?.id, normal.workItems[0]?.id);
+  assert.equal(state.workItems[0]?.priority, "normal");
+  assert.equal(state.objectives.find((objective) => objective.id === high.objective.id)?.state, "Stopped");
+});
 
 test("one active WorkItem can serve multiple Objectives and completion updates both", async (t) => {
   const harness = await createHarness(t);
@@ -578,6 +762,7 @@ test("new Main consumes a healthy worker result after a crash without restarting
         return reported;
       },
       async pushBranch() {},
+      async fetchAndMergeBase() { return { baseCommit: "base-sha", headCommit: "base-sha", merged: false }; },
     },
     github: {
       async repositoryInDirectory(path) {
@@ -947,7 +1132,7 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
   for (const [number, pullRequest] of pullRequests) {
     setPullRequest(number, {
       checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }],
-      reviews: [{ author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: pullRequest.headRefOid }],
+      reviews: [{ id: `approval-${number}`, author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: pullRequest.headRefOid }],
     });
   }
   await main.runPass();
@@ -972,7 +1157,7 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
   assert.ok(webPullRequest);
   setPullRequest(webPullRequest[0], {
     checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }],
-    reviews: [{ author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: webPullRequest[1].headRefOid }],
+    reviews: [{ id: `approval-${webPullRequest[0]}`, author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: webPullRequest[1].headRefOid }],
   });
   await main.runPass();
   const pending = (await main.statusSnapshot()).decisions;

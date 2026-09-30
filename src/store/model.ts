@@ -30,6 +30,7 @@ export interface WorkItemRuntimeRecord {
   reviewRound: number;
   infrastructureRetries: number;
   implementationAttempt: number;
+  lastReworkTrigger: string | null;
   lastReconciledAt: string | null;
 }
 

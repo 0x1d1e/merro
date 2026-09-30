@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { CommandOptions, CommandOutput, CommandRunner } from "../src/runtime/commands.js";
-import { GitHubClient } from "../src/github/client.js";
+import { GitHubClient, GitHubMergeError } from "../src/github/client.js";
 
 class FakeCommands implements CommandRunner {
   readonly calls: Array<{ file: string; args: readonly string[]; options?: CommandOptions }> = [];
@@ -187,6 +187,27 @@ test("squash merge requires the approved pull request head commit", async () => 
     "--match-head-commit", expectedHead,
   ]);
   await assert.rejects(new GitHubClient(new FakeCommands([])).mergeSquash(project, 23, "bad-sha"), /invalid expected/);
+});
+
+test("squash merge classifies permanent rejection separately from availability failure", async () => {
+  const expectedHead = "a".repeat(40);
+  const rejected = new GitHubClient(new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("Squash merging is disabled for this repository"),
+  ]));
+  await assert.rejects(
+    rejected.mergeSquash(project, 23, expectedHead),
+    (error: unknown) => error instanceof GitHubMergeError && error.kind === "rejected",
+  );
+
+  const unavailable = new GitHubClient(new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("gh pr merge failed (ETIMEDOUT): network timeout"),
+  ]));
+  await assert.rejects(
+    unavailable.mergeSquash(project, 23, expectedHead),
+    (error: unknown) => error instanceof GitHubMergeError && error.kind === "unavailable",
+  );
 });
 
 test("branch protection combines classic settings with active rulesets", async () => {

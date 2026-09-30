@@ -76,6 +76,7 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       reviewRound: 1,
       infrastructureRetries: 0,
       implementationAttempt: 2,
+      lastReworkTrigger: null,
       lastReconciledAt: null,
     });
     assert.equal(store.getWorkItemRuntime("a")?.implementationAttempt, 2);

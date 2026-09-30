@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 7;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -240,4 +240,20 @@ ALTER TABLE task_runtime ADD COLUMN runtime_kind TEXT CHECK (runtime_kind IN ('d
 
 export const MIGRATION_5 = `
 ALTER TABLE work_item_runtime ADD COLUMN merged_commit_sha TEXT;
+`;
+
+export const MIGRATION_6 = `
+ALTER TABLE work_item_runtime ADD COLUMN last_rework_trigger TEXT;
+`;
+
+export const MIGRATION_7 = `
+DROP TRIGGER IF EXISTS blocked_work_items_resume_previous_flow;
+CREATE TRIGGER blocked_work_items_resume_previous_flow
+BEFORE UPDATE ON work_items
+WHEN OLD.state = 'Blocked'
+  AND NEW.state NOT IN ('Blocked', 'Obsolete', 'Cancelled', 'Done')
+  AND NEW.state IS NOT OLD.blocked_resume_state
+BEGIN
+  SELECT RAISE(ABORT, 'Blocked WorkItem must resume previous flow state');
+END;
 `;

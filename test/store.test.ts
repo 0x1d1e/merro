@@ -35,6 +35,31 @@ test("terminal generation allows a fresh generation", () => {
   }
 });
 
+test("external PR merge completes a blocked WorkItem regardless of its resume state", () => {
+  const store = makeStore();
+  try {
+    store.createWorkItem({
+      id: "blocked-implement",
+      projectSlug: "p",
+      sourceType: "issue",
+      sourceRef: "8",
+      generation: 1,
+      state: "Implementing",
+      priority: "normal",
+      readySince: null,
+      blockedReason: null,
+      blockedResumeState: null,
+    });
+    store.transitionWorkItem("blocked-implement", "Blocked", "task_failed");
+
+    store.completeWorkItemAfterExternalMerge("blocked-implement");
+
+    assert.equal(store.getWorkItem("blocked-implement")?.state, "Done");
+  } finally {
+    store.close();
+  }
+});
+
 test("store enforces one active Task per WorkItem and immutable finalization", () => {
   const store = makeStore();
   try {

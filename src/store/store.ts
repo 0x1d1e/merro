@@ -1,22 +1,24 @@
 import { DatabaseSync } from "node:sqlite";
-import type {
-  BlockReason,
-  Decision,
-  FlowWorkItemState,
-  Objective,
-  Project,
-  Relation,
-  ReviewRoundLimit,
-  Task,
-  TaskOutcome,
-  TaskRole,
-  WorkItem,
-  WorkItemState,
+import {
+  priorityRank,
+  type BlockReason,
+  type Decision,
+  type FlowWorkItemState,
+  type Objective,
+  type Priority,
+  type Project,
+  type Relation,
+  type ReviewRoundLimit,
+  type Task,
+  type TaskOutcome,
+  type TaskRole,
+  type WorkItem,
+  type WorkItemState,
 } from "../domain/model.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
 import type { ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -169,6 +171,30 @@ export class MerroStore {
         this.#db.prepare("UPDATE schema_meta SET version = 5").run();
         this.#db.exec("COMMIT");
         version = 5;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version < 6) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_6);
+        this.#db.prepare("UPDATE schema_meta SET version = 6").run();
+        this.#db.exec("COMMIT");
+        version = 6;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version < 7) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_7);
+        this.#db.prepare("UPDATE schema_meta SET version = 7").run();
+        this.#db.exec("COMMIT");
+        version = 7;
       } catch (error) {
         this.#db.exec("ROLLBACK");
         throw error;
@@ -378,6 +404,7 @@ export class MerroStore {
       reviewRound: Number(row.review_round),
       infrastructureRetries: Number(row.infrastructure_retries),
       implementationAttempt: Number(row.implementation_attempt),
+      lastReworkTrigger: row.last_rework_trigger === null ? null : String(row.last_rework_trigger),
       lastReconciledAt: row.last_reconciled_at === null ? null : String(row.last_reconciled_at),
     };
   }
@@ -387,20 +414,38 @@ export class MerroStore {
       INSERT INTO work_item_runtime(
         work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
         pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, review_round,
-        infrastructure_retries, implementation_attempt, last_reconciled_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        infrastructure_retries, implementation_attempt, last_reconciled_at, last_rework_trigger
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(work_item_id) DO UPDATE SET
         branch_name = excluded.branch_name, clone_path = excluded.clone_path, base_commit = excluded.base_commit,
         pull_request_number = excluded.pull_request_number, pull_request_url = excluded.pull_request_url,
         pull_request_state = excluded.pull_request_state, pull_request_head_sha = excluded.pull_request_head_sha,
         pull_request_base_sha = excluded.pull_request_base_sha, merged_commit_sha = excluded.merged_commit_sha,
         review_round = excluded.review_round, infrastructure_retries = excluded.infrastructure_retries,
-        implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at
+        implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at,
+        last_rework_trigger = excluded.last_rework_trigger
     `).run(
       record.workItemId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
       record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
-      record.mergedCommitSha, record.reviewRound, record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt,
+      record.mergedCommitSha, record.reviewRound, record.infrastructureRetries, record.implementationAttempt,
+      record.lastReconciledAt, record.lastReworkTrigger,
     );
+  }
+
+  markPullRequestRework(runtime: WorkItemRuntimeRecord): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const item = this.getWorkItem(runtime.workItemId);
+      if (!item || item.state !== "AwaitingMerge") {
+        throw new Error(`WorkItem ${runtime.workItemId} is not AwaitingMerge`);
+      }
+      this.saveWorkItemRuntime(runtime);
+      this.transitionWorkItem(item.id, "Implementing");
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getTaskRuntime(taskId: string): TaskRuntimeRecord | null {
@@ -562,6 +607,27 @@ export class MerroStore {
     return row ? workItemFromRow(row) : null;
   }
 
+  completeWorkItemAfterExternalMerge(id: string): void {
+    const item = this.getWorkItem(id);
+    if (!item) throw new Error(`unknown WorkItem: ${id}`);
+    if (item.state !== "AwaitingMerge" && item.state !== "Blocked") {
+      throw new Error(`WorkItem ${id} is not awaiting an external pull request merge`);
+    }
+    if (this.activeTask(id)) throw new Error(`WorkItem ${id} still has an active Task`);
+    this.#db.prepare(`
+      UPDATE work_items
+      SET state = 'Done', blocked_reason = NULL, blocked_resume_state = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(now(), id);
+    this.appendEvent("WorkItem", id, "state_changed", {
+      from: item.state,
+      to: "Done",
+      reason: "pull_request_merged_externally",
+      blockedReason: null,
+      blockedResumeState: null,
+    });
+  }
+
   transitionWorkItem(id: string, to: WorkItemState, blockedReason: BlockReason | null = null): void {
     const item = this.getWorkItem(id);
     if (!item) throw new Error(`unknown WorkItem: ${id}`);
@@ -713,8 +779,18 @@ export class MerroStore {
 
       for (const workItemId of affectedWorkItemIds) {
         const item = this.getWorkItem(workItemId);
-        if (!item || item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled"
-          || this.activeTask(item.id) || this.hasActiveObjectiveForWorkItem(item.id)) continue;
+        if (!item || item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled") continue;
+        if (this.hasActiveObjectiveForWorkItem(item.id)) {
+          const priorities = this.#db.prepare(`
+            SELECT o.priority FROM objectives o
+            JOIN objective_work_items ow ON ow.objective_id = o.id
+            WHERE ow.work_item_id = ? AND o.state = 'Active'
+          `).all(item.id).map((row) => row.priority as Priority);
+          const highest = priorities.sort((left, right) => priorityRank(left) - priorityRank(right))[0];
+          if (highest && highest !== item.priority) this.setWorkItemPriority(item.id, highest);
+          continue;
+        }
+        if (this.activeTask(item.id)) continue;
         this.transitionWorkItem(item.id, "Obsolete");
         for (const decision of this.pendingDecisions()) {
           if (decision.kind === "merge" && decision.subjectId === item.id) this.resolveDecision(decision.id, "resolved");

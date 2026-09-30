@@ -19,6 +19,7 @@ export interface GitHubIssue {
 }
 
 export interface GitHubReview {
+  id: string | null;
   author: string;
   state: string;
   submittedAt: string | null;
@@ -156,6 +157,7 @@ function parseReview(value: unknown): GitHubReview {
     ? nullableString((row.commit as Record<string, unknown>).oid)
     : nullableString(row.commit);
   return {
+    id: typeof row.id === "string" || typeof row.id === "number" ? String(row.id) : null,
     author: author ?? "",
     state: typeof row.state === "string" ? row.state : "",
     submittedAt: nullableString(row.submittedAt),
@@ -197,6 +199,20 @@ function parsePullRequest(value: unknown): GitHubPullRequest {
     reviews,
     checks,
   };
+}
+
+export class GitHubMergeError extends Error {
+  constructor(readonly kind: "unavailable" | "rejected", message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "GitHubMergeError";
+  }
+}
+
+function isGitHubAvailabilityFailure(error: unknown): boolean {
+  const message = error instanceof CommandError
+    ? `${error.message} ${error.stderr} ${error.causeCode ?? ""}`
+    : error instanceof Error ? error.message : String(error);
+  return /\b(?:ENOENT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN)\b|\b(?:401|429|502|503|504)\b|rate limit|timed? ?out|network|connection (?:reset|refused|closed)|could not resolve|failed to connect|not logged in|authentication token/i.test(message);
 }
 
 export class GitHubClient {
@@ -358,10 +374,18 @@ export class GitHubClient {
     if (!/^[0-9a-f]{40,64}$/i.test(expectedHeadCommit)) {
       throw new Error(`invalid expected pull request head SHA: ${expectedHeadCommit}`);
     }
-    const repository = await this.repository(project.baseRemote);
-    await this.#commands.run("gh", [
-      "pr", "merge", String(number), "--repo", repository.nameWithOwner,
-      "--squash", "--match-head-commit", expectedHeadCommit,
-    ], { cwd: project.path });
+    try {
+      const repository = await this.repository(project.baseRemote);
+      await this.#commands.run("gh", [
+        "pr", "merge", String(number), "--repo", repository.nameWithOwner,
+        "--squash", "--match-head-commit", expectedHeadCommit,
+      ], { cwd: project.path });
+    } catch (error) {
+      throw new GitHubMergeError(
+        isGitHubAvailabilityFailure(error) ? "unavailable" : "rejected",
+        error instanceof Error ? error.message : String(error),
+        { cause: error },
+      );
+    }
   }
 }

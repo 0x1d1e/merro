@@ -10,6 +10,13 @@ export interface WorkItemClone {
   baseCommit: string;
 }
 
+export class GitBaseMergeConflictError extends Error {
+  constructor(readonly baseCommit: string, readonly conflictingPaths: string[], options?: ErrorOptions) {
+    super(`merging base ${baseCommit} caused conflicts: ${conflictingPaths.join(", ") || "unknown files"}`, options);
+    this.name = "GitBaseMergeConflictError";
+  }
+}
+
 export class GitClient {
   readonly #commands: CommandRunner;
 
@@ -131,7 +138,17 @@ export class GitClient {
     } catch (error) {
       if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
     }
-    await this.#run("git", ["merge", "--no-edit", baseCommit], { cwd: path });
+    try {
+      await this.#run("git", ["merge", "--no-edit", baseCommit], { cwd: path });
+    } catch (error) {
+      if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
+      const conflicts = await this.#run("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: path });
+      await this.#run("git", ["merge", "--abort"], { cwd: path }).catch(() => {});
+      if (conflicts.stdout.trim()) {
+        throw new GitBaseMergeConflictError(baseCommit, conflicts.stdout.trim().split(/\r?\n/), { cause: error });
+      }
+      throw error;
+    }
     return { baseCommit, headCommit: await this.currentCommit(path), merged: true };
   }
 
