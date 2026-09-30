@@ -55,6 +55,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS work_items_one_live_generation
 ON work_items(project_slug, source_type, source_ref)
 WHERE state NOT IN ('Done', 'Obsolete', 'Cancelled');
 
+CREATE TRIGGER IF NOT EXISTS work_items_block_from_current_flow
+BEFORE UPDATE ON work_items
+WHEN OLD.state <> 'Blocked'
+  AND NEW.state = 'Blocked'
+  AND NEW.blocked_resume_state IS NOT OLD.state
+BEGIN
+  SELECT RAISE(ABORT, 'Blocked WorkItem resume state must match previous flow state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS blocked_work_items_resume_previous_flow
+BEFORE UPDATE ON work_items
+WHEN OLD.state = 'Blocked'
+  AND NEW.state NOT IN ('Blocked', 'Obsolete', 'Cancelled')
+  AND NEW.state IS NOT OLD.blocked_resume_state
+BEGIN
+  SELECT RAISE(ABORT, 'Blocked WorkItem must resume previous flow state');
+END;
+
 CREATE TRIGGER IF NOT EXISTS terminal_work_items_core_immutable_update
 BEFORE UPDATE ON work_items
 WHEN OLD.state IN ('Done', 'Obsolete', 'Cancelled')
