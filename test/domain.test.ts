@@ -16,6 +16,7 @@ function item(id: string, state: WorkItem["state"], priority: WorkItem["priority
     priority,
     readySince: state === "Ready" ? readySince : null,
     blockedReason: null,
+    blockedResumeState: null,
   };
 }
 
@@ -38,6 +39,13 @@ test("active WorkItems cannot become Obsolete before their Task finishes", () =>
   assert.throws(() => assertWorkItemTransition("Reviewing", "Obsolete"), /invalid WorkItem transition/);
   assert.throws(() => assertWorkItemTransition("AwaitingMerge", "Obsolete"), /invalid WorkItem transition/);
   assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Obsolete"));
+});
+
+test("Blocked WorkItems resume only to their persisted previous flow state", () => {
+  assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Ready", "Ready"));
+  assert.throws(() => assertWorkItemTransition("Blocked", "Reviewing", "Ready"), /invalid WorkItem transition/);
+  assert.throws(() => assertWorkItemTransition("Blocked", "Planned", null), /invalid WorkItem transition/);
+  assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Cancelled", "Ready"));
 });
 
 test("Conflicts are canonicalized symmetrically", () => {
