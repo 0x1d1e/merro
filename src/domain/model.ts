@@ -1,15 +1,25 @@
 export type Priority = "high" | "normal" | "low";
 export type ObjectiveState = "Active" | "Done" | "Stopped";
+export type FlowWorkItemState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "AwaitingMerge";
 export type WorkItemState =
-  | "Planned"
-  | "Ready"
-  | "Implementing"
-  | "Reviewing"
-  | "AwaitingMerge"
+  | FlowWorkItemState
   | "Blocked"
   | "Done"
   | "Obsolete"
   | "Cancelled";
+export type BlockReason =
+  | "review_cap"
+  | "cycle"
+  | "task_failed"
+  | "clone_lost"
+  | "policy_unknown"
+  | "github_unavailable"
+  | "structural_rejected"
+  | "merge_rejected"
+  | "merge_failed"
+  | "pr_closed"
+  | "remote_branch_deleted"
+  | "project_unavailable";
 export type TaskRole = "implement" | "review";
 export type TaskOutcome = "success" | "failed" | "cancelled" | "pass" | "reject";
 export type RelationKind = "Requires" | "Conflicts";
@@ -39,7 +49,8 @@ export interface WorkItem {
   state: WorkItemState;
   priority: Priority;
   readySince: string | null;
-  blockedReason: string | null;
+  blockedReason: BlockReason | null;
+  blockedResumeState: FlowWorkItemState | null;
 }
 
 export interface Relation {
@@ -57,6 +68,14 @@ export interface SchedulingInput {
   activeTaskCount: number;
   maxConcurrentTasks: number | "unlimited";
 }
+
+export const FLOW_WORK_ITEM_STATES = new Set<FlowWorkItemState>([
+  "Planned",
+  "Ready",
+  "Implementing",
+  "Reviewing",
+  "AwaitingMerge",
+]);
 
 export const TERMINAL_WORK_ITEM_STATES = new Set<WorkItemState>([
   "Done",
