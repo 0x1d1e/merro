@@ -35,9 +35,19 @@ CREATE TABLE IF NOT EXISTS work_items (
   state TEXT NOT NULL CHECK (state IN ('Planned','Ready','Implementing','Reviewing','AwaitingMerge','Blocked','Done','Obsolete','Cancelled')),
   priority TEXT NOT NULL CHECK (priority IN ('high', 'normal', 'low')),
   ready_since TEXT,
-  blocked_reason TEXT,
+  blocked_reason TEXT CHECK (blocked_reason IN (
+    'review_cap','cycle','task_failed','clone_lost','policy_unknown','github_unavailable',
+    'structural_rejected','merge_rejected','merge_failed','pr_closed',
+    'remote_branch_deleted','project_unavailable'
+  )),
+  blocked_resume_state TEXT CHECK (blocked_resume_state IN ('Planned','Ready','Implementing','Reviewing','AwaitingMerge')),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  CHECK (
+    (state = 'Blocked' AND blocked_reason IS NOT NULL AND blocked_resume_state IS NOT NULL)
+    OR
+    (state <> 'Blocked' AND blocked_reason IS NULL AND blocked_resume_state IS NULL)
+  ),
   UNIQUE(project_slug, source_type, source_ref, generation)
 );
 
@@ -58,6 +68,7 @@ WHEN OLD.state IN ('Done', 'Obsolete', 'Cancelled')
     OR NEW.priority IS NOT OLD.priority
     OR NEW.ready_since IS NOT OLD.ready_since
     OR NEW.blocked_reason IS NOT OLD.blocked_reason
+    OR NEW.blocked_resume_state IS NOT OLD.blocked_resume_state
     OR NEW.created_at IS NOT OLD.created_at
   )
 BEGIN
