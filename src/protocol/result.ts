@@ -42,6 +42,7 @@ export interface ReviewFailedResult {
   status: "failed";
   summary: string;
   reason: string;
+  reviewed_commit: string;
   findings: ReviewFinding[];
   verification: Verification[];
 }
@@ -96,6 +97,13 @@ function verificationList(value: unknown): Verification[] {
   });
 }
 
+function assertSuccessfulVerification(verification: readonly Verification[], status: "success" | "pass"): void {
+  const failed = verification.find((entry) => entry.kind === "command" && entry.exit_code !== 0);
+  if (failed && failed.kind === "command") {
+    throw new ResultValidationError(`${status} result contains failing verification: ${failed.command} exited ${failed.exit_code}`);
+  }
+}
+
 function findings(value: unknown): ReviewFinding[] {
   if (!Array.isArray(value)) throw new ResultValidationError("findings must be an array");
   return value.map((entry, index) => {
@@ -134,6 +142,7 @@ export function parseImplementResult(value: unknown): ImplementSuccessResult | I
   const verification = verificationList(row.verification);
 
   if (row.status === "success") {
+    assertSuccessfulVerification(verification, "success");
     const result: ImplementSuccessResult = {
       task_id,
       status: "success",
@@ -169,6 +178,7 @@ export function parseReviewResult(value: unknown): ReviewResult | ReviewFailedRe
   const summary = text(row.summary, "summary");
   const parsedFindings = findings(row.findings);
   const verification = verificationList(row.verification);
+  const reviewed_commit = text(row.reviewed_commit, "reviewed_commit");
 
   if (row.status === "failed") {
     return {
@@ -176,6 +186,7 @@ export function parseReviewResult(value: unknown): ReviewResult | ReviewFailedRe
       status: "failed",
       summary,
       reason: text(row.reason, "reason"),
+      reviewed_commit,
       findings: parsedFindings,
       verification,
     };
@@ -192,12 +203,15 @@ export function parseReviewResult(value: unknown): ReviewResult | ReviewFailedRe
   if (row.status === "reject" && !hasBlocking) {
     throw new ResultValidationError("review reject requires at least one blocking finding");
   }
+  if (row.status === "pass") {
+    assertSuccessfulVerification(verification, "pass");
+  }
 
   return {
     task_id,
     status: row.status,
     summary,
-    reviewed_commit: text(row.reviewed_commit, "reviewed_commit"),
+    reviewed_commit,
     findings: parsedFindings,
     verification,
   };
