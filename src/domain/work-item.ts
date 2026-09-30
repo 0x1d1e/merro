@@ -4,9 +4,9 @@ import { TERMINAL_WORK_ITEM_STATES } from "./model.js";
 const allowedTransitions: Readonly<Record<WorkItemState, ReadonlySet<WorkItemState>>> = {
   Planned: new Set(["Ready", "Blocked", "Obsolete", "Cancelled"]),
   Ready: new Set(["Implementing", "Blocked", "Obsolete", "Cancelled"]),
-  Implementing: new Set(["Reviewing", "Blocked", "Obsolete"]),
-  Reviewing: new Set(["Implementing", "AwaitingMerge", "Blocked", "Obsolete"]),
-  AwaitingMerge: new Set(["Done", "Blocked", "Obsolete"]),
+  Implementing: new Set(["Reviewing", "Blocked"]),
+  Reviewing: new Set(["Implementing", "AwaitingMerge", "Blocked"]),
+  AwaitingMerge: new Set(["Done", "Blocked"]),
   Blocked: new Set(["Planned", "Ready", "Implementing", "Reviewing", "AwaitingMerge", "Obsolete", "Cancelled"]),
   Done: new Set(),
   Obsolete: new Set(),
