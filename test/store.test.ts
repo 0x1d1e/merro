@@ -13,8 +13,8 @@ function makeStore(): MerroStore {
 test("store enforces one non-terminal generation per source", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({ id: "p:issue-1:g1", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 1, state: "Ready", priority: "normal", readySince: "2026-01-01T00:00:00Z", blockedReason: null });
-    assert.throws(() => store.createWorkItem({ id: "p:issue-1:g2", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null }));
+    store.createWorkItem({ id: "p:issue-1:g1", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 1, state: "Ready", priority: "normal", readySince: "2026-01-01T00:00:00Z", blockedReason: null, blockedResumeState: null });
+    assert.throws(() => store.createWorkItem({ id: "p:issue-1:g2", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null }));
   } finally {
     store.close();
   }
@@ -23,9 +23,9 @@ test("store enforces one non-terminal generation per source", () => {
 test("terminal generation allows a fresh generation", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({ id: "p:issue-1:g1", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 1, state: "AwaitingMerge", priority: "normal", readySince: null, blockedReason: null });
+    store.createWorkItem({ id: "p:issue-1:g1", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 1, state: "AwaitingMerge", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
     store.transitionWorkItem("p:issue-1:g1", "Done");
-    store.createWorkItem({ id: "p:issue-1:g2", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null });
+    store.createWorkItem({ id: "p:issue-1:g2", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
     assert.equal(store.getWorkItem("p:issue-1:g2")?.generation, 2);
   } finally {
     store.close();
@@ -35,7 +35,7 @@ test("terminal generation allows a fresh generation", () => {
 test("store enforces one active Task per WorkItem and immutable finalization", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({ id: "w", projectSlug: "p", sourceType: "local", sourceRef: "w", generation: 1, state: "Implementing", priority: "normal", readySince: null, blockedReason: null });
+    store.createWorkItem({ id: "w", projectSlug: "p", sourceType: "local", sourceRef: "w", generation: 1, state: "Implementing", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
     store.createTask({ id: "t1", workItemId: "w", role: "implement", attempt: 1 });
     assert.throws(() => store.createTask({ id: "t2", workItemId: "w", role: "review", attempt: 1 }));
     store.finalizeTask({ id: "t1", outcome: "success", summary: "done", resultJson: "{}", commitSha: "abc" });
@@ -71,6 +71,88 @@ test("SQLite trigger protects terminal WorkItem core fields", () => {
     );
 
     assert.doesNotThrow(() => db.prepare("UPDATE work_items SET updated_at = ? WHERE id = 'done'").run("2026-01-02T00:00:00Z"));
+  } finally {
+    db.close();
+  }
+});
+
+
+test("Blocked transition requires a typed reason and resumes only to the previous flow state", () => {
+  const store = makeStore();
+  try {
+    store.createWorkItem({
+      id: "blocked",
+      projectSlug: "p",
+      sourceType: "issue",
+      sourceRef: "2",
+      generation: 1,
+      state: "Ready",
+      priority: "normal",
+      readySince: "2026-01-01T00:00:00Z",
+      blockedReason: null,
+      blockedResumeState: null,
+    });
+
+    assert.throws(() => store.transitionWorkItem("blocked", "Blocked"), /requires a BlockReason/);
+
+    store.transitionWorkItem("blocked", "Blocked", "task_failed");
+    const blocked = store.getWorkItem("blocked");
+    assert.equal(blocked?.state, "Blocked");
+    assert.equal(blocked?.blockedReason, "task_failed");
+    assert.equal(blocked?.blockedResumeState, "Ready");
+
+    assert.throws(
+      () => store.transitionWorkItem("blocked", "Reviewing"),
+      /invalid WorkItem transition/,
+    );
+
+    store.transitionWorkItem("blocked", "Ready");
+    const resumed = store.getWorkItem("blocked");
+    assert.equal(resumed?.state, "Ready");
+    assert.equal(resumed?.blockedReason, null);
+    assert.equal(resumed?.blockedResumeState, null);
+    assert.equal(resumed?.readySince, "2026-01-01T00:00:00Z");
+  } finally {
+    store.close();
+  }
+});
+
+test("SQLite rejects Blocked WorkItems without reason and resume state", () => {
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec(MIGRATION_1);
+    db.prepare(`
+      INSERT INTO projects(slug, path, base_remote, push_remote, default_branch, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run("p", "/tmp/p", "origin", "origin", "main", "2026-01-01T00:00:00Z");
+    db.prepare(`
+      INSERT INTO work_items(
+        id, project_slug, source_type, source_ref, generation, state, priority,
+        ready_since, blocked_reason, blocked_resume_state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "ready",
+      "p",
+      "issue",
+      "3",
+      1,
+      "Ready",
+      "normal",
+      "2026-01-01T00:00:00Z",
+      null,
+      null,
+      "2026-01-01T00:00:00Z",
+      "2026-01-01T00:00:00Z",
+    );
+
+    assert.throws(
+      () => db.prepare("UPDATE work_items SET state = 'Blocked' WHERE id = 'ready'").run(),
+    );
+    assert.throws(
+      () => db.prepare(
+        "UPDATE work_items SET state = 'Blocked', blocked_reason = 'not_a_reason', blocked_resume_state = 'Ready' WHERE id = 'ready'",
+      ).run(),
+    );
   } finally {
     db.close();
   }
