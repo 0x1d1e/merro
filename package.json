@@ -1,0 +1,26 @@
+{
+  "name": "@prightcord/merro",
+  "version": "0.1.0",
+  "description": "Pi package that coordinates multiple coding workers from one Main Pi session.",
+  "type": "module",
+  "keywords": ["pi-package", "pi-coding-agent", "coding-agent", "orchestration"],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node scripts/check-boundaries.mjs && npm run typecheck",
+    "test": "npm run build && node --test dist/test/*.test.js"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.87.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
