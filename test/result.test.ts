@@ -14,6 +14,16 @@ test("implement result requires commit and structured verification", () => {
   assert.doesNotThrow(() => assertResultMatchesTask({ expectedTaskId: "t1", expectedCommit: "abc", result }));
 });
 
+test("successful implement result rejects failing command verification", () => {
+  assert.throws(() => parseImplementResult({
+    task_id: "t1",
+    status: "success",
+    summary: "implemented",
+    commit: "abc",
+    verification: [{ kind: "command", project: "p", cwd: ".", command: "npm test", exit_code: 1 }],
+  }), /failing verification/);
+});
+
 test("review pass cannot contain blocking findings", () => {
   assert.throws(() => parseReviewResult({
     task_id: "t2",
@@ -25,6 +35,17 @@ test("review pass cannot contain blocking findings", () => {
   }), /blocking finding/);
 });
 
+test("review pass rejects failing command verification", () => {
+  assert.throws(() => parseReviewResult({
+    task_id: "t2",
+    status: "pass",
+    summary: "looks good",
+    reviewed_commit: "abc",
+    findings: [],
+    verification: [{ kind: "command", project: "p", cwd: ".", command: "npm test", exit_code: 2 }],
+  }), /failing verification/);
+});
+
 test("review reject requires a blocking finding", () => {
   assert.throws(() => parseReviewResult({
     task_id: "t2",
@@ -34,6 +55,28 @@ test("review reject requires a blocking finding", () => {
     findings: [{ severity: "note", summary: "minor" }],
     verification: [],
   }), /requires at least one blocking/);
+});
+
+test("failed review requires reviewed_commit and validates it", () => {
+  assert.throws(() => parseReviewResult({
+    task_id: "t2",
+    status: "failed",
+    summary: "could not verify",
+    reason: "tooling failed",
+    findings: [],
+    verification: [],
+  }), /reviewed_commit/);
+
+  const result = parseReviewResult({
+    task_id: "t2",
+    status: "failed",
+    summary: "could not verify",
+    reason: "tooling failed",
+    reviewed_commit: "abc",
+    findings: [],
+    verification: [],
+  });
+  assert.throws(() => assertResultMatchesTask({ expectedTaskId: "t2", expectedCommit: "def", result }), /reviewed_commit mismatch/);
 });
 
 test("task and commit mismatches are rejected", () => {
