@@ -6,7 +6,7 @@ Read before changing states, relations, scheduling, PR or merge flow, reconcilia
 
 1. User states Objective + Projects.
 2. Main inspects repos and GitHub (open issues only), proposes WorkItems and relations.
-3. User approves. Approval covers scope, structure, current plan. Persist each Project's issue scope: fixed issue numbers, or a query matching all specified labels and an optional milestone title. An empty query covers all open issues.
+3. User approves. Approval covers scope, structure, current plan. Persist exactly one approved issue scope per linked Project: fixed issue numbers, or a query matching all specified labels and an optional milestone title. An empty query covers all open issues.
 4. New WorkItems inside approved scope are added automatically. Scope expansion, new Project, unregistered Project, splitting an issue → structural Decision.
 5. Rejected structural change → affected WorkItems Blocked, wait for freeform direction.
 

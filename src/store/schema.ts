@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -292,4 +292,9 @@ ALTER TABLE task_runtime ADD COLUMN base_update_json TEXT CHECK (base_update_jso
 export const MIGRATION_11 = `
 ALTER TABLE objective_work_items ADD COLUMN in_scope INTEGER NOT NULL DEFAULT 1 CHECK (in_scope IN (0, 1));
 ALTER TABLE relations ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0 CHECK (automatic IN (0, 1));
+`;
+
+export const MIGRATION_12 = `
+ALTER TABLE task_runtime ADD COLUMN cleanup_completed_at TEXT;
+CREATE INDEX task_runtime_pending_cleanup ON task_runtime(task_id) WHERE cleanup_completed_at IS NULL;
 `;

@@ -2,11 +2,12 @@ import type { IssueQuery, ObjectiveIssueScope } from "./model.js";
 
 export function parseObjectiveIssueScopes(value: unknown, projectSlugs: readonly string[]): ObjectiveIssueScope[] {
   if (!Array.isArray(value)) throw new Error("Objective issue scopes must be an array");
+  const linkedProjects = new Set(projectSlugs);
   const projects = new Set<string>();
-  return value.map((entry) => {
+  const scopes: ObjectiveIssueScope[] = value.map((entry) => {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error("invalid Objective issue scope");
     const row = entry as Record<string, unknown>;
-    if (typeof row.projectSlug !== "string" || !projectSlugs.includes(row.projectSlug)) throw new Error("issue scope references an unlinked Project");
+    if (typeof row.projectSlug !== "string" || !linkedProjects.has(row.projectSlug)) throw new Error("issue scope references an unlinked Project");
     if (projects.has(row.projectSlug)) throw new Error(`duplicate issue scope for Project '${row.projectSlug}'`);
     projects.add(row.projectSlug);
     if (("numbers" in row) === ("query" in row)) throw new Error("issue scope requires either numbers or query, not both");
@@ -29,6 +30,10 @@ export function parseObjectiveIssueScopes(value: unknown, projectSlugs: readonly
       },
     };
   });
+  for (const project of linkedProjects) {
+    if (!projects.has(project)) throw new Error(`missing issue scope for Project '${project}'`);
+  }
+  return scopes;
 }
 
 export function matchesIssueQuery(query: IssueQuery, issue: { labels: readonly string[]; milestone?: string | null }): boolean {

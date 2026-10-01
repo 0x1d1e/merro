@@ -21,7 +21,7 @@ import { parseObjectiveIssueScopes } from "../domain/objective.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -246,6 +246,18 @@ export class MerroStore {
         this.#db.prepare("UPDATE schema_meta SET version = 11").run();
         this.#db.exec("COMMIT");
         version = 11;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version < 12) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_12);
+        this.#db.prepare("UPDATE schema_meta SET version = 12").run();
+        this.#db.exec("COMMIT");
+        version = 12;
       } catch (error) {
         this.#db.exec("ROLLBACK");
         throw error;
@@ -590,6 +602,7 @@ export class MerroStore {
       expectedCommit: String(row.expected_commit),
       ...(row.base_update_json === null ? {} : { baseUpdate: JSON.parse(String(row.base_update_json)) as BaseUpdate }),
       startedAt: String(row.started_at),
+      cleanupCompletedAt: row.cleanup_completed_at === null ? null : String(row.cleanup_completed_at),
     };
   }
 
@@ -969,6 +982,34 @@ export class MerroStore {
       ? this.#db.prepare("SELECT * FROM tasks ORDER BY started_at, id").all()
       : this.#db.prepare("SELECT * FROM tasks WHERE work_item_id = ? ORDER BY started_at, id").all(workItemId);
     return rows.map(taskFromRow);
+  }
+
+  listActiveTaskInputPaths(): string[] {
+    return this.#db.prepare(`
+      SELECT task_runtime.task_file_path FROM tasks
+      JOIN task_runtime ON task_runtime.task_id = tasks.id
+      WHERE tasks.status = 'active'
+    `).all().map((row) => String(row.task_file_path));
+  }
+
+  listTasksPendingCleanup(): Task[] {
+    // Otherwise SQLite can choose a full scan of immutable Task history.
+    return this.#db.prepare(`
+      SELECT tasks.* FROM task_runtime INDEXED BY task_runtime_pending_cleanup
+      JOIN tasks ON tasks.id = task_runtime.task_id
+      WHERE task_runtime.cleanup_completed_at IS NULL AND tasks.status = 'finalized'
+      ORDER BY tasks.started_at, tasks.id
+    `).all().map(taskFromRow);
+  }
+
+  markTaskCleanupCompleted(taskId: string): void {
+    const updated = this.#db.prepare(`
+      UPDATE task_runtime SET cleanup_completed_at = COALESCE(cleanup_completed_at, ?)
+      WHERE task_id = ? AND EXISTS (
+        SELECT 1 FROM tasks WHERE tasks.id = task_runtime.task_id AND tasks.status = 'finalized'
+      )
+    `).run(now(), taskId);
+    if (updated.changes !== 1) throw new Error(`cleanup completion requires a finalized Task with runtime: ${taskId}`);
   }
 
   activeTask(workItemId: string): Task | null {

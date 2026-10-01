@@ -49,6 +49,48 @@ test("objectives preserve linked Projects and per-Objective review limits", () =
   }
 });
 
+test("cleanup completion retires finalized runtime records without changing Task history", () => {
+  const store = makeStore();
+  try {
+    store.createWorkItem(item("a"));
+    store.createWorkItem(item("b"));
+    const runtime = {
+      runtimeKind: "host" as const, tmuxSession: "merro-p", tmuxWindow: "impl-a", paneId: "%1",
+      containerId: null, processPid: 1, processStartedAt: "2026-01-01T00:00:00Z",
+      clonePath: "/tmp/a", taskFilePath: "/tmp/a/.merro-task.md", resultPath: "/tmp/task/result.json",
+      expectedCommit: "abc", startedAt: "2026-01-01T00:00:00Z",
+    };
+    for (let index = 0; index < 100; index++) {
+      const id = `cleaned-${index}`;
+      store.createTask({ id, workItemId: "a", role: "implement", attempt: index + 1, runtime: { ...runtime, taskId: id } });
+      store.finalizeTask({ id, outcome: "failed", summary: "Finished", resultJson: "{}" });
+      store.markTaskCleanupCompleted(id);
+    }
+    store.createTask({ id: "pending", workItemId: "a", role: "implement", attempt: 101, runtime: { ...runtime, taskId: "pending" } });
+    store.createTask({ id: "no-runtime", workItemId: "b", role: "implement", attempt: 1 });
+    store.finalizeTask({ id: "no-runtime", outcome: "failed", summary: "No runtime", resultJson: "{}" });
+    assert.equal(store.listTasksPendingCleanup().length, 0);
+    assert.deepEqual(store.listActiveTaskInputPaths(), [runtime.taskFilePath]);
+    assert.throws(() => store.markTaskCleanupCompleted("pending"), /requires a finalized Task with runtime/);
+    assert.throws(() => store.markTaskCleanupCompleted("no-runtime"), /requires a finalized Task with runtime/);
+    assert.throws(() => store.markTaskCleanupCompleted("unknown"), /requires a finalized Task with runtime/);
+    assert.equal(store.getTaskRuntime("pending")?.cleanupCompletedAt, null);
+    store.finalizeTask({ id: "pending", outcome: "failed", summary: "Retry cleanup", resultJson: "{}" });
+    const history = store.getTask("pending");
+    assert.deepEqual(store.listTasksPendingCleanup().map((task) => task.id), ["pending"]);
+    assert.deepEqual(store.listActiveTaskInputPaths(), []);
+    store.markTaskCleanupCompleted("pending");
+    const completedAt = store.getTaskRuntime("pending")?.cleanupCompletedAt;
+    assert.equal(typeof completedAt, "string");
+    store.markTaskCleanupCompleted("pending");
+    store.saveTaskRuntime({ ...runtime, taskId: "pending", cleanupCompletedAt: null });
+    assert.equal(store.getTaskRuntime("pending")?.cleanupCompletedAt, completedAt);
+    assert.deepEqual(store.listTasksPendingCleanup(), []);
+    assert.deepEqual(store.getTask("pending"), history);
+    assert.throws(() => store.finalizeTask({ id: "pending", outcome: "failed", summary: "Changed", resultJson: "{}" }), /already finalized/);
+  } finally { store.close(); }
+});
+
 test("automatic relation rebuild preserves manual evidence and effective Requires precedence", () => {
   const store = makeStore();
   try {

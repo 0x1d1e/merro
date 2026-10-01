@@ -345,13 +345,12 @@ export class MainOrchestrator {
     if (!input.goal.trim()) throw new Error("Objective goal must not be empty");
     if (input.projectSlugs.length === 0) throw new Error("Objective requires at least one Project");
     return this.#withStore(async (store) => {
-      const projects = input.projectSlugs.map((slug) => {
+      const projects = [...new Set(input.projectSlugs)].map((slug) => {
         const project = store.getProject(slug);
         if (!project) throw new Error(`unknown Project: ${slug}`);
         return project;
       });
-      const issueScopes = parseObjectiveIssueScopes(input.issues, input.projectSlugs);
-      if (issueScopes.length === 0) throw new Error("Objective requires an approved issue scope");
+      const issueScopes = parseObjectiveIssueScopes(input.issues, projects.map((project) => project.slug));
       const issueRows = new Map<string, GitHubIssue>();
       for (const scope of issueScopes) {
         const project = projects.find((candidate) => candidate.slug === scope.projectSlug)!;
@@ -777,9 +776,6 @@ export class MainOrchestrator {
           this.#block(store, store.getWorkItem(item.id) ?? item, "task_failed", `Worker launch failed; Task remains active until it can be stopped safely: ${errorText(stopError)}`);
           return;
         }
-        await this.#workers.cleanup(runtimeIntent).catch((cleanupError: unknown) => {
-          this.#notify(`Could not clean up failed Task ${taskId}: ${errorText(cleanupError)}`, "warning");
-        });
       }
       const task = store.getTask(taskId);
       if (task?.status === "active") store.finalizeTask({
@@ -1062,13 +1058,13 @@ export class MainOrchestrator {
   }
 
   async #reconcileFinalizedTasks(store: MerroStore, unsafeProjects: ReadonlySet<string>): Promise<void> {
-    // Finalized Tasks remain the durable cleanup queue, including across Main restarts.
-    const tasks = store.listTasks();
-    const activeInputs = new Set(tasks.filter((task) => task.status === "active")
-      .map((task) => store.getTaskRuntime(task.id)?.taskFilePath));
-    for (const task of tasks.filter((candidate) => candidate.status === "finalized")) {
+    const pending = store.listTasksPendingCleanup();
+    if (pending.length === 0) return;
+    const activeInputs = new Set(store.listActiveTaskInputPaths());
+    for (const task of pending) {
       const runtime = store.getTaskRuntime(task.id);
-      if (!runtime || unsafeProjects.has(store.getWorkItem(task.workItemId)!.projectSlug)) continue;
+      const projectSlug = store.getWorkItem(task.workItemId)?.projectSlug;
+      if (!runtime || !projectSlug || unsafeProjects.has(projectSlug)) continue;
       let preserveResult = false;
       try {
         const raw: unknown = JSON.parse(task.resultJson ?? "null");
@@ -1079,6 +1075,7 @@ export class MainOrchestrator {
       }
       try {
         await this.#workers.cleanup(runtime, { preserveResult, preserveTaskInput: activeInputs.has(runtime.taskFilePath) });
+        store.markTaskCleanupCompleted(task.id);
       } catch (error) {
         this.#notify(`Could not clean up finalized Task ${task.id}; reconciliation will retry: ${errorText(error)}`, "warning");
       }

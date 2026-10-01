@@ -59,4 +59,5 @@ export interface TaskRuntimeRecord {
   expectedCommit: string;
   baseUpdate?: BaseUpdate | null;
   startedAt: string;
+  readonly cleanupCompletedAt?: string | null;
 }

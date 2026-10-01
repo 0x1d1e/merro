@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Relation, WorkItem } from "../src/domain/model.js";
+import { parseObjectiveIssueScopes } from "../src/domain/objective.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../src/domain/relations.js";
 import { schedule } from "../src/domain/scheduler.js";
 import { assertWorkItemTransition } from "../src/domain/work-item.js";
@@ -27,6 +28,17 @@ function requires(from: string, to: string): Relation {
 function conflicts(left: string, right: string): Relation {
   return { kind: "Conflicts", from: left, to: right, confidence: "high", rationale: "test", evidence: "test" };
 }
+
+test("Objective issue scopes cover exactly the normalized linked Project set", () => {
+  const scopes = [{ projectSlug: "web", numbers: [8, 8] }, { projectSlug: "api", query: {} }];
+  assert.deepEqual(parseObjectiveIssueScopes(scopes, ["api", "web", "api"]), [
+    { projectSlug: "web", numbers: [8] }, { projectSlug: "api", query: { labels: [] } },
+  ]);
+  assert.throws(() => parseObjectiveIssueScopes(scopes, ["api", "web", "infra"]), /missing issue scope for Project 'infra'/);
+  assert.throws(() => parseObjectiveIssueScopes([], ["api"]), /missing issue scope for Project 'api'/);
+  assert.throws(() => parseObjectiveIssueScopes(scopes, ["api"]), /unlinked Project/);
+  assert.throws(() => parseObjectiveIssueScopes([...scopes, { projectSlug: "api", numbers: [7] }], ["api", "web"]), /duplicate issue scope/);
+});
 
 test("terminal WorkItems cannot reactivate", () => {
   assert.throws(() => assertWorkItemTransition("Done", "Ready"), /invalid WorkItem transition/);

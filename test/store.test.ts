@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { MIGRATION_1, SCHEMA_VERSION } from "../src/store/schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, SCHEMA_VERSION } from "../src/store/schema.js";
 import { MerroStore } from "../src/store/store.js";
 
 function makeStore(): MerroStore {
@@ -199,6 +199,62 @@ test("SQLite rejects Blocked WorkItems without reason and resume state", () => {
   }
 });
 
+test("v11 finalized Tasks enter cleanup once and retain immutable history across migration and restart", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "merro-cleanup-migration-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "state.db");
+  const legacy = new DatabaseSync(path);
+  try {
+    legacy.exec([MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11].join("\n"));
+    legacy.exec(`
+      INSERT INTO schema_meta VALUES (11);
+      INSERT INTO projects(slug, path, base_remote, push_remote, default_branch, created_at)
+      VALUES ('p', '/tmp/p', 'origin', 'origin', 'main', '2026-01-01T00:00:00Z');
+      INSERT INTO work_items(id, project_slug, source_type, source_ref, generation, state, priority, created_at, updated_at)
+      VALUES ('legacy', 'p', 'issue', '1', 1, 'Ready', 'normal', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+      INSERT INTO tasks(id, work_item_id, role, attempt, status, outcome, started_at, finalized_at, summary, result_json)
+      VALUES ('finished', 'legacy', 'implement', 1, 'finalized', 'failed', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z', 'Original summary', '{}');
+      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, clone_path, task_file_path, result_path, started_at, expected_commit)
+      VALUES ('finished', 'merro-p', 'impl-legacy', '/tmp/legacy', '/tmp/legacy/.merro-task.md', '/tmp/task/result.json', '2026-01-01T00:00:00Z', 'abc');
+    `);
+  } finally { legacy.close(); }
+  const prepare = DatabaseSync.prototype.prepare;
+  let cleanupQuery = "";
+  const observed = t.mock.method(DatabaseSync.prototype, "prepare", function(this: DatabaseSync, sql: string) {
+    if (sql.includes("cleanup_completed_at IS NULL")) cleanupQuery = sql;
+    return prepare.call(this, sql);
+  });
+  const migrated = new MerroStore(path);
+  const history = migrated.getTask("finished");
+  try {
+    assert.equal(history?.summary, "Original summary");
+    assert.equal(migrated.getTaskRuntime("finished")?.cleanupCompletedAt, null);
+    assert.deepEqual(migrated.listTasksPendingCleanup().map((task) => task.id), ["finished"]);
+  } finally { migrated.close(); }
+  const restarted = new MerroStore(path);
+  try {
+    assert.deepEqual(restarted.listTasksPendingCleanup().map((task) => task.id), ["finished"]);
+    restarted.markTaskCleanupCompleted("finished");
+    assert.deepEqual(restarted.getTask("finished"), history);
+  } finally { restarted.close(); }
+  const completed = new MerroStore(path);
+  try {
+    assert.equal(typeof completed.getTaskRuntime("finished")?.cleanupCompletedAt, "string");
+    assert.deepEqual(completed.listTasksPendingCleanup(), []);
+    assert.deepEqual(completed.getTask("finished"), history);
+  } finally { completed.close(); }
+  observed.mock.restore();
+  const database = new DatabaseSync(path);
+  try {
+    assert.throws(() => database.prepare("UPDATE tasks SET summary = 'Changed' WHERE id = 'finished'").run(), /immutable/);
+    assert.throws(() => database.prepare("DELETE FROM tasks WHERE id = 'finished'").run(), /immutable/);
+    assert.notEqual(cleanupQuery, "");
+    const plan = database.prepare(`EXPLAIN QUERY PLAN ${cleanupQuery}`).all();
+    assert.ok(plan.some((row) => String(row.detail).includes("task_runtime_pending_cleanup")));
+    assert.equal(plan.some((row) => /^SCAN tasks\b/.test(String(row.detail))), false);
+  } finally { database.close(); }
+});
+
 test("store migrates v1 state without losing WorkItems", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "merro-migration-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -231,7 +287,7 @@ test("store migrates v1 state without losing WorkItems", async (t) => {
   const migrated = new DatabaseSync(path);
   try {
     assert.equal(Number(migrated.prepare("SELECT version FROM schema_meta").get()?.version), SCHEMA_VERSION);
-    assert.doesNotThrow(() => migrated.prepare("SELECT runtime_kind, base_update_json FROM task_runtime").all());
+    assert.doesNotThrow(() => migrated.prepare("SELECT runtime_kind, base_update_json, cleanup_completed_at FROM task_runtime").all());
     assert.doesNotThrow(() => migrated.prepare("SELECT base_update_json FROM work_item_runtime").all());
     assert.doesNotThrow(() => migrated.prepare("SELECT issue_scopes_json FROM objectives").all());
   } finally {

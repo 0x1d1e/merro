@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { MerroStore } from "../src/store/store.js";
 import type { Project, Relation } from "../src/domain/model.js";
@@ -59,7 +60,6 @@ interface MainHarness {
   reviewComments: Map<number, string>;
   notifications: string[];
   synchronizedHeads: string[];
-  baseMerges: Array<{ path: string; defaultBranch: string }>;
   fetchedBases: Array<{ path: string; baseRefName: string; baseCommit: string }>;
   restoredClones: Array<{ projectSlug: string; branchName: string; headCommit: string }>;
   cloneBaseBranches: string[];
@@ -120,7 +120,6 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   let remoteBranchExists = options.remoteBranchExists ?? true;
   let baseMergeConflict = options.baseMergeConflict ?? false;
   const reviewComments = new Map<number, string>();
-  const baseMerges: Array<{ path: string; defaultBranch: string }> = [];
   const fetchedBases: Array<{ path: string; baseRefName: string; baseCommit: string }> = [];
   let nextPullRequest = 13;
   const github = {
@@ -275,15 +274,6 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       assert.match(baseCommit, /^[0-9a-f]{40}$/);
       fetchedBases.push({ path, baseRefName, baseCommit });
     },
-    async fetchAndMergeBase(path: string, defaultBranch: string) {
-      baseMerges.push({ path, defaultBranch });
-      if (baseMergeConflict) {
-        throw new Error("Main must not merge the base");
-      }
-      const headCommit = "f".repeat(40);
-      heads.set(path, headCommit);
-      return { baseCommit: "d".repeat(40), headCommit, merged: true };
-    },
     async createReadOnlyCheckout(_project: Project, path: string, commit: string) {
       await mkdir(path, { recursive: true });
       await writeFile(join(path, "MERRO_COMMIT"), `${commit}\n`);
@@ -423,7 +413,6 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     setBaseMergeConflict(conflicts) {
       baseMergeConflict = conflicts;
     },
-    baseMerges,
     fetchedBases,
     setBranchPolicyAvailable(available) {
       branchPolicyAvailable = available;
@@ -1366,7 +1355,6 @@ test("a base that moves again during implementation requires another verified im
   await harness.main.runPass();
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement", "review", "implement"]);
   assert.equal(harness.launches[4]?.baseUpdate?.baseCommit, "e".repeat(40));
-  assert.deepEqual(harness.baseMerges, []);
 });
 
 test("legacy Objectives retain fixed selections rather than inferring a query from their goal", async (t) => {
@@ -1422,6 +1410,57 @@ test("one Project scope failure does not prevent another Project from discoverin
   assert.equal(snapshot.objectives[0]?.state, "Active");
   assert.deepEqual(snapshot.workItems.map((item) => item.id), ["plugins:issue-4:g1"]);
   assert.equal(harness.launches[0]?.workItemId, "plugins:issue-4:g1");
+});
+
+for (const missingProject of ["api", "web"]) {
+  test(`Objective approval rejects a missing ${missingProject} scope before persisting or scheduling`, async (t) => {
+    const harness = await createHarness(t, { projects: [{ slug: "api", issueNumbers: [7] }, { slug: "web", issueNumbers: [8] }] });
+    const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+    registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+    const approve = tools.get("merro_start_objective");
+    assert.ok(approve);
+    await assert.rejects(approve.execute("approve", {
+      goal: "Ship both", project_slugs: ["api", "web"],
+      issues: [{ project_slug: missingProject === "api" ? "web" : "api", query: {} }],
+    }), new RegExp(`missing issue scope for Project '${missingProject}'`));
+    await assert.rejects(harness.main.startObjective({
+      goal: "Ship both", projectSlugs: ["api", "web"],
+      issues: [{ projectSlug: missingProject === "api" ? "web" : "api", query: {} }],
+    }), new RegExp(`missing issue scope for Project '${missingProject}'`));
+    const snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.objectives.length, 0);
+    assert.equal(snapshot.workItems.length, 0);
+    assert.equal(harness.launches.length, 0);
+  });
+}
+
+test("Objective approval normalizes duplicate Project slugs before scope validation", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "api", issueNumbers: [7] }, { slug: "web", issueNumbers: [8] }] });
+  const started = await harness.main.startObjective({
+    goal: "Ship both", projectSlugs: ["api", "web", "api"],
+    issues: [{ projectSlug: "api", query: {} }, { projectSlug: "web", numbers: [8] }],
+  });
+  assert.deepEqual(started.objective.projectSlugs, ["api", "web"]);
+  assert.equal(started.objective.issueScopes?.length, 2);
+  assert.equal(started.workItems.length, 2);
+  assert.deepEqual((await harness.restartMain().statusSnapshot()).objectives[0]?.projectSlugs, ["api", "web"]);
+});
+
+test("complete multi-Project scopes persist and check every Project before Objective completion", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "api", issueNumbers: [7] }, { slug: "web", issueNumbers: [8] }] });
+  const started = await harness.main.startObjective({
+    goal: "Ship both", projectSlugs: ["api", "web"],
+    issues: [{ projectSlug: "web", numbers: [8] }, { projectSlug: "api", query: {} }],
+  });
+  assert.deepEqual(started.workItems.map((item) => item.projectSlug).sort(), ["api", "web"]);
+  const restarted = harness.restartMain();
+  assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, started.objective.issueScopes);
+  harness.setIssueState("api", 7, "CLOSED");
+  await restarted.runPass();
+  assert.equal((await restarted.statusSnapshot()).objectives[0]?.state, "Active");
+  harness.setIssueState("web", 8, "CLOSED");
+  await restarted.runPass();
+  assert.equal((await restarted.statusSnapshot()).objectives[0]?.state, "Done");
 });
 
 test("ambiguous and unsupported approved scopes fail before creating an Objective", async (t) => {
@@ -1596,9 +1635,72 @@ for (const failure of ["success", "cancelled", "unreadable", "missing", "identit
     } else {
       await assert.rejects(readFile(resultPath), { code: "ENOENT" });
     }
+    const cleanupAttempts = harness.cleanupCalls.filter((id) => id === task.id).length;
+    for (let pass = 0; pass < 3; pass++) await restarted.runPass();
+    assert.equal(harness.cleanupCalls.filter((id) => id === task.id).length, cleanupAttempts);
     assert.deepEqual((await restarted.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id), finalized);
   });
 }
+
+for (const failCompletion of [false, true]) {
+  test(`successful artifact cleanup leaves the retry queue across restarts, metadata write failure: ${failCompletion}`, async (t) => {
+    const harness = await createHarness(t, {
+      taskArtifacts: true,
+      result: (input, _number, result) => input.role === "review" ? null : result,
+      inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+    });
+    await startDefaultObjective(harness.main);
+    await harness.main.runPass();
+    const task = (await harness.main.statusSnapshot()).tasks[0];
+    assert.ok(task);
+    const path = join(harness.workspacePath, ".merro", "state.db");
+    if (failCompletion) {
+      const database = new DatabaseSync(path);
+      try {
+        database.exec(`
+          CREATE TRIGGER fail_cleanup_completion BEFORE UPDATE OF cleanup_completed_at ON task_runtime
+          BEGIN SELECT RAISE(ABORT, 'cleanup completion write failed'); END;
+        `);
+      } finally { database.close(); }
+    }
+    await harness.main.runPass();
+    const finalized = (await harness.main.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id);
+    assert.equal(finalized?.status, "finalized");
+    assert.deepEqual(harness.cleanupCalls, [task.id]);
+    await assert.rejects(readFile(join(harness.workspacePath, "worker-results", task.id, "pi-config", "auth.json")), { code: "ENOENT" });
+    if (failCompletion) {
+      assert.ok(harness.notifications.some((message) => message.includes("cleanup completion write failed")));
+      const store = new MerroStore(path);
+      try {
+        assert.equal(store.getTaskRuntime(task.id)?.cleanupCompletedAt, null);
+        assert.deepEqual(store.listTasksPendingCleanup().map((candidate) => candidate.id), [task.id]);
+      } finally { store.close(); }
+      const database = new DatabaseSync(path);
+      try { database.exec("DROP TRIGGER fail_cleanup_completion"); } finally { database.close(); }
+    }
+    const restarted = harness.restartMain();
+    for (let pass = 0; pass < 3; pass++) await restarted.runPass();
+    assert.deepEqual(harness.cleanupCalls, failCompletion ? [task.id, task.id] : [task.id]);
+    assert.deepEqual((await restarted.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id), finalized);
+    const store = new MerroStore(path);
+    try {
+      assert.equal(typeof store.getTaskRuntime(task.id)?.cleanupCompletedAt, "string");
+      assert.equal(store.listTasksPendingCleanup().length, 0);
+    } finally { store.close(); }
+  });
+}
+
+test("successful failed-launch cleanup runs once, including after Main restarts", async (t) => {
+  const harness = await createHarness(t, { taskArtifacts: true, launchFailure: true });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const task = (await harness.main.statusSnapshot()).tasks[0];
+  assert.ok(task);
+  assert.equal(task.status, "finalized");
+  assert.deepEqual(harness.cleanupCalls, [task.id]);
+  await harness.restartMain().runPass();
+  assert.deepEqual(harness.cleanupCalls, [task.id]);
+});
 
 test("failed launch cleanup retries after Main restarts even when the Project is unavailable", async (t) => {
   let failCleanup = true;
@@ -1982,7 +2084,6 @@ test("base movement schedules implementation and verification before a fresh rev
   harness.setPullRequest(number, { baseRefOid: "d".repeat(40) });
   await harness.main.runPass();
 
-  assert.deepEqual(harness.baseMerges, []);
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
   assert.match(harness.launches[2]!.taskFile, /updated base/i);
   assert.match(harness.launches[2]!.taskFile, /dddddddddddddddddddddddddddddddddddddddd/);
@@ -1997,7 +2098,6 @@ test("base movement schedules implementation and verification before a fresh rev
   assert.equal(snapshot.workItems[0]?.state, "AwaitingMerge");
   assert.equal(snapshot.decisions[0]?.kind, "merge");
   assert.equal(snapshot.tasks.filter((task) => task.role === "review").length, 2);
-  assert.deepEqual(harness.baseMerges, []);
 });
 
 test("base merge conflicts create one merge_conflict Decision", async (t) => {
@@ -2018,7 +2118,6 @@ test("base merge conflicts create one merge_conflict Decision", async (t) => {
 
   await harness.main.runPass();
   state = await harness.main.statusSnapshot();
-  assert.equal(harness.baseMerges.length, 0);
   assert.equal(state.decisions.length, 1);
   assert.equal(state.decisions[0]?.kind, "merge_conflict");
 });
@@ -2048,7 +2147,6 @@ test("approve command schedules an implementer to resolve a merge conflict befor
   assert.equal(state.decisions.length, 0);
   assert.equal(state.workItems[0]?.state, "Implementing");
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
-  assert.deepEqual(harness.baseMerges, []);
 });
 
 test("reject command abandons a merge_conflict Decision without wedging the WorkItem", async (t) => {
