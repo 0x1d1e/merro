@@ -33,11 +33,9 @@
     "lint": "node scripts/check-boundaries.mjs",
     "test": "npm run build && node --test dist/test/*.test.js"
   },
-  "devDependencies": {
-    "@types/node": "^22.0.0",
-    "typescript": "^5.8.0"
-  },
   "dependencies": {
-    "typebox": "1.3.27"
+    "@types/node": "^22.0.0",
+    "typebox": "1.3.27",
+    "typescript": "^5.8.0"
   }
 }
