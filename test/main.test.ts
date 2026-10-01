@@ -39,8 +39,9 @@ interface HarnessOptions {
   pullRequestFailure?: (number: number) => boolean;
   pullRequestContentFailure?: () => boolean;
   deleteCloneFailure?: boolean;
-  cleanupFailure?: boolean;
-  launchFailure?: boolean;
+  cleanupFailure?: boolean | (() => boolean);
+  taskArtifacts?: boolean;
+  launchFailure?: boolean | ((input: WorkerLaunchInput) => boolean);
   realWorkerPlan?: boolean;
   notifyCommand?: string;
   commands?: import("../src/runtime/commands.js").CommandRunner;
@@ -61,6 +62,8 @@ interface MainHarness {
   restoredClones: Array<{ projectSlug: string; branchName: string; headCommit: string }>;
   cloneBaseBranches: string[];
   deletedClones: string[];
+  cleanupCalls: string[];
+  restartMain(): MainOrchestrator;
   branchPolicyBranches: string[];
   setProjectState(projectSlug: string, update: Partial<Project>): void;
   setPullRequest(number: number, update: Partial<GitHubPullRequest>): void;
@@ -286,6 +289,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     },
   };
 
+  const cleanupCalls: string[] = [];
   const runtimePlanner = new WorkerRuntime({ workspacePath: join(workspacePath, ".merro", "runtime"), config: DEFAULT_CONFIG });
   const workers = {
     ...(options.realWorkerPlan ? { plan: (input: WorkerLaunchInput) => runtimePlanner.plan(input) } : {}),
@@ -299,10 +303,17 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
           if (path === ".." || path.startsWith(`..${sep}`)) throw new Error("dependency checkout outside worker scratch");
         }
       }
-      if (options.launchFailure) throw new Error("launch failed after process creation");
-      const taskDir = join(workspacePath, "worker-results", input.taskId);
+      const failLaunch = typeof options.launchFailure === "function" ? options.launchFailure(input) : options.launchFailure;
+      const taskDir = failLaunch ? dirname(runtimePlanner.plan(input).resultPath) : join(workspacePath, "worker-results", input.taskId);
       await mkdir(taskDir, { recursive: true });
       const resultPath = join(taskDir, "result.json");
+      if (options.taskArtifacts) {
+        await mkdir(input.clonePath, { recursive: true });
+        await writeFile(join(input.clonePath, ".merro-task.md"), input.taskFile);
+        await mkdir(join(taskDir, "pi-config"));
+        await writeFile(join(taskDir, "pi-config", "auth.json"), '{"test":"auth"}');
+      }
+      if (failLaunch) throw new Error("launch failed after process creation");
       const commit = createHash("sha1").update(input.taskId).digest("hex");
       const result = input.role === "implement"
         ? {
@@ -344,12 +355,14 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     async stop() {
       await options.stop?.();
     },
-    async cleanup() {
-      if (options.cleanupFailure) throw new Error("Task cleanup failed");
+    async cleanup(record: TaskRuntimeRecord, cleanupOptions?: { preserveResult?: boolean; preserveTaskInput?: boolean }) {
+      cleanupCalls.push(record.taskId);
+      if (typeof options.cleanupFailure === "function" ? options.cleanupFailure() : options.cleanupFailure) throw new Error("Task cleanup failed");
+      if (options.taskArtifacts) await runtimePlanner.cleanup(record, cleanupOptions);
     },
   };
 
-  const main = new MainOrchestrator({
+  const createMain = () => new MainOrchestrator({
     workspacePath,
     config: { ...DEFAULT_CONFIG, sandbox: options.realWorkerPlan ? "docker" : "none", max_concurrent_tasks: options.maxConcurrentTasks ?? 3, work_root: join(workspacePath, "workers"), notify_command: options.notifyCommand ?? null },
     ...(options.commands ? { commands: options.commands } : {}),
@@ -358,6 +371,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     github,
     workers,
   });
+  const main = createMain();
   for (const fixture of fixtures) {
     await main.addProject(paths.get(fixture.slug) ?? "", fixture.slug);
   }
@@ -374,6 +388,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     restoredClones,
     cloneBaseBranches,
     deletedClones,
+    cleanupCalls,
+    restartMain: createMain,
     branchPolicyBranches,
     setProjectState(projectSlug, update) {
       const current = projects.get(projectSlug);
@@ -547,6 +563,141 @@ test("failed launch remains active if stopping the worker fails", async (t) => {
   assert.equal(snapshot.tasks[0]?.status, "active");
   assert.equal(snapshot.workItems[0]?.blockedReason, "task_failed");
 });
+
+for (const outcome of ["success", "pass", "reject"] as const) {
+  test(`valid late ${outcome} result resumes its WorkItem after launch and stop fail`, async (t) => {
+    const role = outcome === "success" ? "implement" : "review";
+    const harness = await createHarness(t, {
+      launchFailure: (input) => input.role === role,
+      stop: async () => { throw new Error("worker still running"); },
+    });
+    await startDefaultObjective(harness.main);
+    await harness.main.runPass();
+    if (role === "review") await harness.main.runPass();
+    const before = await harness.main.statusSnapshot();
+    const task = before.tasks.find((candidate) => candidate.status === "active")!;
+    assert.equal(before.workItems[0]?.state, "Blocked");
+    const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+    const runtime = store.getTaskRuntime(task.id)!;
+    store.close();
+    await mkdir(dirname(runtime.resultPath), { recursive: true });
+    const result = outcome === "success"
+      ? { task_id: task.id, status: outcome, summary: "Late implementation", commit: createHash("sha1").update(task.id).digest("hex"), verification: [] }
+      : { task_id: task.id, status: outcome, summary: "Late review", reviewed_commit: runtime.expectedCommit, verification: [], findings: outcome === "reject" ? [{ severity: "blocking", summary: "Needs rework" }] : [] };
+    await writeFile(runtime.resultPath, JSON.stringify(result));
+    await harness.main.runPass();
+    const after = await harness.main.statusSnapshot();
+    assert.equal(after.tasks.find((candidate) => candidate.id === task.id)?.outcome, outcome);
+    assert.equal(after.workItems[0]?.state, outcome === "success" ? "Reviewing" : outcome === "pass" ? "AwaitingMerge" : "Implementing");
+    assert.ok(harness.cleanupCalls.includes(task.id));
+  });
+}
+
+for (const failure of ["success", "cancelled", "unreadable", "missing", "identity", "malformed", "wrong_task_id"] as const) {
+  test(`finalized ${failure} Task artifacts are cleaned and cleanup retries survive a Main restart`, async (t) => {
+    let failCleanup = true;
+    const harness = await createHarness(t, {
+      taskArtifacts: true,
+      cleanupFailure: () => failCleanup,
+      inspect: async () => ({ alive: failure === "identity", identityMatches: false, reason: "worker unavailable" }),
+      result: (_input, _number, result) => failure === "missing" || failure === "identity" ? null : result,
+    });
+    await startDefaultObjective(harness.main);
+    await harness.main.runPass();
+    const task = (await harness.main.statusSnapshot()).tasks[0]!;
+    const dir = join(harness.workspacePath, "worker-results", task.id);
+    const resultPath = join(dir, "result.json");
+    if (failure === "cancelled") harness.setIssueState("example", 7, "CLOSED");
+    if (failure === "unreadable") { await rm(resultPath); await mkdir(resultPath); }
+    if (failure === "malformed") await writeFile(resultPath, "{not json}");
+    if (failure === "wrong_task_id") {
+      const result = JSON.parse(await readFile(resultPath, "utf8")) as Record<string, unknown>;
+      await writeFile(resultPath, JSON.stringify({ ...result, task_id: "another-task" }));
+    }
+    await harness.main.runPass();
+    const finalized = (await harness.main.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id)!;
+    assert.equal(finalized.status, "finalized");
+    assert.ok(harness.cleanupCalls.includes(task.id));
+    assert.match(await readFile(join(dir, "pi-config", "auth.json"), "utf8"), /auth/);
+    failCleanup = false;
+    const restarted = harness.restartMain();
+    await restarted.runPass();
+    await assert.rejects(readFile(join(dir, "pi-config", "auth.json")), { code: "ENOENT" });
+    if (failure === "wrong_task_id") {
+      assert.match(await readFile(resultPath, "utf8"), /another-task/);
+    } else {
+      await assert.rejects(readFile(resultPath), { code: "ENOENT" });
+    }
+    assert.deepEqual((await restarted.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id), finalized);
+  });
+}
+
+test("failed launch cleanup retries after Main restarts even when the Project is unavailable", async (t) => {
+  let failCleanup = true;
+  const harness = await createHarness(t, { taskArtifacts: true, launchFailure: true, cleanupFailure: () => failCleanup });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const task = (await harness.main.statusSnapshot()).tasks[0]!;
+  assert.equal(task.status, "finalized");
+  const scratch = join(harness.workspacePath, ".merro", "runtime", "tasks", task.id);
+  assert.match(await readFile(join(scratch, "pi-config", "auth.json"), "utf8"), /auth/);
+  await rm(harness.projects.get("example")!.path, { recursive: true, force: true });
+  failCleanup = false;
+  await harness.restartMain().runPass();
+  await assert.rejects(readFile(join(scratch, "pi-config", "auth.json")), { code: "ENOENT" });
+});
+
+test("retrying finalized cleanup never removes a successor Task input", async (t) => {
+  let failCleanup = true;
+  const harness = await createHarness(t, {
+    taskArtifacts: true,
+    cleanupFailure: () => failCleanup,
+    result: (input, _number, result) => input.role === "review" ? null : result,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const review = harness.launches.find((input) => input.role === "review")!;
+  failCleanup = false;
+  await harness.restartMain().runPass();
+  assert.equal(await readFile(join(review.clonePath, ".merro-task.md"), "utf8"), review.taskFile);
+  const first = harness.launches[0]!;
+  await assert.rejects(readFile(join(harness.workspacePath, "worker-results", first.taskId, "pi-config", "auth.json")), { code: "ENOENT" });
+});
+
+for (const blocker of ["merge_rejected", "conflict_abandoned", "review_cap"] as const) {
+  test(`notify_command fires for ${blocker}`, async (t) => {
+    const events: Array<{ event: string | undefined; message: string | undefined }> = [];
+    const harness = await createHarness(t, {
+      notifyCommand: "notify-test",
+      baseMergeConflict: blocker === "conflict_abandoned",
+      commands: { async run(_file, _args, options) {
+        events.push({ event: options?.env?.MERRO_EVENT, message: options?.env?.MERRO_MESSAGE });
+        return { stdout: "", stderr: "" };
+      } },
+      result: (input, _number, result) => blocker === "review_cap" && input.role === "review"
+        ? { ...result, status: "reject", findings: [{ severity: "blocking", summary: "Must fix compatibility" }] } : result,
+    });
+    await harness.main.startObjective({ goal: "Ship work", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }], maxReviewRounds: 1 });
+    await harness.main.runPass();
+    await harness.main.runPass();
+    await harness.main.runPass();
+    if (blocker === "merge_rejected") {
+      const decision = (await harness.main.statusSnapshot()).decisions.find((candidate) => candidate.kind === "merge")!;
+      await harness.main.resolveMergeDecision(decision.id, false);
+    }
+    if (blocker === "conflict_abandoned") {
+      harness.setPullRequest(13, { mergeable: "CONFLICTING", baseRefOid: "changed-base" });
+      await harness.main.runPass();
+      const decision = (await harness.main.statusSnapshot()).decisions.find((candidate) => candidate.kind === "merge_conflict")!;
+      await harness.main.resolveMergeConflictDecision(decision.id, "abandon");
+    }
+    const blocked = events.filter((event) => event.event === "blocked");
+    assert.equal(blocked.length, 1);
+    if (blocker === "review_cap") assert.match(blocked[0]!.message!, /Must fix compatibility/);
+  });
+}
 
 test("Task cleanup failure does not prevent review scheduling or reset of infrastructure retries", async (t) => {
   const harness = await createHarness(t, { cleanupFailure: true });

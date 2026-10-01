@@ -443,11 +443,26 @@ export class WorkerRuntime {
     await this.#commands.run("tmux", ["kill-window", "-t", `${record.tmuxSession}:${record.tmuxWindow}`]);
   }
 
-  async cleanup(record: TaskRuntimeRecord): Promise<void> {
-    await this.#makeWritable(dirname(record.resultPath));
-    await rm(dirname(record.resultPath), { recursive: true, force: true });
-    await rm(record.taskFilePath, { force: true });
-    await rm(join(this.#workspacePath, "container-ids", `${safeName(record.taskId)}.cid`), { force: true });
+  async cleanup(record: TaskRuntimeRecord, options: { preserveResult?: boolean; preserveTaskInput?: boolean } = {}): Promise<void> {
+    const scratch = dirname(record.resultPath);
+    await this.#makeWritable(scratch);
+    if (options.preserveResult) {
+      const entries = await readdir(scratch).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      });
+      for (const entry of entries) {
+        if (join(scratch, entry) !== record.resultPath) await rm(join(scratch, entry), { recursive: true, force: true });
+      }
+    } else {
+      await rm(scratch, { recursive: true, force: true });
+    }
+    // Main preserves the shared input while a successor Task owns this clone.
+    if (!options.preserveTaskInput) await rm(record.taskFilePath, { force: true });
+    const name = safeName(record.taskId);
+    await rm(join(this.#workspacePath, "container-ids", `${name}.cid`), { force: true });
+    await rm(join(this.#workspacePath, "launch-secrets", `${name}.env`), { force: true });
+    await rm(join(this.#workspacePath, "launch-secrets", `${name}.sh`), { force: true });
   }
 
   async #makeWritable(path: string): Promise<void> {

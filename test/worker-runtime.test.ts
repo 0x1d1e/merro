@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DEFAULT_CONFIG } from "../src/config.js";
@@ -140,6 +140,45 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   await runtime.cleanup(record);
   assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), false);
   assert.equal(await exists(record.resultPath), false);
+});
+
+test("cleanup preserves mismatched results and active input, removes auth and launch material, and is idempotent", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-cleanup-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtime = new WorkerRuntime({ workspacePath: root, config: DEFAULT_CONFIG });
+  const record = runtime.plan({
+    taskId: "old-task", workItemId: "work", role: "implement",
+    project: { slug: "project", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" },
+    clonePath: join(root, "clone"), taskFile: "old input", expectedCommit: "a".repeat(40), projectSettings: null,
+  });
+  const scratch = join(root, "tasks", "old-task");
+  await mkdir(record.clonePath);
+  await mkdir(join(scratch, "pi-config"), { recursive: true });
+  await mkdir(join(scratch, "merro-runtime"));
+  await mkdir(join(root, "launch-secrets"));
+  await mkdir(join(root, "container-ids"));
+  await writeFile(record.taskFilePath, "active successor input");
+  const wrongResult = '{"task_id":"another-task"}';
+  await writeFile(record.resultPath, wrongResult);
+  await writeFile(join(scratch, "pi-config", "auth.json"), "private auth");
+  await writeFile(join(scratch, "merro-runtime", "worker-result.js"), "staged extension");
+  await chmod(join(scratch, "pi-config"), 0o500);
+  await writeFile(join(root, "launch-secrets", "old-task.env"), "GH_TOKEN=secret");
+  await writeFile(join(root, "launch-secrets", "old-task.sh"), "export GITHUB_TOKEN=secret");
+  await writeFile(join(root, "container-ids", "old-task.cid"), "container");
+  const options = { preserveResult: true, preserveTaskInput: true };
+  await runtime.cleanup(record, options);
+  await runtime.cleanup(record, options);
+  assert.deepEqual(await readdir(scratch), [".merro-result.json"]);
+  assert.equal(await readFile(record.resultPath, "utf8"), wrongResult);
+  assert.equal(await readFile(record.taskFilePath, "utf8"), "active successor input");
+  assert.deepEqual(await readdir(join(root, "launch-secrets")), []);
+  assert.deepEqual(await readdir(join(root, "container-ids")), []);
+  await runtime.cleanup(record, { preserveResult: true });
+  assert.equal(await exists(record.taskFilePath), false);
+  await runtime.cleanup(record);
+  await runtime.cleanup(record);
+  assert.equal(await exists(scratch), false);
 });
 
 for (const sandbox of ["docker", "none"] as const) {

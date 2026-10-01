@@ -466,8 +466,7 @@ export class MainOrchestrator {
         }
         if (!approved) {
           store.resolveDecision(decisionId, "rejected");
-          store.transitionWorkItem(item.id, "Blocked", "merge_rejected");
-          this.#notify(`Merge rejected for WorkItem ${item.id}; PR and branch remain open.`, "warning");
+          this.#block(store, item, "merge_rejected", "Merge rejected; PR and branch remain open");
           return;
         }
 
@@ -544,8 +543,7 @@ export class MainOrchestrator {
       }
       if (resolution === "abandon") {
         store.resolveDecision(decisionId, "rejected");
-        store.transitionWorkItem(item.id, "Blocked", "merge_rejected");
-        this.#notify(`Conflict resolution abandoned for WorkItem ${item.id}; the PR remains open.`, "warning");
+        this.#block(store, item, "merge_rejected", "Conflict resolution abandoned; the PR remains open");
         return;
       }
 
@@ -583,27 +581,31 @@ export class MainOrchestrator {
 
   async runPass(): Promise<void> {
     await this.#withStore(async (store) => {
-      const unavailableProjects = await this.#reconcileProjects(store);
-      await this.#reconcileIssues(store, unavailableProjects);
-      await this.#reconcileTasks(store, unavailableProjects);
-      await this.#reconcilePullRequests(store, unavailableProjects);
-      this.#deriveReady(store, unavailableProjects);
-      const tasks = store.listTasks();
-      const active = tasks.filter((task) => task.status === "active");
-      const items = store.listWorkItems();
-      const result = schedule({
-        workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id) && !unavailableProjects.has(item.projectSlug)),
-        relations: store.listRelations(),
-        activeTaskCount: active.length,
-        activeWorkItemIds: active.map((task) => task.workItemId),
-        maxConcurrentTasks: this.#config.max_concurrent_tasks,
-      });
-      if (result.cycle) this.#blockCycle(store, result.cycle, new Set(active.map((task) => task.workItemId)));
-      for (const item of result.selected) {
-        if (item.state === "Ready") store.transitionWorkItem(item.id, "Implementing");
-        await this.#launchTask(store, store.getWorkItem(item.id) ?? item);
+      try {
+        const unavailableProjects = await this.#reconcileProjects(store);
+        await this.#reconcileIssues(store, unavailableProjects);
+        await this.#reconcileTasks(store, unavailableProjects);
+        await this.#reconcilePullRequests(store, unavailableProjects);
+        this.#deriveReady(store, unavailableProjects);
+        const tasks = store.listTasks();
+        const active = tasks.filter((task) => task.status === "active");
+        const items = store.listWorkItems();
+        const result = schedule({
+          workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id) && !unavailableProjects.has(item.projectSlug)),
+          relations: store.listRelations(),
+          activeTaskCount: active.length,
+          activeWorkItemIds: active.map((task) => task.workItemId),
+          maxConcurrentTasks: this.#config.max_concurrent_tasks,
+        });
+        if (result.cycle) this.#blockCycle(store, result.cycle, new Set(active.map((task) => task.workItemId)));
+        for (const item of result.selected) {
+          if (item.state === "Ready") store.transitionWorkItem(item.id, "Implementing");
+          await this.#launchTask(store, store.getWorkItem(item.id) ?? item);
+        }
+        this.#finishObjectives(store);
+      } finally {
+        await this.#reconcileFinalizedTasks(store);
       }
-      this.#finishObjectives(store);
     });
   }
 
@@ -857,9 +859,6 @@ export class MainOrchestrator {
       summary: `GitHub issue #${item.sourceRef} was closed externally`,
       resultJson: JSON.stringify({ taskId: task.id, reason: "issue_closed_externally" }),
     });
-    await this.#workers.cleanup(runtime).catch((error: unknown) => {
-      this.#notify(`Could not clean up cancelled Task ${task.id}: ${errorText(error)}`, "warning");
-    });
     return true;
   }
 
@@ -985,15 +984,43 @@ export class MainOrchestrator {
         continue;
       }
       await this.#consumeResult(store, item, task, result, runtime, workRuntime);
-      await this.#workers.cleanup(runtime).catch((error: unknown) => {
-        this.#notify(`Could not clean up finalized Task ${task.id}: ${errorText(error)}`, "warning");
-      });
       workRuntime.infrastructureRetries = 0;
       store.saveWorkItemRuntime(workRuntime);
     }
   }
 
+  async #reconcileFinalizedTasks(store: MerroStore): Promise<void> {
+    // Finalized Tasks remain the durable cleanup queue, including across Main restarts.
+    const tasks = store.listTasks();
+    const activeInputs = new Set(tasks.filter((task) => task.status === "active")
+      .map((task) => store.getTaskRuntime(task.id)?.taskFilePath));
+    for (const task of tasks.filter((candidate) => candidate.status === "finalized")) {
+      const runtime = store.getTaskRuntime(task.id);
+      if (!runtime) continue;
+      let preserveResult = false;
+      try {
+        const raw: unknown = JSON.parse(task.resultJson ?? "null");
+        preserveResult = typeof raw === "object" && raw !== null && "task_id" in raw
+          && typeof raw.task_id === "string" && raw.task_id !== task.id;
+      } catch {
+        // Malformed output is already retained in immutable Task history.
+      }
+      try {
+        await this.#workers.cleanup(runtime, { preserveResult, preserveTaskInput: activeInputs.has(runtime.taskFilePath) });
+      } catch (error) {
+        this.#notify(`Could not clean up finalized Task ${task.id}; reconciliation will retry: ${errorText(error)}`, "warning");
+      }
+    }
+  }
+
   async #consumeResult(store: MerroStore, item: WorkItem, task: Task, result: WorkerResult, runtime: TaskRuntimeRecord, workRuntime: WorkItemRuntimeRecord): Promise<void> {
+    const flowState = task.role === "implement" ? "Implementing" : "Reviewing";
+    if (result.status !== "failed" && item.state === "Blocked" && item.blockedReason === "task_failed"
+      && item.blockedResumeState === flowState) {
+      // A worker whose failed launch could not be stopped can still finish its owned Task.
+      store.transitionWorkItem(item.id, flowState);
+      item = store.getWorkItem(item.id)!;
+    }
     if (task.role === "implement") {
       const implementResult = result as ImplementSuccessResult | ImplementFailedResult;
       if (implementResult.status === "failed") {
@@ -1024,8 +1051,7 @@ export class MainOrchestrator {
       store.transitionWorkItem(item.id, "Implementing");
       const limit = this.#reviewLimit(store, item);
       if (limit !== "unlimited" && workRuntime.reviewRound >= limit) {
-        store.transitionWorkItem(item.id, "Blocked", "review_cap");
-        this.#notify(`WorkItem ${item.id} reached its review cap. Blocking findings:\n${review.findings.filter((finding) => finding.severity === "blocking").map((finding) => `- ${finding.summary}`).join("\n")}`, "warning");
+        this.#block(store, item, "review_cap", `Reached review cap. Blocking findings:\n${review.findings.filter((finding) => finding.severity === "blocking").map((finding) => `- ${finding.summary}`).join("\n")}`);
       }
       return;
     }

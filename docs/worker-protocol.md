@@ -35,6 +35,8 @@ Written fresh by Main per Task into the clone (excluded via `.git/info/exclude`,
 Worker ends by calling the `merro_submit_result` tool, which validates the schema, writes `.merro-result.json` atomically, and exits Pi. Main validates: `task_id` equals the active Task, schema matches role, commit state matches, result is not stale. Then copies to Task history and deletes the file.
 Wrong `task_id`: don't consume, don't delete, WorkItem Blocked, report expected vs found.
 
+Main retries finalized Task artifact cleanup every reconciliation pass, including after restart and when a Project is unavailable. Remove Task scratch and launch credentials; preserve mismatched results and shared input owned by an active successor Task.
+
 Implement result: `task_id`, `status: success|failed`, `summary`, `commit`, `verification[]`, optional `pr{title,body}`; failed adds `reason`, optional `diagnostics`.
 Review result: `task_id`, `status: pass|reject|failed`, `summary`, `reviewed_commit`, `findings[]`, `verification[]`; failed adds `reason`.
 Finding: `severity: blocking|non-blocking|note`, `summary`, optional repo-relative `file`, `line_start`, `line_end` (lines refer to reviewed commit). Any blocking finding means reject. `reviewed_commit` mismatch → failed, Main never substitutes current HEAD.
