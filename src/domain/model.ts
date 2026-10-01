@@ -35,6 +35,20 @@ export interface Project {
   defaultBranch: string;
 }
 
+export interface IssueQuery {
+  labels?: readonly string[];
+  milestone?: string;
+}
+
+export type ObjectiveIssueScope =
+  | { projectSlug: string; numbers: number[] }
+  | { projectSlug: string; query: IssueQuery };
+
+export interface BaseUpdate {
+  baseRefName: string;
+  baseCommit: string;
+}
+
 export interface Objective {
   id: string;
   goal: string;
@@ -42,6 +56,7 @@ export interface Objective {
   state: ObjectiveState;
   projectSlugs: string[];
   maxReviewRounds?: ReviewRoundLimit | null;
+  issueScopes?: ObjectiveIssueScope[];
 }
 
 export interface WorkItem {

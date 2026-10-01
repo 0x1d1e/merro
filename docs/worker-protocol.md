@@ -28,7 +28,7 @@ Pi exited but valid matching result exists → consume it.
 
 ## Task input: `.merro-task.md`
 
-Written fresh by Main per Task into the clone (excluded via `.git/info/exclude`, never the repo's `.gitignore`). Contains only: WorkItem scope, relevant Objective context, latest review result, user and Project guidance, repo instructions, direct dependency context (WorkItem ID, Project, merged PR, commit, final summary), role instructions, verification expectations. Never the full backlog. Copied to Task history, deleted at finalization.
+Written fresh by Main per Task into the clone (excluded via `.git/info/exclude`, never the repo's `.gitignore`). Contains only: WorkItem scope, relevant Objective context, latest review result, user and Project guidance, repo instructions, direct dependency context (WorkItem ID, Project, merged PR, commit, final summary), role instructions, verification expectations, and any exact updated-base commit to merge. Never the full backlog. Copied to Task history, deleted at finalization.
 
 ## Task output: `merro_submit_result`
 
@@ -45,6 +45,7 @@ Verification entry: `kind: command` (`project`, `cwd`, exact `command`, `exit_co
 ## Implementer rules
 
 Fresh Pi. Edits, verifies, fixes, re-verifies, makes exactly one final commit with the user's Git identity, writes the result. Verification failures stay inside the Task. Pre-commit hook failure: fix, re-verify, retry; hook-modified files: recreate the unfinalized commit. Merro validates the SHA exists, equals HEAD, and is the one new commit. Never amend a finalized commit. Cannot proceed safely → failed.
+For a base update, Main fetches and persists the exact base commit. The implementer merges that commit with `--no-ff --no-commit`, resolves conflicts, verifies the merged tree, and creates one final merge commit: first parent is the Task's expected HEAD, second parent is the approved base. Main validates both parents and base ancestry. If the base is already an ancestor, one ordinary commit is allowed instead. No rebase, branch push, or PR operations by workers. A fresh reviewer follows every successful base-update Task.
 Next implementer after a reject gets the full latest review: blocking, non-blocking, notes, verification. Blocking must be fixed.
 
 ## Reviewer rules

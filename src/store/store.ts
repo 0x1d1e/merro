@@ -1,10 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   priorityRank,
+  type BaseUpdate,
   type BlockReason,
   type Decision,
   type FlowWorkItemState,
   type Objective,
+  type ObjectiveIssueScope,
   type Priority,
   type Project,
   type Relation,
@@ -15,10 +17,11 @@ import {
   type WorkItem,
   type WorkItemState,
 } from "../domain/model.js";
+import { parseObjectiveIssueScopes } from "../domain/objective.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -224,6 +227,18 @@ export class MerroStore {
         throw error;
       }
     }
+    if (version < 10) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_10);
+        this.#db.prepare("UPDATE schema_meta SET version = 10").run();
+        this.#db.exec("COMMIT");
+        version = 10;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -301,9 +316,10 @@ export class MerroStore {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       this.#db.prepare(`
-        INSERT INTO objectives(id, goal, priority, state, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(objective.id, objective.goal, objective.priority, objective.state, timestamp, timestamp);
+        INSERT INTO objectives(id, goal, priority, state, created_at, updated_at, issue_scopes_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(objective.id, objective.goal, objective.priority, objective.state, timestamp, timestamp,
+        objective.issueScopes === undefined ? null : JSON.stringify(parseObjectiveIssueScopes(objective.issueScopes, objective.projectSlugs)));
       const attach = this.#db.prepare("INSERT INTO objective_projects(objective_id, project_slug) VALUES (?, ?)");
       for (const slug of [...new Set(objective.projectSlugs)]) attach.run(objective.id, slug);
       if (objective.maxReviewRounds !== undefined && objective.maxReviewRounds !== null) {
@@ -316,6 +332,15 @@ export class MerroStore {
       this.#db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  restoreObjectiveIssueScopes(id: string, scopes: ObjectiveIssueScope[]): void {
+    const objective = this.getObjective(id);
+    if (!objective) throw new Error(`unknown Objective: ${id}`);
+    if (objective.issueScopes !== undefined) throw new Error("Objective already has approved issue scopes");
+    const normalized = parseObjectiveIssueScopes(scopes, objective.projectSlugs);
+    this.#db.prepare("UPDATE objectives SET issue_scopes_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(normalized), now(), id);
+    this.appendEvent("Objective", id, "scope_restored", normalized);
   }
 
   getObjective(id: string): Objective | null {
@@ -432,6 +457,7 @@ export class MerroStore {
       branchName: row.branch_name === null ? null : String(row.branch_name),
       clonePath: row.clone_path === null ? null : String(row.clone_path),
       baseCommit: row.base_commit === null ? null : String(row.base_commit),
+      ...(row.base_update_json === null ? {} : { baseUpdate: JSON.parse(String(row.base_update_json)) as BaseUpdate }),
       pullRequestNumber: row.pull_request_number === null ? null : Number(row.pull_request_number),
       pullRequestUrl: row.pull_request_url === null ? null : String(row.pull_request_url),
       pullRequestState: row.pull_request_state === null ? null : String(row.pull_request_state),
@@ -454,8 +480,8 @@ export class MerroStore {
         work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
         pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, last_issue_state,
         reviewed_diff_hash, review_round, infrastructure_retries, implementation_attempt, last_reconciled_at,
-        last_rework_trigger
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_rework_trigger, base_update_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(work_item_id) DO UPDATE SET
         branch_name = excluded.branch_name, clone_path = excluded.clone_path, base_commit = excluded.base_commit,
         pull_request_number = excluded.pull_request_number, pull_request_url = excluded.pull_request_url,
@@ -464,12 +490,13 @@ export class MerroStore {
         last_issue_state = excluded.last_issue_state, reviewed_diff_hash = excluded.reviewed_diff_hash,
         review_round = excluded.review_round, infrastructure_retries = excluded.infrastructure_retries,
         implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at,
-        last_rework_trigger = excluded.last_rework_trigger
+        last_rework_trigger = excluded.last_rework_trigger, base_update_json = excluded.base_update_json
     `).run(
       record.workItemId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
       record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
       record.mergedCommitSha, record.lastIssueState, record.reviewedDiffHash, record.reviewRound,
       record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt, record.lastReworkTrigger,
+      record.baseUpdate ? JSON.stringify(record.baseUpdate) : null,
     );
   }
 
@@ -505,22 +532,23 @@ export class MerroStore {
       taskFilePath: String(row.task_file_path),
       resultPath: String(row.result_path),
       expectedCommit: String(row.expected_commit),
+      ...(row.base_update_json === null ? {} : { baseUpdate: JSON.parse(String(row.base_update_json)) as BaseUpdate }),
       startedAt: String(row.started_at),
     };
   }
 
   saveTaskRuntime(record: TaskRuntimeRecord): void {
     this.#db.prepare(`
-      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, pane_id, container_id, process_pid, process_started_at, clone_path, task_file_path, result_path, expected_commit, started_at, runtime_kind)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, pane_id, container_id, process_pid, process_started_at, clone_path, task_file_path, result_path, expected_commit, started_at, runtime_kind, base_update_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         tmux_session = excluded.tmux_session, tmux_window = excluded.tmux_window, pane_id = excluded.pane_id,
         container_id = excluded.container_id, process_pid = excluded.process_pid, process_started_at = excluded.process_started_at,
         clone_path = excluded.clone_path, task_file_path = excluded.task_file_path,
         result_path = excluded.result_path, expected_commit = excluded.expected_commit, started_at = excluded.started_at,
-        runtime_kind = excluded.runtime_kind
+        runtime_kind = excluded.runtime_kind, base_update_json = excluded.base_update_json
     `).run(record.taskId, record.tmuxSession, record.tmuxWindow, record.paneId, record.containerId,
-      record.processPid, record.processStartedAt, record.clonePath, record.taskFilePath, record.resultPath, record.expectedCommit, record.startedAt, record.runtimeKind);
+      record.processPid, record.processStartedAt, record.clonePath, record.taskFilePath, record.resultPath, record.expectedCommit, record.startedAt, record.runtimeKind, record.baseUpdate ? JSON.stringify(record.baseUpdate) : null);
   }
 
   #objectiveFromRow(row: Record<string, unknown>): Objective {
@@ -535,6 +563,7 @@ export class MerroStore {
       state: row.state as Objective["state"],
       projectSlugs,
       maxReviewRounds: reviewRoundLimit(row.max_review_rounds),
+      ...(row.issue_scopes_json === null ? {} : { issueScopes: parseObjectiveIssueScopes(JSON.parse(String(row.issue_scopes_json)), projectSlugs) }),
     };
   }
 

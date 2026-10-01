@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chmod, copyFile, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import type { Project, TaskRole } from "../domain/model.js";
+import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import type { MerroConfig } from "../config.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
@@ -45,6 +45,7 @@ export interface WorkerLaunchInput {
   clonePath: string;
   taskFile: string;
   expectedCommit: string;
+  baseUpdate?: BaseUpdate | null;
   projectSettings: ProjectSettingsRecord | null;
   dependencies?: readonly WorkerDependencyMount[];
 }
@@ -191,6 +192,7 @@ export class WorkerRuntime {
       taskFilePath: join(resolve(input.clonePath), ".merro-task.md"),
       resultPath: join(scratchPath, ".merro-result.json"),
       expectedCommit: input.expectedCommit,
+      ...(input.baseUpdate ? { baseUpdate: input.baseUpdate } : {}),
       startedAt: new Date().toISOString(),
     };
   }
@@ -347,6 +349,7 @@ export class WorkerRuntime {
         taskFilePath,
         resultPath,
         expectedCommit: input.expectedCommit,
+        ...(input.baseUpdate ? { baseUpdate: input.baseUpdate } : {}),
         startedAt,
       };
     } catch (error) {

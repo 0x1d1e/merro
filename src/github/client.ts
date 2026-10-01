@@ -1,5 +1,6 @@
 import { CommandError, systemCommandRunner, type CommandRunner } from "../runtime/commands.js";
-import type { Project } from "../domain/model.js";
+import type { IssueQuery, Project } from "../domain/model.js";
+import { matchesIssueQuery } from "../domain/objective.js";
 
 export interface GitHubRepository {
   nameWithOwner: string;
@@ -16,6 +17,7 @@ export interface GitHubIssue {
   state: string;
   labels: string[];
   updatedAt: string;
+  milestone?: string | null;
 }
 
 export interface GitHubReview {
@@ -153,21 +155,22 @@ function parseRepository(value: unknown): GitHubRepository {
 
 function parseIssue(value: unknown): GitHubIssue {
   const row = object(value, "gh issue list item");
-  const labels = Array.isArray(row.labels)
-    ? row.labels.flatMap((label) => {
-      if (typeof label !== "object" || label === null) return [];
-      const name = (label as Record<string, unknown>).name;
-      return typeof name === "string" ? [name] : [];
-    })
-    : [];
+  if (!Number.isSafeInteger(row.number) || Number(row.number) < 1) throw new Error("GitHub issue has an invalid number");
+  if (!Array.isArray(row.labels)) throw new Error("GitHub issue has invalid labels");
+  if (!("milestone" in row)) throw new Error("GitHub issue is missing milestone information");
+  const state = stringField(row, "state", "GitHub issue").toUpperCase();
+  if (state !== "OPEN" && state !== "CLOSED") throw new Error(`GitHub issue has unsupported state '${state}'`);
+  const labels = row.labels.map((label) => stringField(object(label, "GitHub issue label"), "name", "GitHub issue label"));
   return {
     number: typeof row.number === "number" ? row.number : Number.NaN,
     title: stringField(row, "title", "gh issue list item"),
     body: typeof row.body === "string" ? row.body : "",
     url: stringField(row, "url", "gh issue list item"),
-    state: stringField(row, "state", "gh issue list item"),
+    state,
     labels,
     updatedAt: stringField(row, "updatedAt", "gh issue list item"),
+    milestone: row.milestone === null ? null
+      : stringField(object(row.milestone, "GitHub issue milestone"), "title", "GitHub issue milestone"),
   };
 }
 
@@ -264,25 +267,28 @@ export class GitHubClient {
     return parseRepository(parseJson(result.stdout, "gh repo view"));
   }
 
-  async listOpenIssues(project: Project, labels: readonly string[] = [], limit = 100): Promise<GitHubIssue[]> {
+  async listOpenIssues(project: Project, query: IssueQuery = {}): Promise<GitHubIssue[]> {
     const repository = await this.repository(project.baseRemote);
-    const args = [
-      "issue", "list", "--repo", repository.nameWithOwner,
-      "--state", "open", "--limit", String(limit),
-      "--json", "number,title,body,url,state,labels,updatedAt",
-    ];
-    for (const label of labels) args.push("--label", label);
-    const result = await this.#commands.run("gh", args, { cwd: project.path });
-    const value = parseJson(result.stdout, "gh issue list");
-    if (!Array.isArray(value)) throw new Error("gh issue list returned a non-array value");
-    return value.map(parseIssue).filter((issue) => Number.isSafeInteger(issue.number) && issue.number > 0);
+    const result = await this.#commands.run("gh", [
+      "api", "--paginate", "--slurp", `repos/${repository.nameWithOwner}/issues?state=open&per_page=100`,
+    ], { cwd: project.path });
+    const pages = parseJson(result.stdout, "gh api issues");
+    if (!Array.isArray(pages) || pages.length === 0 || pages.some((page) => !Array.isArray(page))) throw new Error("gh api issues returned invalid pages");
+    const issues = new Map<number, GitHubIssue>();
+    for (const value of pages.flat()) {
+      const row = object(value, "gh api issue");
+      if (row.pull_request !== undefined) continue;
+      const issue = parseIssue({ ...row, url: row.html_url, updatedAt: row.updated_at, state: stringField(row, "state", "gh api issue").toUpperCase() });
+      if (issue.state === "OPEN" && matchesIssueQuery(query, issue)) issues.set(issue.number, issue);
+    }
+    return [...issues.values()].sort((a, b) => a.number - b.number);
   }
 
   async issue(project: Project, number: number): Promise<GitHubIssue> {
     const repository = await this.repository(project.baseRemote);
     const result = await this.#commands.run("gh", [
       "issue", "view", String(number), "--repo", repository.nameWithOwner,
-      "--json", "number,title,body,url,state,labels,updatedAt",
+      "--json", "number,title,body,url,state,labels,updatedAt,milestone",
     ], { cwd: project.path });
     return parseIssue(parseJson(result.stdout, "gh issue view"));
   }

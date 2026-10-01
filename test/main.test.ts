@@ -11,7 +11,6 @@ import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../s
 import { MainOrchestrator } from "../src/runtime/main.js";
 import { registerCommands, type PiExtensionLike } from "../src/tools/commands.js";
 import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
-import { GitBaseMergeConflictError } from "../src/vcs/git.js";
 import { WorkerRuntime, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
@@ -36,6 +35,7 @@ interface HarnessOptions {
   inspect?: () => Promise<WorkerPresence>;
   stop?: () => Promise<void>;
   issueFailure?: (projectSlug: string, number: number) => boolean;
+  scopeFailure?: (projectSlug: string) => boolean;
   pullRequestFailure?: (number: number) => boolean;
   pullRequestContentFailure?: () => boolean;
   deleteCloneFailure?: boolean;
@@ -59,6 +59,7 @@ interface MainHarness {
   notifications: string[];
   synchronizedHeads: string[];
   baseMerges: Array<{ path: string; defaultBranch: string }>;
+  fetchedBases: Array<{ path: string; baseRefName: string; baseCommit: string }>;
   restoredClones: Array<{ projectSlug: string; branchName: string; headCommit: string }>;
   cloneBaseBranches: string[];
   deletedClones: string[];
@@ -119,6 +120,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   let baseMergeConflict = options.baseMergeConflict ?? false;
   const reviewComments = new Map<number, string>();
   const baseMerges: Array<{ path: string; defaultBranch: string }> = [];
+  const fetchedBases: Array<{ path: string; baseRefName: string; baseCommit: string }> = [];
   let nextPullRequest = 13;
   const github = {
     async repositoryInDirectory(path: string) {
@@ -144,6 +146,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       };
     },
     async listOpenIssues(project: Project) {
+      if (options.scopeFailure?.(project.slug)) throw new Error("GitHub scope unavailable");
       return [...issues.values()].filter((candidate) => candidate.url.includes(`/${project.slug}/issues/`));
     },
     async issue(project: Project, number: number) {
@@ -190,7 +193,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       if (options.pullRequestFailure?.(number)) throw new Error(`GitHub pull request ${number} unavailable`);
       const pullRequest = pullRequests.get(number);
       if (!pullRequest) throw new Error(`pull request ${number} not found`);
-      return pullRequest;
+      return baseMergeConflict && pullRequest.baseRefOid !== "base-sha"
+        ? { ...pullRequest, mergeable: "CONFLICTING" } : pullRequest;
     },
     async syncPullRequestContent(_project: Project, pullRequest: GitHubPullRequest, body: string, notes: string) {
       if (options.pullRequestContentFailure?.()) throw new Error("GitHub PR content update unavailable");
@@ -264,10 +268,16 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       heads.set(path, expectedCommit);
       synchronizedHeads.push(expectedCommit);
     },
+    async fetchBaseCommit(path: string, baseRefName: string, baseCommit: string) {
+      assert.ok(cloneBranches.has(path));
+      assert.ok(baseRefName);
+      assert.match(baseCommit, /^[0-9a-f]{40}$/);
+      fetchedBases.push({ path, baseRefName, baseCommit });
+    },
     async fetchAndMergeBase(path: string, defaultBranch: string) {
       baseMerges.push({ path, defaultBranch });
       if (baseMergeConflict) {
-        throw new GitBaseMergeConflictError("d".repeat(40), ["src/conflict.ts"]);
+        throw new Error("Main must not merge the base");
       }
       const headCommit = "f".repeat(40);
       heads.set(path, headCommit);
@@ -346,6 +356,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         taskFilePath: join(input.clonePath, ".merro-task.md"),
         resultPath,
         expectedCommit: input.expectedCommit,
+        ...(input.baseUpdate ? { baseUpdate: input.baseUpdate } : {}),
         startedAt: "2026-01-01T00:00:00Z",
       };
     },
@@ -411,6 +422,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       baseMergeConflict = conflicts;
     },
     baseMerges,
+    fetchedBases,
     setBranchPolicyAvailable(available) {
       branchPolicyAvailable = available;
     },
@@ -475,6 +487,159 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
   } finally {
     store.close();
   }
+});
+
+test("approved label and milestone scope survives restart and discovers matching work before completion", async (t) => {
+  const harness = await createHarness(t);
+  const original = harness.issues.get("example:7")!;
+  harness.issues.set("example:7", { ...original, milestone: "v1" } as GitHubIssue);
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  await tools.get("merro_start_objective")!.execute("approve", {
+    goal: "Ship all v1 features", project_slugs: ["example"],
+    issues: [{ project_slug: "example", query: { labels: ["feature"], milestone: "v1" } }],
+  });
+  await harness.main.runPass();
+  await harness.main.runPass();
+  harness.issues.set("example:8", { ...original, number: 8, url: original.url.replace("/7", "/8"), milestone: "v1" } as GitHubIssue);
+  harness.issues.set("example:9", { ...original, number: 9, url: original.url.replace("/7", "/9"), labels: ["bug"], milestone: "v1" } as GitHubIssue);
+  harness.issues.set("example:10", { ...original, number: 10, url: original.url.replace("/7", "/10"), milestone: "v2" } as GitHubIssue);
+  const restarted = harness.restartMain();
+  const merge = (await restarted.statusSnapshot()).decisions.find((decision) => decision.kind === "merge")!;
+  await restarted.resolveMergeDecision(merge.id, true);
+  const snapshot = await restarted.statusSnapshot();
+  assert.equal(snapshot.objectives[0]?.state, "Active");
+  assert.deepEqual(snapshot.workItems.map((item) => item.sourceRef).sort(), ["7", "8"]);
+  assert.deepEqual((snapshot.objectives[0] as unknown as Record<string, unknown>).issueScopes,
+    [{ projectSlug: "example", query: { labels: ["feature"], milestone: "v1" } }]);
+  assert.ok(harness.launches.some((input) => input.workItemId === "example:issue-8:g1"));
+  await restarted.runPass();
+  assert.equal((await restarted.statusSnapshot()).workItems.filter((item) => item.sourceRef === "8").length, 1);
+});
+
+test("Objective completion requires a fresh GitHub check even for fixed issue selections", async (t) => {
+  let fail = false;
+  const harness = await createHarness(t, { issueFailure: () => fail });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const decision = (await harness.main.statusSnapshot()).decisions[0]!;
+  fail = true;
+  await harness.main.resolveMergeDecision(decision.id, true);
+  let snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.workItems[0]?.state, "Done");
+  assert.equal(snapshot.objectives[0]?.state, "Active");
+  fail = false;
+  await harness.restartMain().runPass();
+  snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.objectives[0]?.state, "Done");
+});
+
+test("query scope failures keep a satisfied Objective Active until a fresh check succeeds", async (t) => {
+  let fail = false;
+  const harness = await createHarness(t, { scopeFailure: () => fail });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  // The approval check finds work; the next check fails after all attached work becomes satisfied.
+  await tools.get("merro_start_objective")!.execute("approve", {
+    goal: "Ship features", project_slugs: ["example"],
+    issues: [{ project_slug: "example", query: { labels: ["feature"] } }],
+  });
+  harness.setIssueState("example", 7, "CLOSED");
+  fail = true;
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Active");
+  fail = false;
+  await harness.restartMain().runPass();
+  assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Done");
+});
+
+test("a base that moves again during implementation requires another verified implementer Task", async (t) => {
+  const harness = await createHarness(t);
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  harness.setPullRequest(13, { baseRefOid: "d".repeat(40) });
+  await harness.main.runPass();
+  harness.setPullRequest(13, { baseRefOid: "e".repeat(40) });
+  await harness.restartMain().runPass();
+  await harness.main.runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement", "review", "implement"]);
+  assert.equal(harness.launches[4]?.baseUpdate?.baseCommit, "e".repeat(40));
+  assert.deepEqual(harness.baseMerges, []);
+});
+
+test("legacy Objectives retain fixed selections rather than inferring a query from their goal", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [7, 8] }] });
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    store.createObjective({ id: "legacy", goal: "Ship all features", priority: "normal", state: "Active", projectSlugs: ["example"] });
+    store.createWorkItem({
+      id: "example:issue-7:g1", projectSlug: "example", sourceType: "issue", sourceRef: "7", generation: 1,
+      state: "Ready", priority: "normal", readySince: "2026-01-01T00:00:00Z", blockedReason: null, blockedResumeState: null,
+    });
+    store.attachWorkItem("legacy", "example:issue-7:g1");
+  } finally { store.close(); }
+  harness.setIssueState("example", 7, "CLOSED");
+  await harness.restartMain().runPass();
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.objectives[0]?.state, "Done");
+  assert.deepEqual(snapshot.objectives[0]?.issueScopes, [{ projectSlug: "example", numbers: [7] }]);
+  assert.deepEqual(snapshot.workItems.map((item) => item.sourceRef), ["7"]);
+});
+
+test("empty query scopes complete only after a successful fresh check", async (t) => {
+  let fail = false;
+  const harness = await createHarness(t, { scopeFailure: () => fail });
+  await harness.main.startObjective({
+    goal: "Ship matching features", projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", query: { labels: ["unmatched"] } }],
+  });
+  fail = true;
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Active");
+  fail = false;
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Done");
+  assert.equal(harness.launches.length, 0);
+});
+
+test("one Project scope failure does not prevent another Project from discovering and scheduling work", async (t) => {
+  let fail = false;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "plugins", issueNumbers: [3] }],
+    scopeFailure: (slug) => fail && slug === "example",
+  });
+  await harness.main.startObjective({
+    goal: "Ship later features", projectSlugs: ["example", "plugins"],
+    issues: [{ projectSlug: "example", query: { labels: ["later"] } }, { projectSlug: "plugins", query: { labels: ["later"] } }],
+  });
+  const issue = harness.issues.get("plugins:3")!;
+  harness.issues.set("plugins:4", { ...issue, number: 4, url: issue.url.replace("/3", "/4"), labels: ["later"] });
+  fail = true;
+  await harness.main.runPass();
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.objectives[0]?.state, "Active");
+  assert.deepEqual(snapshot.workItems.map((item) => item.id), ["plugins:issue-4:g1"]);
+  assert.equal(harness.launches[0]?.workItemId, "plugins:issue-4:g1");
+});
+
+test("ambiguous and unsupported approved scopes fail before creating an Objective", async (t) => {
+  const harness = await createHarness(t);
+  for (const issues of [
+    [{ projectSlug: "example", numbers: [7], query: { labels: ["feature"] } }],
+    [{ projectSlug: "example", query: { search: "everything" } }],
+    [{ projectSlug: "example", query: { labels: null } }],
+    [{ projectSlug: "example", numbers: [7] }, { projectSlug: "example", query: {} }],
+    [{ projectSlug: "other", query: {} }],
+  ]) {
+    await assert.rejects(harness.main.startObjective({
+      goal: "Ship", projectSlugs: ["example"], issues: issues as unknown as Parameters<MainOrchestrator["startObjective"]>[0]["issues"],
+    }));
+  }
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
 });
 
 test("blocked reason follows external PR closure without losing resume state", async (t) => {
@@ -1002,7 +1167,7 @@ test("persistent CHANGES_REQUESTED reworks only once for the same review and rev
   assert.equal(state.decisions.length, 0);
 });
 
-test("base movement merges the base into the PR branch and schedules a fresh review", async (t) => {
+test("base movement schedules implementation and verification before a fresh review", async (t) => {
   const harness = await createHarness(t);
   await startDefaultObjective(harness.main);
   await harness.main.runPass();
@@ -1014,10 +1179,22 @@ test("base movement merges the base into the PR branch and schedules a fresh rev
   harness.setPullRequest(number, { baseRefOid: "d".repeat(40) });
   await harness.main.runPass();
 
-  assert.deepEqual(harness.baseMerges, [{ path: join(harness.workspacePath, "workers", "example", "example:issue-7:g1"), defaultBranch: "main" }]);
-  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "review"]);
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Reviewing");
+  assert.deepEqual(harness.baseMerges, []);
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
+  assert.match(harness.launches[2]!.taskFile, /updated base/i);
+  assert.match(harness.launches[2]!.taskFile, /dddddddddddddddddddddddddddddddddddddddd/);
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Implementing");
   assert.equal((await harness.main.statusSnapshot()).decisions.length, 0);
+  assert.equal(harness.fetchedBases[0]?.baseCommit, "d".repeat(40));
+  const restarted = harness.restartMain();
+  await restarted.runPass();
+  await restarted.runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement", "review"]);
+  const snapshot = await restarted.statusSnapshot();
+  assert.equal(snapshot.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(snapshot.decisions[0]?.kind, "merge");
+  assert.equal(snapshot.tasks.filter((task) => task.role === "review").length, 2);
+  assert.deepEqual(harness.baseMerges, []);
 });
 
 test("base merge conflicts create one merge_conflict Decision", async (t) => {
@@ -1038,12 +1215,12 @@ test("base merge conflicts create one merge_conflict Decision", async (t) => {
 
   await harness.main.runPass();
   state = await harness.main.statusSnapshot();
-  assert.equal(harness.baseMerges.length, 1);
+  assert.equal(harness.baseMerges.length, 0);
   assert.equal(state.decisions.length, 1);
   assert.equal(state.decisions[0]?.kind, "merge_conflict");
 });
 
-test("approve command resolves a merge_conflict Decision and schedules fresh review", async (t) => {
+test("approve command schedules an implementer to resolve a merge conflict before review", async (t) => {
   const harness = await createHarness(t, { baseMergeConflict: true });
   await startDefaultObjective(harness.main);
   await harness.main.runPass();
@@ -1066,8 +1243,9 @@ test("approve command resolves a merge_conflict Decision and schedules fresh rev
 
   const state = await harness.main.statusSnapshot();
   assert.equal(state.decisions.length, 0);
-  assert.equal(state.workItems[0]?.state, "Reviewing");
-  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "review"]);
+  assert.equal(state.workItems[0]?.state, "Implementing");
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
+  assert.deepEqual(harness.baseMerges, []);
 });
 
 test("reject command abandons a merge_conflict Decision without wedging the WorkItem", async (t) => {
@@ -1629,7 +1807,7 @@ test("new Main consumes a healthy worker result after a crash without restarting
       async pushBranch() {},
       async syncBranchHead() {},
       async effectiveDiffFingerprint(_project, _path, _baseRefName, _baseCommit, headCommit) { return headCommit; },
-      async fetchAndMergeBase() { return { baseCommit: "base-sha", headCommit: "base-sha", merged: false }; },
+      async fetchBaseCommit() { assert.fail("unexpected base update in dependency-only fixture"); },
     },
     github: {
       async repository() {

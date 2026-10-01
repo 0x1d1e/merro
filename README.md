@@ -18,6 +18,10 @@ Objective: ship kinetix 1.0, all open issues labeled 1.0.
 
 Main proposes WorkItems and relations, you approve, then it schedules implement and review Tasks,
 opens PRs, asks per-PR merge approval, squash-merges, and replans until the Objective is done.
+Approve fixed issue numbers or a query matching all specified labels and an optional milestone title.
+Query scopes include future matching issues automatically; completion requires a fresh GitHub check.
+`merro_start_objective` records each Project's scope as `numbers: [7, 8]` or
+`query: { labels: ["1.0"], milestone: "1.0" }`; `query: {}` covers all open issues.
 
 Escape hatches (commands): `status`, `stop`, `unlock`, `export` (SQLite to JSON).
 

@@ -1,4 +1,4 @@
-import type { ReviewRoundLimit } from "../domain/model.js";
+import type { BaseUpdate, ReviewRoundLimit } from "../domain/model.js";
 
 export type ProjectSandbox = "docker" | "none";
 export type ProjectNetwork = "on" | "off";
@@ -20,7 +20,9 @@ export interface WorkItemRuntimeRecord {
   workItemId: string;
   branchName: string | null;
   clonePath: string | null;
+  // Last base verified in this branch, not the latest observed GitHub tip.
   baseCommit: string | null;
+  baseUpdate?: BaseUpdate | null;
   pullRequestNumber: number | null;
   pullRequestUrl: string | null;
   pullRequestState: string | null;
@@ -55,5 +57,6 @@ export interface TaskRuntimeRecord {
   taskFilePath: string;
   resultPath: string;
   expectedCommit: string;
+  baseUpdate?: BaseUpdate | null;
   startedAt: string;
 }

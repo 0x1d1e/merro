@@ -1,7 +1,7 @@
 import { chmod, lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { Project } from "../domain/model.js";
+import type { BaseUpdate, Project } from "../domain/model.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { CommandError, systemCommandRunner, type CommandRunner } from "../runtime/commands.js";
 
@@ -9,13 +9,6 @@ export interface WorkItemClone {
   path: string;
   branchName: string;
   baseCommit: string;
-}
-
-export class GitBaseMergeConflictError extends Error {
-  constructor(readonly baseCommit: string, readonly conflictingPaths: string[], options?: ErrorOptions) {
-    super(`merging base ${baseCommit} caused conflicts: ${conflictingPaths.join(", ") || "unknown files"}`, options);
-    this.name = "GitBaseMergeConflictError";
-  }
 }
 
 export class GitClient {
@@ -115,7 +108,7 @@ export class GitClient {
     await chmod(path, details.mode & ~0o222);
   }
 
-  async validateTaskCommit(path: string, expectedHead: string, reportedCommit: string): Promise<string> {
+  async validateTaskCommit(path: string, expectedHead: string, reportedCommit: string, baseUpdate?: BaseUpdate | null): Promise<string> {
     if (!/^[0-9a-f]{40,64}$/i.test(reportedCommit)) {
       throw new Error(`Task reported an invalid commit SHA: ${reportedCommit}`);
     }
@@ -124,8 +117,18 @@ export class GitClient {
     if (head !== reported) throw new Error(`Task commit ${reported} does not match clone HEAD ${head}`);
 
     const parents = (await this.#run("git", ["show", "-s", "--format=%P", reported], { cwd: path })).stdout.trim().split(/\s+/).filter(Boolean);
-    if (parents.length !== 1 || parents[0] !== expectedHead) {
-      throw new Error(`Task commit must be one commit directly on ${expectedHead}`);
+    const approvedMerge = baseUpdate && parents.length === 2 && parents[1] === baseUpdate.baseCommit;
+    if (parents[0] !== expectedHead || (parents.length !== 1 && !approvedMerge)) {
+      throw new Error(`Task commit must be one commit directly on ${expectedHead}, with only the approved base as an optional second parent`);
+    }
+    if (baseUpdate) {
+      if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseUpdate.baseCommit)) throw new Error("invalid approved base commit SHA");
+      try {
+        await this.#run("git", ["merge-base", "--is-ancestor", baseUpdate.baseCommit, reported], { cwd: path });
+      } catch (error) {
+        if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
+        throw new Error(`Task commit does not contain approved base ${baseUpdate.baseCommit}`, { cause: error });
+      }
     }
 
     const status = (await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: path })).stdout;
@@ -133,27 +136,12 @@ export class GitClient {
     return reported;
   }
 
-  async fetchAndMergeBase(path: string, defaultBranch: string): Promise<{ baseCommit: string; headCommit: string; merged: boolean }> {
-    await this.#run("git", ["fetch", "--no-tags", "origin", defaultBranch], { cwd: path });
-    const baseCommit = (await this.#run("git", ["rev-parse", "FETCH_HEAD"], { cwd: path })).stdout.trim();
-    try {
-      await this.#run("git", ["merge-base", "--is-ancestor", baseCommit, "HEAD"], { cwd: path });
-      return { baseCommit, headCommit: await this.currentCommit(path), merged: false };
-    } catch (error) {
-      if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
-    }
-    try {
-      await this.#run("git", ["merge", "--no-edit", baseCommit], { cwd: path });
-    } catch (error) {
-      if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
-      const conflicts = await this.#run("git", ["diff", "--name-only", "--diff-filter=U"], { cwd: path });
-      await this.#run("git", ["merge", "--abort"], { cwd: path }).catch(() => {});
-      if (conflicts.stdout.trim()) {
-        throw new GitBaseMergeConflictError(baseCommit, conflicts.stdout.trim().split(/\r?\n/), { cause: error });
-      }
-      throw error;
-    }
-    return { baseCommit, headCommit: await this.currentCommit(path), merged: true };
+  async fetchBaseCommit(path: string, baseRefName: string, baseCommit: string): Promise<void> {
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseCommit)) throw new Error("invalid approved base commit SHA");
+    await this.#run("git", ["check-ref-format", "--branch", baseRefName], { cwd: path });
+    await this.#run("git", ["fetch", "--no-tags", "origin", baseRefName], { cwd: path });
+    const resolved = (await this.#run("git", ["rev-parse", "--verify", `${baseCommit}^{commit}`], { cwd: path })).stdout.trim();
+    if (resolved !== baseCommit) throw new Error(`approved base ${baseCommit} resolved to ${resolved}`);
   }
 
   async pushBranch(project: Project, clonePath: string, branchName: string): Promise<void> {

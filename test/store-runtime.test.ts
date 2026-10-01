@@ -34,9 +34,14 @@ test("objectives preserve linked Projects and per-Objective review limits", () =
       state: "Active",
       projectSlugs: ["q", "p", "p"],
       maxReviewRounds: "unlimited",
+      issueScopes: [{ projectSlug: "p", query: { labels: ["feature"], milestone: "v1" } }, { projectSlug: "q", numbers: [7] }],
     });
     assert.deepEqual(store.getObjective("o1")?.projectSlugs, ["p", "q"]);
     assert.equal(store.listObjectives()[0]?.maxReviewRounds, "unlimited");
+    assert.deepEqual(store.getObjective("o1")?.issueScopes, [
+      { projectSlug: "p", query: { labels: ["feature"], milestone: "v1" } }, { projectSlug: "q", numbers: [7] },
+    ]);
+    assert.throws(() => store.restoreObjectiveIssueScopes("o1", [{ projectSlug: "p", query: {} }]), /already has approved/);
     store.saveObjectiveSettings("o1", { maxReviewRounds: 2 });
     assert.equal(store.getObjective("o1")?.maxReviewRounds, 2);
   } finally {
@@ -67,6 +72,7 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       branchName: "fix/a",
       clonePath: "/tmp/a",
       baseCommit: "abc",
+      baseUpdate: { baseRefName: "release", baseCommit: "d".repeat(40) },
       pullRequestNumber: null,
       pullRequestUrl: null,
       pullRequestState: null,
@@ -82,6 +88,7 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       lastReconciledAt: null,
     });
     assert.equal(store.getWorkItemRuntime("a")?.implementationAttempt, 2);
+    assert.deepEqual(store.getWorkItemRuntime("a")?.baseUpdate, { baseRefName: "release", baseCommit: "d".repeat(40) });
 
     store.createTask({ id: "t1", workItemId: "a", role: "implement", attempt: 1 });
     store.saveTaskRuntime({
@@ -97,9 +104,11 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       taskFilePath: "/tmp/a/.merro-task.md",
       resultPath: "/tmp/task/.merro-result.json",
       expectedCommit: "abc",
+      baseUpdate: { baseRefName: "release", baseCommit: "d".repeat(40) },
       startedAt: "2026-01-01T00:00:00Z",
     });
     assert.equal(store.getTaskRuntime("t1")?.containerId, "container");
+    assert.deepEqual(store.getTaskRuntime("t1")?.baseUpdate, { baseRefName: "release", baseCommit: "d".repeat(40) });
 
     store.createDecision({
       id: "d1",

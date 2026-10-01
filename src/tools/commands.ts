@@ -92,7 +92,7 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
     for (const [name, approved] of [["merro-approve", true], ["merro-reject", false]] as const) {
       pi.registerCommand(name, {
         description: approved
-          ? "Approve a merge Decision or confirm a merge-conflict resolution"
+          ? "Approve a merge Decision or authorize an implementer to resolve a merge conflict"
           : "Reject a merge Decision or abandon a merge-conflict resolution",
         async handler(args, ctx) {
           const decisionId = args.trim();

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -281,4 +281,10 @@ BEFORE DELETE ON final_summaries
 BEGIN
   SELECT RAISE(ABORT, 'final summaries are immutable');
 END;
+`;
+
+export const MIGRATION_10 = `
+ALTER TABLE objectives ADD COLUMN issue_scopes_json TEXT CHECK (issue_scopes_json IS NULL OR json_valid(issue_scopes_json));
+ALTER TABLE work_item_runtime ADD COLUMN base_update_json TEXT CHECK (base_update_json IS NULL OR json_valid(base_update_json));
+ALTER TABLE task_runtime ADD COLUMN base_update_json TEXT CHECK (base_update_json IS NULL OR json_valid(base_update_json));
 `;

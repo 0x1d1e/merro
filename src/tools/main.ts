@@ -1,4 +1,5 @@
 import { Type } from "typebox";
+import { parseObjectiveIssueScopes } from "../domain/objective.js";
 import type { ObjectiveStartInput } from "../runtime/main.js";
 import type { MainOrchestrator } from "../runtime/main.js";
 
@@ -14,10 +15,16 @@ const projectSlugParameters = Type.Object({
 const objectiveParameters = Type.Object({
   goal: Type.String(),
   project_slugs: Type.Array(Type.String(), { minItems: 1 }),
-  issues: Type.Array(Type.Object({
-    project_slug: Type.String(),
-    numbers: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 }),
-  }), { minItems: 1 }),
+  issues: Type.Array(Type.Union([
+    Type.Object({ project_slug: Type.String(), numbers: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 }) }, { additionalProperties: false }),
+    Type.Object({
+      project_slug: Type.String(),
+      query: Type.Object({
+        labels: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+        milestone: Type.Optional(Type.String({ minLength: 1 })),
+      }, { additionalProperties: false }),
+    }, { additionalProperties: false }),
+  ]), { minItems: 1 }),
   priority: Type.Optional(Type.Union([Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")])),
   max_review_rounds: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Literal("unlimited")])),
 }, { additionalProperties: false });
@@ -114,21 +121,22 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
   pi.registerTool({
     name: "merro_start_objective",
     label: "Approve Objective and start work",
-    description: "Create an Objective and its selected open-issue WorkItems, then schedule work. Call only after the user explicitly approves the goal, Project scope, selected issues, and proposed relations. This call itself records that approval.",
+    description: "Create an Objective and schedule work. Each Project issue scope is either fixed numbers or a query: all specified labels AND an optional milestone title; an empty query means all open issues. Query scopes automatically include future matching issues. Call only after the user explicitly approves the goal, Project scope, issue scopes, and proposed relations. This call records that approval.",
     parameters: objectiveParameters,
     async execute(_id, args) {
       const goal = stringArgument(args, "goal");
       const projectSlugs = stringArray(args, "project_slugs");
       const rawIssues = args.issues;
       if (!Array.isArray(rawIssues)) throw new Error("issues must be an array");
-      const issues = rawIssues.map((entry, index) => {
+      const issues = parseObjectiveIssueScopes(rawIssues.map((entry, index) => {
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new Error(`issues[${index}] must be an object`);
         const row = entry as Record<string, unknown>;
-        if (typeof row.project_slug !== "string" || !Array.isArray(row.numbers) || row.numbers.some((number) => !Number.isSafeInteger(number) || Number(number) < 1)) {
-          throw new Error(`issues[${index}] must include project_slug and positive issue numbers`);
-        }
-        return { projectSlug: row.project_slug, numbers: row.numbers as number[] };
-      });
+        return {
+          projectSlug: row.project_slug,
+          ...("numbers" in row ? { numbers: row.numbers } : {}),
+          ...("query" in row ? { query: row.query } : {}),
+        };
+      }), projectSlugs);
       const input: ObjectiveStartInput = {
         goal,
         projectSlugs,
@@ -159,7 +167,7 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
   pi.registerTool({
     name: "merro_resolve_merge_conflict",
     label: "Resolve merge conflict Decision",
-    description: "Resolve a pending merge-conflict Decision after the user explicitly chooses to confirm conflict resolution or abandon it. 'resolved' merges and pushes the updated base when possible, then requires GitHub to report the PR conflict-free; 'abandon' leaves the PR open and blocks its WorkItem.",
+    description: "Resolve a pending merge-conflict Decision only after the user's explicit choice. 'resolved' authorizes an implementer Task to merge the exact updated base, resolve conflicts, and verify, followed by a fresh review. Main does not make the merge commit. 'abandon' leaves the PR open and blocks its WorkItem.",
     parameters: mergeConflictParameters,
     async execute(_id, args) {
       const decisionId = stringArgument(args, "decision_id");

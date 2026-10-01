@@ -39,26 +39,55 @@ test("GitHub issue discovery uses gh JSON and parses issue labels", async () => 
   const commands = new FakeCommands([
     { stdout: repository("acme/widget"), stderr: "" },
     {
-      stdout: JSON.stringify([{
+      stdout: JSON.stringify([[{
         number: 17,
         title: "Fix widget",
         body: "Details",
-        url: "https://github.com/acme/widget/issues/17",
-        state: "OPEN",
+        html_url: "https://github.com/acme/widget/issues/17",
+        state: "open",
         labels: [{ name: "v0.1" }, { name: "bug" }],
-        updatedAt: "2026-01-01T00:00:00Z",
-      }]),
+        milestone: { title: "v1" },
+        updated_at: "2026-01-01T00:00:00Z",
+      }]]),
       stderr: "",
     },
   ]);
   const gh = new GitHubClient(commands);
 
-  const issues = await gh.listOpenIssues(project, ["v0.1", "bug"]);
+  const issues = await gh.listOpenIssues(project, { labels: ["v0.1", "bug"], milestone: "v1" });
 
   assert.equal(issues.length, 1);
   assert.deepEqual(issues[0]?.labels, ["v0.1", "bug"]);
-  assert.deepEqual(commands.calls[1]?.args.slice(-4), ["--label", "v0.1", "--label", "bug"]);
+  assert.equal(issues[0]?.milestone, "v1");
+  assert.deepEqual(commands.calls[1]?.args, ["api", "--paginate", "--slurp", "repos/acme/widget/issues?state=open&per_page=100"]);
   assert.equal(commands.calls[1]?.options?.cwd, project.path);
+});
+
+test("scope discovery consumes every page, excludes PRs, and filters all approved labels and milestone", async () => {
+  const issue = (number: number, labels = ["feature"], milestone = "v1") => ({
+    number, title: `Issue ${number}`, body: "scope", html_url: `https://github.com/acme/widget/issues/${number}`,
+    state: "open", labels: labels.map((name) => ({ name })), milestone: { title: milestone }, updated_at: "2026-01-01T00:00:00Z",
+  });
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: JSON.stringify([
+      Array.from({ length: 100 }, (_, index) => issue(index + 1, ["bug"])),
+      [issue(101, ["feature", "release"]), { ...issue(102, ["feature", "release"]), pull_request: {} }, issue(103, ["feature", "release"], "v2"), issue(104)],
+    ]), stderr: "" },
+  ]);
+  const issues = await new GitHubClient(commands).listOpenIssues(project, { labels: ["FEATURE", "release"], milestone: "v1" });
+  assert.deepEqual(issues.map((candidate) => candidate.number), [101]);
+  assert.ok(commands.calls[1]?.args.includes("--paginate"));
+});
+
+test("scope discovery rejects incomplete or malformed responses instead of reporting no work", async () => {
+  for (const value of [[], [{}], [[{ number: 1, labels: [{}] }]]]) {
+    const commands = new FakeCommands([
+      { stdout: repository("acme/widget"), stderr: "" },
+      { stdout: JSON.stringify(value), stderr: "" },
+    ]);
+    await assert.rejects(new GitHubClient(commands).listOpenIssues(project));
+  }
 });
 
 test("branch protection is unknown on GitHub API failure", async () => {

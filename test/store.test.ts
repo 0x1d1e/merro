@@ -231,7 +231,9 @@ test("store migrates v1 state without losing WorkItems", async (t) => {
   const migrated = new DatabaseSync(path);
   try {
     assert.equal(Number(migrated.prepare("SELECT version FROM schema_meta").get()?.version), SCHEMA_VERSION);
-    assert.doesNotThrow(() => migrated.prepare("SELECT runtime_kind FROM task_runtime").all());
+    assert.doesNotThrow(() => migrated.prepare("SELECT runtime_kind, base_update_json FROM task_runtime").all());
+    assert.doesNotThrow(() => migrated.prepare("SELECT base_update_json FROM work_item_runtime").all());
+    assert.doesNotThrow(() => migrated.prepare("SELECT issue_scopes_json FROM objectives").all());
   } finally {
     migrated.close();
   }

@@ -172,6 +172,51 @@ test("Git client creates an exact detached checkout for dependency review", asyn
   await assert.rejects(new GitClient().createReadOnlyCheckout(projectRecord, join(root, "bad-checkout"), "f".repeat(40)));
 });
 
+test("updated base is fetched without changing the branch and only its verified Task merge is accepted", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = await createProject(root);
+  const clonePath = join(root, "work", "p-issue-1-g1");
+  const client = new GitClient();
+  const clone = await client.createWorkItemClone({
+    slug: "p", path: project.path, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main",
+  }, clonePath, "feat/issue-1");
+  await writeFile(join(clonePath, "feature.txt"), "feature\n");
+  await git(clonePath, "add", "feature.txt");
+  await git(clonePath, "commit", "-m", "implement");
+  const expected = await client.currentCommit(clonePath);
+  await writeFile(join(project.path, "base.txt"), "updated base\n");
+  await git(project.path, "add", "base.txt");
+  await git(project.path, "commit", "-m", "advance base");
+  await git(project.path, "push", "origin", "main");
+  const baseCommit = await client.currentCommit(project.path);
+  const baseUpdate = { baseRefName: "main", baseCommit };
+
+  await client.fetchBaseCommit(clonePath, "main", baseCommit);
+  assert.equal(await client.currentCommit(clonePath), expected);
+  assert.equal(await git(clonePath, "status", "--porcelain"), "");
+  await git(clonePath, "commit", "--allow-empty", "-m", "did not merge the base");
+  await assert.rejects(client.validateTaskCommit(clonePath, expected, await client.currentCommit(clonePath), baseUpdate), /does not contain approved base/);
+  await git(clonePath, "reset", "--hard", expected);
+
+  await git(clonePath, "merge", "--no-ff", "--no-commit", baseCommit);
+  await git(clonePath, "diff", "--check");
+  assert.equal(await git(clonePath, "show", ":base.txt"), "updated base");
+  assert.equal(await git(clonePath, "show", ":feature.txt"), "feature");
+  await git(clonePath, "commit", "-m", "merge and verify updated base");
+  const merged = await client.currentCommit(clonePath);
+  assert.equal(await git(clonePath, "show", "-s", "--format=%P", merged), `${expected} ${baseCommit}`);
+  assert.equal(await client.validateTaskCommit(clonePath, expected, merged, baseUpdate), merged);
+  await assert.rejects(client.validateTaskCommit(clonePath, expected, merged), /one commit directly/);
+  await assert.rejects(client.validateTaskCommit(clonePath, expected, merged, { ...baseUpdate, baseCommit: clone.baseCommit }), /one commit directly/);
+  await writeFile(join(clonePath, "feature.txt"), "unverified change\n");
+  await assert.rejects(client.validateTaskCommit(clonePath, expected, merged, baseUpdate), /uncommitted/);
+  await git(clonePath, "restore", "feature.txt");
+
+  await git(clonePath, "commit", "--allow-empty", "-m", "verify already merged base");
+  assert.equal(await client.validateTaskCommit(clonePath, merged, await client.currentCommit(clonePath), baseUpdate), await client.currentCommit(clonePath));
+});
+
 test("Git client rejects Task commits that contain more than one commit", async (t) => {
   const root = await tempDirectory();
   t.after(() => rm(root, { recursive: true, force: true }));

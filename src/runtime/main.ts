@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { MerroConfig } from "../config.js";
-import { priorityRank, type Objective, type Priority, type Project, type Relation, type Task, type TaskRole, type WorkItem } from "../domain/model.js";
+import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type WorkItem } from "../domain/model.js";
+import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { findRequiresCycle } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
@@ -14,9 +15,9 @@ import { renderTaskFile } from "./task-file.js";
 import { MainLock } from "./main-lock.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
-import { GitBaseMergeConflictError, GitClient } from "../vcs/git.js";
+import { GitClient } from "../vcs/git.js";
 
-type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchAndMergeBase" | "syncBranchHead" | "effectiveDiffFingerprint">
+type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint">
   & Partial<Pick<GitClient, "remoteBranchCommit" | "ensureWorkItemClone" | "createReadOnlyCheckout" | "deleteClone">>;
 type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest">>;
@@ -36,7 +37,7 @@ export interface MainOptions {
 export interface ObjectiveStartInput {
   goal: string;
   projectSlugs: string[];
-  issues: Array<{ projectSlug: string; numbers: number[] }>;
+  issues: ObjectiveIssueScope[];
   priority?: Priority;
   maxReviewRounds?: number | "unlimited";
 }
@@ -349,51 +350,31 @@ export class MainOrchestrator {
         if (!project) throw new Error(`unknown Project: ${slug}`);
         return project;
       });
-      const issueSelections = new Map(input.issues.map((entry) => [entry.projectSlug, new Set(entry.numbers)]));
+      const issueScopes = parseObjectiveIssueScopes(input.issues, input.projectSlugs);
+      if (issueScopes.length === 0) throw new Error("Objective requires an approved issue scope");
       const issueRows = new Map<string, GitHubIssue>();
-      for (const project of projects) {
-        const selected = issueSelections.get(project.slug) ?? new Set<number>();
-        if (selected.size === 0) continue;
-        const open = await this.#github.listOpenIssues(project);
-        for (const number of selected) {
-          const issue = open.find((candidate) => candidate.number === number);
-          if (!issue) throw new Error(`issue #${number} is not open in Project '${project.slug}'`);
-          issueRows.set(`${project.slug}\0${number}`, issue);
+      for (const scope of issueScopes) {
+        const project = projects.find((candidate) => candidate.slug === scope.projectSlug)!;
+        const open = await this.#github.listOpenIssues(project, "query" in scope ? scope.query : undefined);
+        const selected = open.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue));
+        if ("numbers" in scope) {
+          for (const number of scope.numbers) {
+            if (!selected.some((issue) => issue.number === number)) throw new Error(`issue #${number} is not open in Project '${project.slug}'`);
+          }
         }
-      }
-      if (issueRows.size === 0) throw new Error("Objective must select at least one open issue");
-      for (const slug of issueSelections.keys()) {
-        if (!projects.some((project) => project.slug === slug)) throw new Error(`issue selection references unlinked Project '${slug}'`);
+        for (const issue of selected) issueRows.set(`${project.slug}\0${issue.number}`, issue);
       }
 
       const objective: Objective = {
         id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
-        projectSlugs: projects.map((project) => project.slug),
+        projectSlugs: projects.map((project) => project.slug), issueScopes,
         ...(input.maxReviewRounds === undefined ? {} : { maxReviewRounds: input.maxReviewRounds }),
       };
       store.createObjective(objective);
       const items: WorkItem[] = [];
       for (const [key, issue] of issueRows) {
         const projectSlug = key.split("\0")[0] ?? "";
-        const existing = store.findNonTerminalWorkItem(projectSlug, "issue", String(issue.number));
-        if (existing) {
-          store.attachWorkItem(objective.id, existing.id);
-          if (priorityRank(objective.priority) < priorityRank(existing.priority)) store.setWorkItemPriority(existing.id, objective.priority);
-          items.push(store.getWorkItem(existing.id) ?? existing);
-          continue;
-        }
-        const generation = store.nextGeneration(projectSlug, "issue", String(issue.number));
-        const item: WorkItem = {
-          id: sourceId(projectSlug, issue.number, generation), projectSlug, sourceType: "issue",
-          sourceRef: String(issue.number), generation, state: "Ready", priority: objective.priority,
-          readySince: new Date().toISOString(), blockedReason: null, blockedResumeState: null,
-        };
-        store.createWorkItem(item);
-        store.attachWorkItem(objective.id, item.id);
-        const runtime = emptyRuntime(item.id);
-        runtime.lastIssueState = issue.state.toUpperCase();
-        store.saveWorkItemRuntime(runtime);
-        items.push(item);
+        items.push(this.#attachIssue(store, objective, projectSlug, issue));
       }
       this.#notify(`Objective ${objective.id} approved with ${items.length} WorkItem(s).`);
       return { objective, workItems: items };
@@ -456,7 +437,7 @@ export class MainOrchestrator {
           }
           await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
           store.resolveDecision(decisionId, "resolved");
-          this.#finishObjectives(store);
+          await this.#finishObjectives(store);
           return;
         }
         if (pullRequest.state !== "OPEN") {
@@ -523,7 +504,7 @@ export class MainOrchestrator {
         const reason = unavailable ? "github_unavailable" : "merge_failed";
         this.#block(store, item, reason, `Merge ${unavailable ? "reconciliation failed" : "was rejected"}: ${errorText(error)}`);
       }
-      this.#finishObjectives(store);
+      await this.#finishObjectives(store);
     });
     await this.runPass();
   }
@@ -547,7 +528,7 @@ export class MainOrchestrator {
         return;
       }
 
-      let pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
+      const pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
       this.#savePullRequest(store, runtime, pullRequest);
       if (pullRequest.mergedAt) {
         if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("merged pull request has no valid merge commit SHA");
@@ -566,15 +547,8 @@ export class MainOrchestrator {
         ? await this.#git.remoteBranchCommit(project, runtime.branchName)
         : pullRequest.headRefOid;
       if (remoteHead !== pullRequest.headRefOid) throw new Error("remote conflict branch does not match the pull request head");
-      const baseMerge = await this.#git.fetchAndMergeBase(runtime.clonePath, pullRequest.baseRefName);
-      if (baseMerge.merged) await this.#git.pushBranch(project, runtime.clonePath, runtime.branchName);
-      pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
-      this.#savePullRequest(store, runtime, pullRequest);
-      if (pullRequest.state !== "OPEN" || pullRequest.mergeable !== "MERGEABLE") {
-        throw new Error(`pull request is not conflict-free yet (mergeable: ${pullRequest.mergeable})`);
-      }
+      this.#queueBaseUpdate(store, item, runtime, pullRequest);
       store.resolveDecision(decisionId, "resolved");
-      this.#notify(`Conflict resolution confirmed for ${pullRequest.url}; Main will revalidate the diff and review.`, "info");
     });
     await this.runPass();
   }
@@ -583,6 +557,11 @@ export class MainOrchestrator {
     await this.#withStore(async (store) => {
       try {
         const unavailableProjects = await this.#reconcileProjects(store);
+        for (const objective of store.listObjectives()) {
+          if (objective.state === "Active" && objective.issueScopes?.some((scope) => "query" in scope)) {
+            await this.#refreshObjectiveScope(store, objective, unavailableProjects);
+          }
+        }
         await this.#reconcileIssues(store, unavailableProjects);
         await this.#reconcileTasks(store, unavailableProjects);
         await this.#reconcilePullRequests(store, unavailableProjects);
@@ -602,7 +581,7 @@ export class MainOrchestrator {
           if (item.state === "Ready") store.transitionWorkItem(item.id, "Implementing");
           await this.#launchTask(store, store.getWorkItem(item.id) ?? item);
         }
-        this.#finishObjectives(store);
+        await this.#finishObjectives(store, unavailableProjects);
       } finally {
         await this.#reconcileFinalizedTasks(store);
       }
@@ -661,6 +640,8 @@ export class MainOrchestrator {
       }
       const clonePath = runtime.clonePath;
       if (!clonePath) throw new Error("WorkItem clone path is unavailable");
+      const baseUpdate = role === "implement" ? runtime.baseUpdate ?? null : null;
+      if (baseUpdate) await this.#git.fetchBaseCommit(clonePath, baseUpdate.baseRefName, baseUpdate.baseCommit);
       expectedCommit = await this.#git.currentCommit(clonePath);
       const objective = store.listObjectives().find((candidate) => store.listWorkItems(candidate.id).some((workItem) => workItem.id === item.id));
       if (!objective) throw new Error(`WorkItem ${item.id} is not attached to an Objective`);
@@ -718,13 +699,13 @@ export class MainOrchestrator {
         userGuidance: item.guidance ?? "",
         projectGuidance: projectSettings?.guidance ?? "",
         repositoryInstructions: instructions,
-        dependencies: dependencyContext, latestReview, expectedCommit,
+        dependencies: dependencyContext, latestReview, expectedCommit, baseUpdate,
       });
       const previousTasks = store.listTasks(item.id).filter((task) => task.role === role);
       const attempt = previousTasks.reduce((highest, task) => Math.max(highest, task.attempt), 0) + 1;
       const launchInput = {
         taskId, workItemId: item.id, role, project, clonePath,
-        taskFile, expectedCommit, projectSettings, dependencies: dependencyMounts.map(({ mount }) => mount),
+        taskFile, expectedCommit, baseUpdate, projectSettings, dependencies: dependencyMounts.map(({ mount }) => mount),
       };
       runtimeIntent = this.#workers.plan?.(launchInput) ?? {
         taskId,
@@ -738,7 +719,7 @@ export class MainOrchestrator {
         clonePath,
         taskFilePath: join(clonePath, ".merro-task.md"),
         resultPath: join(this.#stateDirectory, "runtime", "tasks", taskId, ".merro-result.json"),
-        expectedCommit,
+        expectedCommit, ...(baseUpdate ? { baseUpdate } : {}),
         startedAt: new Date().toISOString(),
       } satisfies TaskRuntimeRecord;
       store.createTask({ id: taskId, workItemId: item.id, role, attempt, runtime: runtimeIntent });
@@ -966,7 +947,7 @@ export class MainOrchestrator {
           const implementResult = parseImplementResult(raw);
           assertResultMatchesTask({ expectedTaskId: task.id, result: implementResult });
           if (implementResult.status === "success") {
-            await this.#git.validateTaskCommit(runtime.clonePath, runtime.expectedCommit, implementResult.commit);
+            await this.#git.validateTaskCommit(runtime.clonePath, runtime.expectedCommit, implementResult.commit, runtime.baseUpdate);
           } else if (await this.#git.currentCommit(runtime.clonePath) !== implementResult.commit) {
             throw new Error(`failed result commit does not match clone HEAD: ${implementResult.commit}`);
           }
@@ -1032,6 +1013,11 @@ export class MainOrchestrator {
       }
       const typed = implementResult;
       store.finalizeTask({ id: task.id, outcome: "success", summary: typed.summary, resultJson: JSON.stringify(typed), commitSha: typed.commit });
+      if (runtime.baseUpdate) {
+        workRuntime.baseCommit = runtime.baseUpdate.baseCommit;
+        workRuntime.baseUpdate = null;
+        store.saveWorkItemRuntime(workRuntime);
+      }
       if (!this.#obsoleteIfUnowned(store, item)) store.transitionWorkItem(item.id, "Reviewing");
       return;
     }
@@ -1096,7 +1082,6 @@ export class MainOrchestrator {
       const runtime = store.getWorkItemRuntime(item.id);
       const project = store.getProject(item.projectSlug);
       if (!runtime || !project) continue;
-      const previousBaseSha = runtime.pullRequestBaseSha;
       try {
         if (item.sourceType === "issue" && runtime.lastIssueState === "CLOSED" && !terminal(item)) {
           if (store.activeTask(item.id)) continue;
@@ -1209,59 +1194,22 @@ export class MainOrchestrator {
           item = store.getWorkItem(item.id) ?? item;
         }
 
-        const baseMoved = previousBaseSha !== null && pullRequest.baseRefOid !== previousBaseSha;
-        if (baseMoved || pullRequest.mergeable === "CONFLICTING") {
-          if (!runtime.clonePath || !runtime.branchName) throw new Error("cannot merge the updated base: WorkItem branch runtime is incomplete");
-          let baseMerge: Awaited<ReturnType<GitClient["fetchAndMergeBase"]>>;
-          try {
-            baseMerge = await this.#git.fetchAndMergeBase(runtime.clonePath, pullRequest.baseRefName);
-          } catch (error) {
-            if (!(error instanceof GitBaseMergeConflictError)) throw error;
-            this.#resolveMergeDecisions(store, item.id);
-            const pending = store.pendingDecisions().find((decision) => decision.subjectId === item.id);
-            if (!pending) {
-              const decision = store.createDecision({
-                id: randomUUID(), subjectType: "WorkItem", subjectId: item.id, kind: "merge_conflict",
-                payload: {
-                  pullRequest: pullRequest.number,
-                  url: pullRequest.url,
-                  baseRefName: pullRequest.baseRefName,
-                  baseCommit: error.baseCommit,
-                  conflictingPaths: error.conflictingPaths,
-                  detail: error.message,
-                },
-              });
-              this.#notify(`Base merge conflict requires a decision for ${pullRequest.url} (Decision ${decision.id}).`, "warning");
-            }
-            continue;
-          }
-          runtime.pullRequestBaseSha = baseMerge.baseCommit;
-          if (baseMerge.merged) {
-            runtime.pullRequestHeadSha = baseMerge.headCommit;
-            store.saveWorkItemRuntime(runtime);
-            this.#resolveMergeDecisions(store, item.id);
-            await this.#git.pushBranch(project, runtime.clonePath, runtime.branchName);
-            store.transitionWorkItem(item.id, "Reviewing");
-            this.#notify(`Merged the updated base into ${pullRequest.url}; scheduling a fresh review.`, "warning");
-            continue;
-          }
-          store.saveWorkItemRuntime(runtime);
-          pullRequest = await this.#github.pullRequest(project, pullRequest.number);
-          this.#savePullRequest(store, runtime, pullRequest);
-          if (pullRequest.mergeable === "CONFLICTING") {
-            const decision = store.createDecision({
-              id: randomUUID(), subjectType: "WorkItem", subjectId: item.id, kind: "merge_conflict",
-              payload: {
-                pullRequest: pullRequest.number,
-                url: pullRequest.url,
-                baseRefName: pullRequest.baseRefName,
-                baseCommit: baseMerge.baseCommit,
-                detail: "Git reports the base is already merged, but GitHub still reports conflicts.",
-              },
-            });
-            this.#notify(`Base merge conflict requires a decision for ${pullRequest.url} (Decision ${decision.id}).`, "warning");
-            continue;
-          }
+        if (pullRequest.mergeable === "CONFLICTING") {
+          this.#resolveMergeDecisions(store, item.id);
+          const decision = store.createDecision({
+            id: randomUUID(), subjectType: "WorkItem", subjectId: item.id, kind: "merge_conflict",
+            payload: {
+              pullRequest: pullRequest.number, url: pullRequest.url,
+              baseRefName: pullRequest.baseRefName, baseCommit: pullRequest.baseRefOid,
+              detail: "GitHub reports conflicts with the updated base; an implementer must resolve and verify them.",
+            },
+          });
+          this.#notify(`Base merge conflict requires a decision for ${pullRequest.url} (Decision ${decision.id}).`, "warning");
+          continue;
+        }
+        if (runtime.baseCommit !== null && pullRequest.baseRefOid !== runtime.baseCommit) {
+          this.#queueBaseUpdate(store, item, runtime, pullRequest);
+          continue;
         }
 
         const reviewTrigger = changeRequestTrigger(pullRequest);
@@ -1505,16 +1453,105 @@ export class MainOrchestrator {
     if (this.#config.notify_command?.trim()) this.#pendingNotifications.push({ event, subjectId, message });
   }
 
-  #finishObjectives(store: MerroStore): void {
+  #queueBaseUpdate(store: MerroStore, item: WorkItem, runtime: WorkItemRuntimeRecord, pullRequest: GitHubPullRequest): void {
+    if (!runtime.clonePath || !runtime.branchName || !isCommitSha(pullRequest.baseRefOid)) throw new Error("cannot schedule updated base: WorkItem runtime or base commit is invalid");
+    this.#resolveMergeDecisions(store, item.id);
+    runtime.baseUpdate = { baseRefName: pullRequest.baseRefName, baseCommit: pullRequest.baseRefOid };
+    runtime.reviewedDiffHash = null;
+    store.saveWorkItemRuntime(runtime);
+    store.transitionWorkItem(item.id, "Implementing");
+    this.#notify(`Scheduling an implementer to merge and verify the updated base for ${pullRequest.url}, then a fresh review.`, "warning");
+  }
+
+  #attachIssue(store: MerroStore, objective: Objective, projectSlug: string, issue: GitHubIssue): WorkItem {
+    const existing = store.findNonTerminalWorkItem(projectSlug, "issue", String(issue.number));
+    if (existing) {
+      store.attachWorkItem(objective.id, existing.id);
+      if (priorityRank(objective.priority) < priorityRank(existing.priority)) store.setWorkItemPriority(existing.id, objective.priority);
+      return store.getWorkItem(existing.id)!;
+    }
+    const generation = store.nextGeneration(projectSlug, "issue", String(issue.number));
+    const item: WorkItem = {
+      id: sourceId(projectSlug, issue.number, generation), projectSlug, sourceType: "issue",
+      sourceRef: String(issue.number), generation, state: "Ready", priority: objective.priority,
+      readySince: new Date().toISOString(), blockedReason: null, blockedResumeState: null,
+    };
+    store.createWorkItem(item);
+    store.attachWorkItem(objective.id, item.id);
+    const runtime = emptyRuntime(item.id);
+    runtime.lastIssueState = issue.state.toUpperCase();
+    store.saveWorkItemRuntime(runtime);
+    return item;
+  }
+
+  async #refreshObjectiveScope(store: MerroStore, objective: Objective, unavailableProjects: ReadonlySet<string> = new Set()): Promise<boolean> {
+    try {
+      let scopes = objective.issueScopes;
+      if (scopes === undefined) {
+        // Older databases record selections only through attached WorkItems. Never infer a broader query from the goal.
+        const numbers = new Map<string, number[]>();
+        for (const item of store.listWorkItems(objective.id)) {
+          if (item.sourceType !== "issue") continue;
+          const selected = numbers.get(item.projectSlug) ?? [];
+          selected.push(Number(item.sourceRef));
+          numbers.set(item.projectSlug, selected);
+        }
+        scopes = parseObjectiveIssueScopes([...numbers].map(([projectSlug, selected]) => ({ projectSlug, numbers: selected })), objective.projectSlugs);
+        store.restoreObjectiveIssueScopes(objective.id, scopes);
+      }
+      const discovered: Array<{ projectSlug: string; issue: GitHubIssue }> = [];
+      let refreshed = true;
+      for (const scope of scopes) {
+        try {
+          const project = store.getProject(scope.projectSlug);
+          if (!project || unavailableProjects.has(project.slug)) throw new Error(`Project '${scope.projectSlug}' is unavailable`);
+          const issues = "query" in scope
+            ? await this.#github.listOpenIssues(project, scope.query)
+            : await Promise.all(scope.numbers.map((number) => this.#github.issue(project, number)));
+          for (const issue of issues) {
+            if (issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue)) discovered.push({ projectSlug: project.slug, issue });
+          }
+        } catch (error) {
+          refreshed = false;
+          this.#notify(`Objective ${objective.id} remains Active: approved scope for Project '${scope.projectSlug}' could not be refreshed: ${errorText(error)}`, "warning");
+        }
+      }
+      const attached = new Map<string, WorkItem>();
+      for (const item of store.listWorkItems(objective.id)) {
+        if (item.sourceType !== "issue") continue;
+        const key = `${item.projectSlug}\0${item.sourceRef}`;
+        if ((attached.get(key)?.generation ?? 0) < item.generation) attached.set(key, item);
+      }
+      for (const { projectSlug, issue } of discovered) {
+        const key = `${projectSlug}\0${issue.number}`;
+        const existing = attached.get(key);
+        if (existing) {
+          if ((existing.state === "Done" || existing.state === "Obsolete")
+            && store.getWorkItemRuntime(existing.id)?.lastIssueState === "CLOSED") {
+            this.#createReopenedIssueGeneration(store, existing, issue);
+          }
+          continue;
+        }
+        attached.set(key, this.#attachIssue(store, objective, projectSlug, issue));
+      }
+      return refreshed;
+    } catch (error) {
+      this.#notify(`Objective ${objective.id} remains Active: approved GitHub scope could not be refreshed: ${errorText(error)}`, "warning");
+      return false;
+    }
+  }
+
+  async #finishObjectives(store: MerroStore, unavailableProjects: ReadonlySet<string> = new Set()): Promise<void> {
     for (const objective of store.listObjectives()) {
       if (objective.state !== "Active") continue;
       const items = store.listWorkItems(objective.id);
-      if (items.length > 0 && items.every(terminal)) {
-        store.setObjectiveState(objective.id, "Done");
-        const message = `Objective ${objective.id} is Done.`;
-        this.#notify(message);
-        this.#queueNotification("objective_done", objective.id, message);
-      }
+      if (!items.every(terminal) || (items.length === 0 && !objective.issueScopes?.some((scope) => "query" in scope))) continue;
+      if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects)) continue;
+      if (!store.listWorkItems(objective.id).every(terminal)) continue;
+      store.setObjectiveState(objective.id, "Done");
+      const message = `Objective ${objective.id} is Done.`;
+      this.#notify(message);
+      this.#queueNotification("objective_done", objective.id, message);
     }
   }
 }

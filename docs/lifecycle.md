@@ -6,12 +6,12 @@ Read before changing states, relations, scheduling, PR or merge flow, reconcilia
 
 1. User states Objective + Projects.
 2. Main inspects repos and GitHub (open issues only), proposes WorkItems and relations.
-3. User approves. Approval covers scope, structure, current plan.
+3. User approves. Approval covers scope, structure, current plan. Persist each Project's issue scope: fixed issue numbers, or a query matching all specified labels and an optional milestone title. An empty query covers all open issues.
 4. New WorkItems inside approved scope are added automatically. Scope expansion, new Project, unregistered Project, splitting an issue → structural Decision.
 5. Rejected structural change → affected WorkItems Blocked, wait for freeform direction.
 
 Goal or scope change: log it, reconcile. Irrelevant untouched WorkItems → Obsolete. Active one finishes its Task, then Obsolete.
-Done: refresh GitHub scope; no required matching work left. Blocked work keeps it Active. Externally closed issues count as satisfied. Reopened issue under an active Objective → new generation.
+Done: freshly enumerate the persisted GitHub scope, add newly matching WorkItems, then require all attached work to be terminal. A failed scope check keeps the Objective Active; never use a cached discovery result to complete it. Older Objectives without persisted scopes retain their attached issue numbers as fixed selections, not a query inferred from the goal. Blocked work keeps it Active. Externally closed issues count as satisfied. Reopened issue under an active Objective → new generation.
 Stop is soft only: active Tasks finish, exclusive unfinished WorkItems → Obsolete, shared ones continue.
 Multiple Objectives share one backlog. Shared WorkItem uses the highest active Objective priority.
 
@@ -56,7 +56,7 @@ Loop: reconcile → consume terminal results → derive states → schedule up t
 
 - Branch prefix by intent (`feat/`, `fix/`, ...), semantic kebab name, collision suffix `-<issue>`, immutable after creation. Never adopt an unrelated external branch.
 - Create: fetch base_remote, branch from `base_remote/<default>`. Fetch fails → no new work for that Project.
-- Base moved after start: implementer Task merges base into branch (no rebase, no force-push). Merge conflict → Decision(merge_conflict).
+- Base moved after start: persist the target base commit and schedule an implementer Task to merge it into the branch, verify, and make one final commit, then a fresh review (no rebase, no force-push). Main may fetch the base, but never makes the merge commit. GitHub-reported conflicts → Decision(merge_conflict); resolving it authorizes this implementer Task, not a Main merge or a reviewer-only pass.
 - External commits/rebase: compare effective diff. Unchanged → review stays valid. Changed → fresh review; reviewer verification becomes the PR verification source.
 - PR only after review pass. Never draft. Head `push_owner:branch`, base `base_owner:default`, from persisted Project remotes. Existing PR reused, never duplicated.
 - Body: `## Summary`, `## Verification` (final successful commands, deduped, grouped by implementer/reviewer if mixed, fallback noted), `## Issues` with `Closes #n`. Main validates structure only.
