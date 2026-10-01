@@ -2,8 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createHash } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DEFAULT_CONFIG } from "../src/config.js";
@@ -50,7 +49,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
           return { stdout: "", stderr: "" };
         }
         if (args[0] === "show-option") {
-          return { stdout: args.at(-1) === "@merro_project" ? "example\n" : `${createHash("sha256").update(projectPath).digest("hex")}\n`, stderr: "" };
+          return { stdout: args.at(-1) === "@merro_project" ? "example\n" : await readFile(join(root, "runtime", "workspace-owner"), "utf8"), stderr: "" };
         }
         if (args[0] === "new-window" || args[0] === "new-session") {
           sessionExists = true;
@@ -134,7 +133,10 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-task-1");
   assert.ok(start.args.includes("@merro_owner"));
   assert.ok(start.args.includes("@merro_task_id"));
-  assert.ok(containerArgs.includes(`merro.owner=${createHash("sha256").update(projectPath).digest("hex")}`));
+  const owner = (await readFile(join(root, "runtime", "workspace-owner"), "utf8")).trim();
+  assert.ok(containerArgs.includes(`merro.owner=${owner}`));
+  assert.equal(start.args[start.args.indexOf("MERRO_OWNER") + 1], owner);
+  assert.equal(start.args[start.args.indexOf("@merro_owner") + 1], owner);
   assert.ok(containerArgs.includes("merro.work_item_id=work-1"));
   assert.ok(calls.some((call) => call.file === "docker" && call.args[0] === "build"));
   assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), true);
@@ -142,6 +144,19 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   await runtime.cleanup(record);
   assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), false);
   assert.equal(await exists(record.resultPath), false);
+
+  const movedPath = join(root, "moved-project");
+  await rename(projectPath, movedPath);
+  containerId = "b".repeat(64);
+  const restarted = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: DEFAULT_CONFIG, commands, piConfigPath });
+  const successor = await restarted.launch({ taskId: "task-2", workItemId: "work-2", role: "implement",
+    project: { ...project, path: movedPath }, clonePath, taskFile: "Implement after Project adoption.",
+    expectedCommit: "b".repeat(40), projectSettings: null });
+  assert.equal(successor.containerId, containerId);
+  assert.ok(containerArgs.includes(`merro.owner=${owner}`));
+  assert.equal(calls.filter(call => call.file === "tmux" && call.args[0] === "new-session").length, 1);
+  assert.equal(calls.filter(call => call.file === "tmux" && call.args[0] === "new-window").length, 1);
+  await restarted.cleanup(successor);
 });
 
 test("cleanup preserves mismatched results and active input, removes auth and launch material, and is idempotent", async (t) => {
@@ -314,7 +329,6 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
     pushRemote: "https://github.com/example/project.git",
     defaultBranch: "main",
   };
-  const owner = createHash("sha256").update(projectPath).digest("hex");
   const calls: Array<{ file: string; args: readonly string[] }> = [];
   let sessionExists = false;
   let workerScript = "";
@@ -328,7 +342,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
           return { stdout: "", stderr: "" };
         }
         if (args[0] === "show-option") {
-          return { stdout: args.at(-1) === "@merro_project" ? "sandbox-none\n" : `${owner}\n`, stderr: "" };
+          return { stdout: args.at(-1) === "@merro_project" ? "sandbox-none\n" : await readFile(join(workspacePath, "workspace-owner"), "utf8"), stderr: "" };
         }
         if (args[0] === "new-window" || args[0] === "new-session") {
           sessionExists = true;

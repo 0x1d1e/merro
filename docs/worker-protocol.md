@@ -17,8 +17,9 @@ Read before changing Task files, the result tool, container/tmux launch, process
 
 - Session `merro-<project>` created when a Project's first Task starts, detached, no Main window. Never auto-attached.
 - Window per Task (`impl-188`, `rev-188`), one pane, workers may not open more.
-- Session env `MERRO_PROJECT`, `MERRO_OWNER=<root-path-hash>`, mirrored by `@merro_project` and `@merro_owner` session options. Existing session without matching markers → do not adopt; block that Project and report.
-- Task window options `@merro_task_id`, `@merro_work_item_id`, `@merro_clone_path`, `@merro_runtime_kind` identify owned live panes for reconciliation. Docker labels `merro.task_id`, `merro.project`, `merro.owner`, `merro.work_item_id`, `merro.clone_path` identify containers even if tmux is gone. Legacy containers require an exact Task scratch mount under this workspace as ownership proof.
+- Session env `MERRO_PROJECT`, `MERRO_OWNER=workspace:<uuid>`, mirrored by `@merro_project` and `@merro_owner` session options. The owner is atomically persisted in `.merro/runtime/workspace-owner`, independent of Project paths; retain it across workspace moves and while workers live. Invalid identity fails inventory closed.
+- Task window options `@merro_task_id`, `@merro_work_item_id`, `@merro_clone_path`, `@merro_runtime_kind` identify owned live panes for reconciliation. Docker labels `merro.task_id`, `merro.project`, `merro.owner`, `merro.work_item_id`, `merro.clone_path` identify containers even if tmux is gone. Containers with old path-hash owners or no owner require an exact workspace Task scratch mount or stored matching Task/container identity as ownership proof, not the current Project path.
+- Legacy path-hash tmux markers migrate only after a stored runtime matches the pane, session, window, and live process identity. Host proof requires PID and start time; Docker proof requires container identity. This changes namespace metadata, not Task status or processes. Otherwise, mismatched session markers block that Project and are reported without adoption.
 - Last window exits, session may vanish. No supervisor hook.
 
 ## Process identity

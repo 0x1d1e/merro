@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
+import { existsSync, type Dirent, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chmod, copyFile, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import type { MerroConfig } from "../config.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
@@ -25,10 +25,6 @@ function findPackageRoot(start: string): string {
     if (parent === directory) throw new Error(`cannot locate Merro package root from ${start}`);
     directory = parent;
   }
-}
-
-function projectOwner(projectPath: string): string {
-  return createHash("sha256").update(resolve(projectPath)).digest("hex");
 }
 
 export interface WorkerDependencyMount {
@@ -116,7 +112,7 @@ function shellScript(environment: Record<string, string>, command: string): stri
 }
 
 async function copyTree(source: string, target: string, omitted = new Set<string>()): Promise<void> {
-  let entries;
+  let entries: Dirent[];
   try {
     entries = await readdir(source, { withFileTypes: true });
   } catch (error) {
@@ -212,6 +208,7 @@ export class WorkerRuntime {
     const sandbox = input.projectSettings?.sandbox ?? this.#config.sandbox;
     const network = input.projectSettings?.network ?? this.#config.network;
     const startedAt = plan.startedAt;
+    const owner = await this.#workspaceOwner();
     const scratchPath = dirname(plan.resultPath);
     const secretRoot = join(this.#workspacePath, "launch-secrets");
     const scratchConfigPath = join(scratchPath, "pi-config");
@@ -283,7 +280,7 @@ export class WorkerRuntime {
           "--name", `merro-${safeName(input.taskId)}`,
           "--label", `merro.task_id=${input.taskId}`,
           "--label", `merro.project=${input.project.slug}`,
-          "--label", `merro.owner=${projectOwner(input.project.path)}`,
+          "--label", `merro.owner=${owner}`,
           "--label", `merro.work_item_id=${input.workItemId}`,
           "--label", `merro.clone_path=${resolve(input.clonePath)}`,
           "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
@@ -323,9 +320,9 @@ export class WorkerRuntime {
       const existingSession = await this.#sessionExists(session, input.project);
       const sessionMarkers = existingSession ? [] : [
         ";", "set-option", "-t", session, "@merro_project", input.project.slug,
-        ";", "set-option", "-t", session, "@merro_owner", projectOwner(input.project.path),
+        ";", "set-option", "-t", session, "@merro_owner", owner,
         ";", "set-environment", "-t", session, "MERRO_PROJECT", input.project.slug,
-        ";", "set-environment", "-t", session, "MERRO_OWNER", projectOwner(input.project.path),
+        ";", "set-environment", "-t", session, "MERRO_OWNER", owner,
       ];
       windowLaunchAttempted = true;
       // The first Task is the session's first window. Mark ownership in the same server command queue.
@@ -404,11 +401,13 @@ export class WorkerRuntime {
     }
   }
 
-  async listOwnedWorkers(project: Project, settings: ProjectSettingsRecord | null = null): Promise<OwnedWorker[]> {
+  async listOwnedWorkers(project: Project, settings: ProjectSettingsRecord | null = null,
+    recordedRuntimes: readonly TaskRuntimeRecord[] = []): Promise<OwnedWorker[]> {
     const session = projectSession(project);
+    const owner = await this.#workspaceOwner();
     const workers: OwnedWorker[] = [];
     let dockerPane = false;
-    if (await this.#sessionExists(session, project)) {
+    if (await this.#sessionExists(session, project, recordedRuntimes)) {
       const panes = (await this.#commands.run("tmux", ["list-panes", "-s", "-t", session, "-F", "#{pane_id} #{pane_dead}"])).stdout.trim();
       for (const row of panes ? panes.split("\n") : []) {
         const [paneId, dead] = row.split(" ");
@@ -454,9 +453,12 @@ export class WorkerRuntime {
       const taskId = labels["merro.task_id"];
       if (!taskId) continue;
       const mounts = Array.isArray(inspect.Mounts) ? inspect.Mounts as Array<{ Source?: string; Destination?: string }> : [];
-      const legacyOwned = !labels["merro.owner"] && mounts.some((mount) => mount.Destination === TASK_MOUNT
-        && mount.Source === join(this.#workspacePath, "tasks", safeName(taskId)));
-      if (!legacyOwned && (labels["merro.owner"] !== projectOwner(project.path) || labels["merro.project"] !== project.slug)) continue;
+      // Old path-hash owners change when a Project moves. Their Task mount proves workspace ownership.
+      const legacyOwner = !labels["merro.owner"] || /^[0-9a-f]{64}$/.test(labels["merro.owner"]);
+      const legacyOwned = legacyOwner && (mounts.some((mount) => mount.Destination === TASK_MOUNT
+        && mount.Source === join(this.#workspacePath, "tasks", safeName(taskId)))
+        || recordedRuntimes.some((record) => record.taskId === taskId && record.containerId === inspect.Id));
+      if (!legacyOwned && (labels["merro.owner"] !== owner || labels["merro.project"] !== project.slug)) continue;
       if (legacyOwned && labels["merro.project"] && labels["merro.project"] !== project.slug) continue;
       workers.push({ taskId, projectSlug: project.slug, workItemId: labels["merro.work_item_id"] ?? null,
         clonePath: labels["merro.clone_path"] ?? mounts.find((mount) => mount.Destination === CLONE_MOUNT)?.Source ?? null,
@@ -563,7 +565,7 @@ export class WorkerRuntime {
   }
 
   async #makeWritable(path: string): Promise<void> {
-    let details;
+    let details: Stats;
     try {
       details = await lstat(path);
     } catch (error) {
@@ -619,8 +621,33 @@ export class WorkerRuntime {
     return new Date(time).toISOString();
   }
 
-  async #sessionExists(session: string, project: Project): Promise<boolean> {
-    const owner = projectOwner(project.path);
+  async #workspaceOwner(): Promise<string> {
+    const path = join(this.#workspacePath, "workspace-owner");
+    try {
+      const owner = (await readFile(path, "utf8")).trim();
+      if (!/^workspace:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(owner)) {
+        throw new Error(`invalid Merro workspace owner: ${path}`);
+      }
+      return owner;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    await mkdir(this.#workspacePath, { recursive: true, mode: 0o700 });
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, `workspace:${randomUUID()}\n`, { flag: "wx", mode: 0o600 });
+      // Publish complete content atomically; concurrent runtimes use the first published identity.
+      await link(temporary, path).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
+    } finally {
+      await rm(temporary, { force: true });
+    }
+    return this.#workspaceOwner();
+  }
+
+  async #sessionExists(session: string, project: Project, recordedRuntimes: readonly TaskRuntimeRecord[] = []): Promise<boolean> {
+    const owner = await this.#workspaceOwner();
     try {
       await this.#commands.run("tmux", ["has-session", "-t", session]);
     } catch (error) {
@@ -632,10 +659,29 @@ export class WorkerRuntime {
       this.#commands.run("tmux", ["show-option", "-qv", "-t", session, "@merro_project"]),
       this.#commands.run("tmux", ["show-option", "-qv", "-t", session, "@merro_owner"]),
     ]);
-    if (storedProject.stdout.trim() !== project.slug || storedOwner.stdout.trim() !== owner) {
-      throw new Error(`refusing to adopt unowned tmux session ${session}`);
+    if (storedProject.stdout.trim() === project.slug) {
+      if (storedOwner.stdout.trim() === owner) return true;
+      if (/^[0-9a-f]{64}$/.test(storedOwner.stdout.trim())) {
+        for (const record of recordedRuntimes) {
+          if (record.tmuxSession !== session || !record.paneId
+            || (!record.containerId && (record.runtimeKind !== "host" || record.processPid === null || record.processStartedAt === null))) continue;
+          try {
+            const pane = await this.#commands.run("tmux", ["display-message", "-p", "-t", `${session}:${record.tmuxWindow}`, "#{pane_id}"]);
+            if (pane.stdout.trim() !== record.paneId) continue;
+            const presence = await this.inspect(record, record.taskId);
+            if (!presence.alive || !presence.identityMatches) continue;
+          } catch (error) {
+            if (missingTmuxTarget(error)) continue;
+            throw error;
+          }
+          // Migrate namespace metadata only after proving ownership. Task status and processes are untouched.
+          await this.#commands.run("tmux", ["set-option", "-t", session, "@merro_owner", owner,
+            ";", "set-environment", "-t", session, "MERRO_OWNER", owner]);
+          return true;
+        }
+      }
     }
-    return true;
+    throw new Error(`refusing to adopt unowned tmux session ${session}`);
   }
 
   async #waitForContainerId(path: string): Promise<string> {

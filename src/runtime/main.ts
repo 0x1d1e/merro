@@ -918,14 +918,25 @@ export class MainOrchestrator {
 
   async #workerSafetyPreflight(store: MerroStore, unsafeProjects = new Set<string>()): Promise<{ unsafeProjects: Set<string>; count: number; workItemIds: Set<string>; liveTaskIds: Set<string> }> {
     // Finalized runtime identity still links legacy panes and containers, without adopting their workers.
-    const runtimes = store.listTasks().map((task) => store.getTaskRuntime(task.id)).filter((runtime) => runtime !== null);
+    const runtimes: TaskRuntimeRecord[] = [];
+    const runtimesByProject = new Map<string, TaskRuntimeRecord[]>();
+    for (const task of store.listTasks()) {
+      const runtime = store.getTaskRuntime(task.id);
+      if (!runtime) continue;
+      runtimes.push(runtime);
+      const item = store.getWorkItem(task.workItemId);
+      if (!item) continue;
+      const projectRuntimes = runtimesByProject.get(item.projectSlug) ?? [];
+      projectRuntimes.push(runtime);
+      runtimesByProject.set(item.projectSlug, projectRuntimes);
+    }
     const orphanIds = new Set<string>();
     const workItemIds = new Set<string>();
     const liveTaskIds = new Set<string>();
     const projects = store.listProjects();
     for (const project of projects) {
       try {
-        const workers = await this.#workers.listOwnedWorkers(project, store.getProjectSettings(project.slug));
+        const workers = await this.#workers.listOwnedWorkers(project, store.getProjectSettings(project.slug), runtimesByProject.get(project.slug));
         for (const worker of workers) {
           const matchedRuntime = worker.taskId === null ? runtimes.find((runtime) =>
             (worker.paneId !== null && runtime.paneId === worker.paneId && runtime.tmuxSession === worker.tmuxSession
