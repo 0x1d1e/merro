@@ -47,6 +47,7 @@ export interface GitHubPullRequest {
   baseRefName: string;
   headRefOid: string;
   baseRefOid: string;
+  authorLogin: string | null;
   reviewDecision: string | null;
   reviews: GitHubReview[];
   checks: GitHubCheck[];
@@ -57,6 +58,7 @@ export interface BranchProtection {
   requiredStatusChecks: string[];
   requiredApprovingReviewCount: number;
   requireCodeOwnerReviews: boolean;
+  dismissStaleApprovals: boolean;
 }
 
 export interface UnknownBranchProtection {
@@ -195,6 +197,9 @@ function parsePullRequest(value: unknown): GitHubPullRequest {
     baseRefName: typeof row.baseRefName === "string" ? row.baseRefName : "",
     headRefOid: typeof row.headRefOid === "string" ? row.headRefOid : "",
     baseRefOid: typeof row.baseRefOid === "string" ? row.baseRefOid : "",
+    authorLogin: typeof row.author === "object" && row.author !== null
+      ? nullableString((row.author as Record<string, unknown>).login)
+      : null,
     reviewDecision: nullableString(row.reviewDecision),
     reviews,
     checks,
@@ -217,6 +222,7 @@ function isGitHubAvailabilityFailure(error: unknown): boolean {
 
 export class GitHubClient {
   readonly #commands: CommandRunner;
+  readonly #reviewerPermissionCache = new Map<string, { expiresAt: number; result: Promise<boolean> }>();
 
   constructor(commands: CommandRunner = systemCommandRunner) {
     this.#commands = commands;
@@ -268,7 +274,7 @@ export class GitHubClient {
     const result = await this.#commands.run("gh", [
       "pr", "list", "--repo", base.nameWithOwner, "--state", "all",
       "--head", `${owner}:${branchName}`,
-      "--json", "number,title,body,url,state,isDraft,mergedAt,mergeCommit,mergeable,headRefName,baseRefName,headRefOid,baseRefOid,reviewDecision,reviews,statusCheckRollup",
+      "--json", "number,title,body,url,state,isDraft,mergedAt,mergeCommit,mergeable,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewDecision,reviews,statusCheckRollup",
       "--limit", "100",
     ], { cwd: project.path });
     const value = parseJson(result.stdout, "gh pr list");
@@ -281,7 +287,7 @@ export class GitHubClient {
     const repository = await this.repository(project.baseRemote);
     const result = await this.#commands.run("gh", [
       "pr", "view", String(number), "--repo", repository.nameWithOwner,
-      "--json", "number,title,body,url,state,isDraft,mergedAt,mergeCommit,mergeable,headRefName,baseRefName,headRefOid,baseRefOid,reviewDecision,reviews,statusCheckRollup",
+      "--json", "number,title,body,url,state,isDraft,mergedAt,mergeCommit,mergeable,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewDecision,reviews,statusCheckRollup",
     ], { cwd: project.path });
     return parsePullRequest(parseJson(result.stdout, "gh pr view"));
   }
@@ -357,6 +363,35 @@ export class GitHubClient {
     return this.pullRequest(project, number);
   }
 
+  async hasWritePermission(project: Project, username: string): Promise<boolean> {
+    const normalizedUsername = username.trim().toLowerCase();
+    if (!normalizedUsername) return false;
+    const key = `${project.baseRemote.toLowerCase()}\0${normalizedUsername}`;
+    const cached = this.#reviewerPermissionCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.result;
+
+    const result = (async () => {
+      const repository = await this.repository(project.baseRemote);
+      const path = `repos/${repository.nameWithOwner}/collaborators/${encodeURIComponent(username)}/permission`;
+      try {
+        const response = await this.#commands.run("gh", ["api", path], { cwd: project.path });
+        const row = object(parseJson(response.stdout, "gh api collaborator permission"), "gh api collaborator permission");
+        const permission = typeof row.permission === "string" ? row.permission.toLowerCase() : "none";
+        return permission === "write" || permission === "maintain" || permission === "admin";
+      } catch (error) {
+        if (isNotFound(error)) return false;
+        throw error;
+      }
+    })();
+    this.#reviewerPermissionCache.set(key, { expiresAt: Date.now() + 30_000, result });
+    try {
+      return await result;
+    } catch (error) {
+      if (this.#reviewerPermissionCache.get(key)?.result === result) this.#reviewerPermissionCache.delete(key);
+      throw error;
+    }
+  }
+
   async branchProtection(project: Project): Promise<BranchPolicy> {
     const repository = await this.repository(project.baseRemote);
     const branch = encodeURIComponent(project.defaultBranch);
@@ -365,6 +400,7 @@ export class GitHubClient {
     let classicChecks: string[] = [];
     let classicApprovals = 0;
     let classicCodeOwners = false;
+    let dismissStaleApprovals = false;
 
     try {
       const result = await this.#commands.run("gh", ["api", classicPath], { cwd: project.path });
@@ -377,6 +413,7 @@ export class GitHubClient {
         ? reviews.required_approving_review_count
         : 0;
       classicCodeOwners = reviews.require_code_owner_reviews === true;
+      dismissStaleApprovals = reviews.dismiss_stale_reviews === true;
     } catch (error) {
       if (!isNotFound(error)) return { known: false, reason: error instanceof Error ? error.message : String(error) };
     }
@@ -388,6 +425,7 @@ export class GitHubClient {
       const requiredStatusChecks = [...classicChecks];
       let requiredApprovingReviewCount = classicApprovals;
       let requireCodeOwnerReviews = classicCodeOwners;
+      let dismissStale = dismissStaleApprovals;
       for (const value of rules) {
         const rule = object(value, "gh api branch rule");
         const parameters = typeof rule.parameters === "object" && rule.parameters !== null
@@ -401,6 +439,7 @@ export class GitHubClient {
           }
           requireCodeOwnerReviews ||= parameters.require_code_owner_review === true
             || parameters.require_code_owner_reviews === true;
+          dismissStale ||= parameters.dismiss_stale_reviews_on_push === true;
         }
       }
       return {
@@ -408,6 +447,7 @@ export class GitHubClient {
         requiredStatusChecks: [...new Set(requiredStatusChecks)],
         requiredApprovingReviewCount,
         requireCodeOwnerReviews,
+        dismissStaleApprovals: dismissStale,
       };
     } catch (error) {
       return { known: false, reason: error instanceof Error ? error.message : String(error) };

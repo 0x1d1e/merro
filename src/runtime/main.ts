@@ -12,12 +12,12 @@ import type { TaskRuntimeRecord, WorkItemRuntimeRecord } from "../store/model.js
 import { renderTaskFile } from "./task-file.js";
 import { MainLock } from "./main-lock.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
-import { WorkerRuntime } from "./worker-runtime.js";
+import { WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitBaseMergeConflictError, GitClient } from "../vcs/git.js";
 
 type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchAndMergeBase" | "syncBranchHead" | "effectiveDiffFingerprint">
   & Partial<Pick<GitClient, "remoteBranchCommit" | "ensureWorkItemClone" | "createReadOnlyCheckout">>;
-type GitHubAdapter = Pick<GitHubClient, "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "mergeSquash" | "syncPullRequestContent">
+type GitHubAdapter = Pick<GitHubClient, "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup">
   & Partial<Pick<WorkerRuntime, "plan" | "stop">>;
@@ -71,19 +71,14 @@ function issueBody(item: WorkItem, summary: string, verification: string): strin
   return `## Summary\n\n${summary}\n\n## Verification\n\n${verification}${closes}`;
 }
 
-function replaceMarkdownSection(body: string, title: string, content: string): string {
-  const lines = body.split(/\r?\n/);
+function ensureMarkdownSection(body: string, title: string, content: string): string {
   const heading = `## ${title}`;
-  const start = lines.findIndex((line) => line.trim() === heading);
-  if (start < 0) return `${body.trim()}\n\n${heading}\n\n${content}`.trim();
-  let end = start + 1;
-  while (end < lines.length && !/^##\s/.test(lines[end] ?? "")) end += 1;
-  lines.splice(start, end - start, heading, "", content);
-  return lines.join("\n").trim();
+  if (body.split(/\r?\n/).some((line) => line.trim() === heading)) return body.trim();
+  return `${body.trim()}\n\n${heading}\n\n${content}`.trim();
 }
 
 function reconcilePullRequestBody(body: string, item: WorkItem, verification: string): string {
-  let updated = replaceMarkdownSection(body, "Verification", verification);
+  let updated = ensureMarkdownSection(body, "Verification", verification);
   if (item.sourceType !== "issue") return updated;
   const lines = updated.split(/\r?\n/);
   let issuesStart = lines.findIndex((line) => line.trim() === "## Issues");
@@ -138,18 +133,45 @@ function requiredCheckFailed(pullRequest: GitHubPullRequest, policy: BranchPolic
   ));
 }
 
-function satisfiesBranchPolicy(pullRequest: GitHubPullRequest, policy: BranchPolicy): boolean {
-  if (!policy.known || pullRequest.reviewDecision?.toUpperCase() === "CHANGES_REQUESTED") return false;
-  const checksReady = policy.requiredStatusChecks.every((name) => pullRequest.checks.some((check) =>
-    check.name === name && ((check.state.toUpperCase() === "COMPLETED" && check.conclusion?.toUpperCase() === "SUCCESS") || check.state.toUpperCase() === "SUCCESS"),
-  ));
-  const approvals = pullRequest.reviews.filter((review) =>
-    review.state.toUpperCase() === "APPROVED" && review.commitId === pullRequest.headRefOid,
-  ).length;
-  const reviewsReady = approvals >= policy.requiredApprovingReviewCount
-    && (!policy.requireCodeOwnerReviews || pullRequest.reviewDecision === "APPROVED");
+async function satisfiesBranchPolicy(
+  pullRequest: GitHubPullRequest,
+  policy: BranchPolicy,
+  hasWritePermission: (username: string) => Promise<boolean>,
+): Promise<boolean> {
+  const reviewDecision = pullRequest.reviewDecision?.toUpperCase();
+  if (!policy.known || reviewDecision === "CHANGES_REQUESTED") return false;
+  const successfulConclusions = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
+  const checksReady = policy.requiredStatusChecks.every((name) => pullRequest.checks.some((check) => {
+    const state = check.state.toUpperCase();
+    return check.name === name && (successfulConclusions.has(state)
+      || state === "COMPLETED" && check.conclusion !== null && successfulConclusions.has(check.conclusion.toUpperCase()));
+  }));
+  const latestReviewByAuthor = new Map<string, { author: string; state: string; commitId: string | null; submittedAt: string; index: number }>();
+  pullRequest.reviews.forEach((review, index) => {
+    const author = review.author.trim();
+    if (!author) return;
+    const key = author.toLowerCase();
+    const latest = latestReviewByAuthor.get(key);
+    const submittedAt = review.submittedAt ?? "";
+    if (!latest || submittedAt > latest.submittedAt || submittedAt === latest.submittedAt && index > latest.index) {
+      latestReviewByAuthor.set(key, { author, state: review.state, commitId: review.commitId, submittedAt, index });
+    }
+  });
+  const authorLogin = pullRequest.authorLogin?.toLowerCase();
+  let eligibleApprovals = 0;
+  if (policy.requiredApprovingReviewCount > 0) {
+    for (const review of latestReviewByAuthor.values()) {
+      if (review.state.toUpperCase() !== "APPROVED"
+        || review.author.toLowerCase() === authorLogin
+        || policy.dismissStaleApprovals && review.commitId !== pullRequest.headRefOid) continue;
+      if (await hasWritePermission(review.author)) eligibleApprovals += 1;
+      if (eligibleApprovals >= policy.requiredApprovingReviewCount) break;
+    }
+  }
+  const approvalsReady = eligibleApprovals >= policy.requiredApprovingReviewCount;
+  const codeOwnersReady = !policy.requireCodeOwnerReviews || reviewDecision === "APPROVED";
   return pullRequest.state === "OPEN" && !pullRequest.isDraft
-    && pullRequest.mergeable === "MERGEABLE" && checksReady && reviewsReady;
+    && pullRequest.mergeable === "MERGEABLE" && checksReady && approvalsReady && codeOwnersReady;
 }
 
 function changeRequestTrigger(pullRequest: GitHubPullRequest): string | null {
@@ -410,7 +432,7 @@ export class MainOrchestrator {
         }
         if (!currentDiff || (expectedDiff ? currentDiff !== expectedDiff : payload.headRefOid !== pullRequest.headRefOid)
           || remoteHead !== pullRequest.headRefOid || !latestReview || reviewHash !== currentDiff
-          || !satisfiesBranchPolicy(pullRequest, policy)) {
+          || !await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
           store.resolveDecision(decisionId, "resolved");
           runtime.reviewedDiffHash = null;
           store.saveWorkItemRuntime(runtime);
@@ -668,37 +690,46 @@ export class MainOrchestrator {
   }
 
   async #reconcileIssues(store: MerroStore): Promise<void> {
-    for (const item of store.listWorkItems()) {
+    for (let item of store.listWorkItems()) {
       if (item.sourceType !== "issue" || !store.hasActiveObjectiveForWorkItem(item.id) && !store.activeTask(item.id)) continue;
       const project = store.getProject(item.projectSlug);
       if (!project) continue;
-      const issue = await this.#github.issue(project, Number(item.sourceRef));
-      const state = issue.state.toUpperCase();
-      if (state !== "OPEN" && state !== "CLOSED") throw new Error(`GitHub returned unsupported issue state '${issue.state}' for #${issue.number}`);
-      const runtime = store.getWorkItemRuntime(item.id) ?? emptyRuntime(item.id);
-      const previousState = runtime.lastIssueState;
-      runtime.lastIssueState = state;
-      store.saveWorkItemRuntime(runtime);
+      try {
+        const issue = await this.#github.issue(project, Number(item.sourceRef));
+        const state = issue.state.toUpperCase();
+        if (state !== "OPEN" && state !== "CLOSED") throw new Error(`GitHub returned unsupported issue state '${issue.state}' for #${issue.number}`);
+        const runtime = store.getWorkItemRuntime(item.id) ?? emptyRuntime(item.id);
+        const previousState = runtime.lastIssueState;
+        runtime.lastIssueState = state;
+        store.saveWorkItemRuntime(runtime);
 
-      if (state === "CLOSED") {
-        const activeTask = store.activeTask(item.id);
-        if (activeTask && !await this.#cancelTaskForClosedIssue(store, item, activeTask)) continue;
-        const current = store.getWorkItem(item.id);
-        if (current && !terminal(current) && !runtime.pullRequestNumber) this.#completeClosedIssue(store, current);
-        continue;
+        if (state === "OPEN" && item.state === "Blocked" && item.blockedReason === "github_unavailable" && item.blockedResumeState) {
+          store.transitionWorkItem(item.id, item.blockedResumeState);
+          item = store.getWorkItem(item.id) ?? item;
+        }
+        if (state === "CLOSED") {
+          const activeTask = store.activeTask(item.id);
+          if (activeTask) await this.#cancelTaskForClosedIssue(store, item, activeTask);
+          const current = store.getWorkItem(item.id);
+          if (current && !terminal(current) && !runtime.pullRequestNumber && !store.activeTask(item.id)) {
+            this.#completeClosedIssue(store, current);
+          }
+          continue;
+        }
+        if (previousState === "CLOSED" && item.state === "Done") this.#createReopenedIssueGeneration(store, item, issue);
+      } catch (error) {
+        this.#blockForGitHubUnavailable(store, item, `Issue reconciliation failed: ${errorText(error)}`);
       }
-      if (previousState === "CLOSED" && item.state === "Done") this.#createReopenedIssueGeneration(store, item, issue);
     }
   }
 
   async #cancelTaskForClosedIssue(store: MerroStore, item: WorkItem, task: Task): Promise<boolean> {
     const runtime = store.getTaskRuntime(task.id);
-    if (!runtime) return false;
+    if (!runtime) throw new Error(`Task ${task.id} has no runtime identity`);
     const presence = await this.#workers.inspect(runtime, task.id);
     if (presence.alive) {
       if (!presence.identityMatches || !this.#workers.stop) {
-        this.#notify(`Issue #${item.sourceRef} is closed, but Task ${task.id} could not be stopped safely: ${presence.reason ?? "worker stop is unavailable"}.`, "warning");
-        return false;
+        throw new Error(`Task ${task.id} could not be stopped safely: ${presence.reason ?? "worker stop is unavailable"}`);
       }
       await this.#workers.stop(runtime, task.id);
     }
@@ -762,9 +793,14 @@ export class MainOrchestrator {
       const runtime = store.getTaskRuntime(task.id);
       const workRuntime = item && store.getWorkItemRuntime(item.id);
       if (!item || !runtime || !workRuntime) continue;
+      if (item.sourceType === "issue" && item.state === "Blocked" && item.blockedReason === "github_unavailable") continue;
       if (workRuntime.lastIssueState === "CLOSED") {
-        if (await this.#cancelTaskForClosedIssue(store, item, task) && !workRuntime.pullRequestNumber) {
-          this.#completeClosedIssue(store, store.getWorkItem(item.id) ?? item);
+        try {
+          if (await this.#cancelTaskForClosedIssue(store, item, task) && !workRuntime.pullRequestNumber) {
+            this.#completeClosedIssue(store, store.getWorkItem(item.id) ?? item);
+          }
+        } catch (error) {
+          this.#blockForGitHubUnavailable(store, item, `Could not stop the worker for closed issue #${item.sourceRef}: ${errorText(error)}`);
         }
         continue;
       }
@@ -779,7 +815,15 @@ export class MainOrchestrator {
           }
           continue;
         }
-        const presence = await this.#workers.inspect(runtime, task.id);
+        let presence: WorkerPresence;
+        try {
+          presence = await this.#workers.inspect(runtime, task.id);
+        } catch (inspectionError) {
+          const detail = `Could not inspect active Task ${task.id}; reconciliation will retry: ${errorText(inspectionError)}`;
+          if (item.sourceType === "issue") this.#blockForGitHubUnavailable(store, item, detail);
+          else this.#notify(detail, "warning");
+          continue;
+        }
         if (presence.alive && presence.identityMatches) continue;
         const reason = presence.reason ?? "worker exited without a result";
         store.finalizeTask({ id: task.id, outcome: "failed", summary: reason, resultJson: JSON.stringify({ taskId: task.id, reason }) });
@@ -904,24 +948,24 @@ export class MainOrchestrator {
       const runtime = store.getWorkItemRuntime(item.id);
       const project = store.getProject(item.projectSlug);
       if (!runtime || !project) continue;
-      if (item.sourceType === "issue" && runtime.lastIssueState === "CLOSED" && !terminal(item)) {
-        if (store.activeTask(item.id)) continue;
-        if (runtime.pullRequestNumber !== null) {
-          const pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
-          this.#savePullRequest(store, runtime, pullRequest);
-          if (pullRequest.mergedAt && isCommitSha(pullRequest.mergeCommitSha)) {
-            runtime.mergedCommitSha = pullRequest.mergeCommitSha;
-            store.saveWorkItemRuntime(runtime);
-          }
-        }
-        this.#completeClosedIssue(store, store.getWorkItem(item.id) ?? item);
-        continue;
-      }
-      const hasPullRequestIdentity = runtime.pullRequestNumber !== null || runtime.branchName !== null;
-      const terminalOnly = item.state === "Blocked" && !recovering && hasPullRequestIdentity;
-      if (item.state !== "AwaitingMerge" && !recovering && !terminalOnly) continue;
       const previousBaseSha = runtime.pullRequestBaseSha;
       try {
+        if (item.sourceType === "issue" && runtime.lastIssueState === "CLOSED" && !terminal(item)) {
+          if (store.activeTask(item.id)) continue;
+          if (runtime.pullRequestNumber !== null) {
+            const pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
+            this.#savePullRequest(store, runtime, pullRequest);
+            if (pullRequest.mergedAt && isCommitSha(pullRequest.mergeCommitSha)) {
+              runtime.mergedCommitSha = pullRequest.mergeCommitSha;
+              store.saveWorkItemRuntime(runtime);
+            }
+          }
+          this.#completeClosedIssue(store, store.getWorkItem(item.id) ?? item);
+          continue;
+        }
+        const hasPullRequestIdentity = runtime.pullRequestNumber !== null || runtime.branchName !== null;
+        const terminalOnly = item.state === "Blocked" && !recovering && hasPullRequestIdentity;
+        if (item.state !== "AwaitingMerge" && !recovering && !terminalOnly) continue;
         let pullRequest: GitHubPullRequest | null = null;
         if (runtime.pullRequestNumber) {
           pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
@@ -966,13 +1010,9 @@ export class MainOrchestrator {
           ? parseReviewResult(JSON.parse(latestReviewTask.resultJson))
           : null;
         if (pullRequest.state === "OPEN" && latestReview?.status === "pass") {
-          try {
-            const body = reconcilePullRequestBody(pullRequest.body, item, finalVerification(store, item, latestReview));
-            await this.#github.syncPullRequestContent(project, pullRequest, body, reviewNotes(latestReview));
-            pullRequest = { ...pullRequest, body };
-          } catch (error) {
-            this.#notify(`Could not repair pull request content for ${pullRequest.url}: ${errorText(error)}`, "warning");
-          }
+          const body = reconcilePullRequestBody(pullRequest.body, item, finalVerification(store, item, latestReview));
+          await this.#github.syncPullRequestContent(project, pullRequest, body, reviewNotes(latestReview));
+          pullRequest = { ...pullRequest, body };
         }
         if (terminalOnly) continue;
         if (store.pendingDecisions().some((decision) => decision.subjectId === item.id && decision.kind === "merge_conflict")) continue;
@@ -1113,7 +1153,7 @@ export class MainOrchestrator {
           runtime.reviewedDiffHash = currentDiffHash;
           store.saveWorkItemRuntime(runtime);
         }
-        if (!satisfiesBranchPolicy(pullRequest, policy)) {
+        if (!await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
           this.#resolveMergeDecisions(store, item.id);
           continue;
         }
@@ -1139,9 +1179,24 @@ export class MainOrchestrator {
         });
         this.#notify(`Merge approval required for ${pullRequest.url} (Decision ${decision.id}).`);
       } catch (error) {
-        if (!recovering && item.state !== "Blocked") this.#block(store, item, "github_unavailable", `GitHub reconciliation failed: ${errorText(error)}`);
+        this.#blockForGitHubUnavailable(store, item, `GitHub reconciliation failed: ${errorText(error)}`);
       }
     }
+  }
+
+  #blockForGitHubUnavailable(store: MerroStore, item: WorkItem, detail: string): void {
+    let current = store.getWorkItem(item.id) ?? item;
+    this.#resolveMergeDecisions(store, current.id);
+    if (terminal(current)) return;
+    if (current.state === "Blocked") {
+      if (current.blockedReason !== "github_unavailable" || !current.blockedResumeState) {
+        this.#notify(`WorkItem ${current.id} remains blocked (${current.blockedReason ?? "unknown"}) after: ${detail}`, "warning");
+        return;
+      }
+      store.transitionWorkItem(current.id, current.blockedResumeState);
+      current = store.getWorkItem(current.id) ?? current;
+    }
+    this.#block(store, current, "github_unavailable", detail);
   }
 
   #resolveMergeDecisions(store: MerroStore, workItemId: string): void {

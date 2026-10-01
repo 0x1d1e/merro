@@ -90,6 +90,7 @@ test("pull request parsing reads review commit OIDs from gh's object shape", asy
         baseRefName: "main",
         headRefOid: head,
         baseRefOid: "c".repeat(40),
+        author: { login: "issue-author" },
         reviewDecision: "APPROVED",
         reviews: [{
           author: { login: "maintainer" },
@@ -106,6 +107,7 @@ test("pull request parsing reads review commit OIDs from gh's object shape", asy
   const pullRequest = await new GitHubClient(commands).pullRequest(project, 22);
   assert.equal(pullRequest.reviews[0]?.commitId, head);
   assert.equal(pullRequest.reviews[0]?.author, "maintainer");
+  assert.equal(pullRequest.authorLogin, "issue-author");
 });
 
 test("pull request parsing includes the exact merged commit SHA", async () => {
@@ -210,6 +212,44 @@ test("squash merge classifies permanent rejection separately from availability f
   );
 });
 
+test("reviewer write permissions are parsed and cached per repository and account", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: JSON.stringify({ permission: "write" }), stderr: "" },
+  ]);
+  const github = new GitHubClient(commands);
+
+  assert.equal(await github.hasWritePermission(project, "Maintainer"), true);
+  assert.equal(await github.hasWritePermission(project, "maintainer"), true);
+  assert.equal(commands.calls.length, 2);
+  assert.deepEqual(commands.calls[1]?.args, [
+    "api", "repos/acme/widget/collaborators/Maintainer/permission",
+  ]);
+});
+
+test("maintain permission also qualifies for required approvals", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: JSON.stringify({ permission: "maintain" }), stderr: "" },
+  ]);
+  const github = new GitHubClient(commands);
+
+  assert.equal(await github.hasWritePermission(project, "release-manager"), true);
+});
+
+test("missing or read-only collaborators cannot satisfy required approvals", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: JSON.stringify({ permission: "read" }), stderr: "" },
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 404: Not Found"),
+  ]);
+  const github = new GitHubClient(commands);
+
+  assert.equal(await github.hasWritePermission(project, "reader"), false);
+  assert.equal(await github.hasWritePermission(project, "stranger"), false);
+});
+
 test("branch protection combines classic settings with active rulesets", async () => {
   const commands = new FakeCommands([
     { stdout: repository("acme/widget"), stderr: "" },
@@ -219,6 +259,7 @@ test("branch protection combines classic settings with active rulesets", async (
         required_pull_request_reviews: {
           required_approving_review_count: 2,
           require_code_owner_reviews: true,
+          dismiss_stale_reviews: true,
         },
       }),
       stderr: "",
@@ -231,7 +272,11 @@ test("branch protection combines classic settings with active rulesets", async (
         },
         {
           type: "pull_request",
-          parameters: { required_approving_review_count: 3, require_code_owner_review: false },
+          parameters: {
+            required_approving_review_count: 3,
+            require_code_owner_review: false,
+            dismiss_stale_reviews_on_push: true,
+          },
         },
       ]),
       stderr: "",
@@ -243,6 +288,7 @@ test("branch protection combines classic settings with active rulesets", async (
     requiredStatusChecks: ["ci", "lint", "ruleset-ci"],
     requiredApprovingReviewCount: 3,
     requireCodeOwnerReviews: true,
+    dismissStaleApprovals: true,
   });
 });
 
@@ -260,6 +306,7 @@ test("an unprotected branch is known when classic protection returns 404 and no 
     requiredStatusChecks: [],
     requiredApprovingReviewCount: 0,
     requireCodeOwnerReviews: false,
+    dismissStaleApprovals: false,
   });
   assert.equal(commands.calls[2]?.args[1], "repos/acme/widget/rules/branches/main");
 });
@@ -284,5 +331,6 @@ test("branch rulesets remain authoritative when classic protection returns 404",
     requiredStatusChecks: ["ruleset-ci"],
     requiredApprovingReviewCount: 0,
     requireCodeOwnerReviews: false,
+    dismissStaleApprovals: false,
   });
 });

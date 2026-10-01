@@ -24,6 +24,8 @@ interface HarnessOptions {
   projects?: FixtureProject[];
   maxConcurrentTasks?: number;
   requireExternalApproval?: boolean;
+  dismissStaleApprovals?: boolean;
+  reviewerWritePermission?: (username: string) => boolean;
   branchPolicyAvailable?: boolean;
   failAfterPullRequestCreate?: boolean;
   remoteBranchExists?: boolean;
@@ -32,6 +34,10 @@ interface HarnessOptions {
   localCloneMissing?: boolean;
   effectiveDiffFingerprint?: (headCommit: string) => string;
   inspect?: () => Promise<WorkerPresence>;
+  stop?: () => Promise<void>;
+  issueFailure?: (projectSlug: string, number: number) => boolean;
+  pullRequestFailure?: (number: number) => boolean;
+  pullRequestContentFailure?: () => boolean;
   result?: (input: WorkerLaunchInput, launchNumber: number, defaultResult: Record<string, unknown>) => Record<string, unknown> | null;
 }
 
@@ -113,6 +119,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       return [...issues.values()].filter((candidate) => candidate.url.includes(`/${project.slug}/issues/`));
     },
     async issue(project: Project, number: number) {
+      if (options.issueFailure?.(project.slug, number)) throw new Error(`GitHub issue ${number} unavailable`);
       const found = issues.get(`${project.slug}:${number}`);
       if (!found) throw new Error(`issue ${number} not found`);
       return found;
@@ -139,6 +146,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         baseRefName: "main",
         headRefOid,
         baseRefOid: "base-sha",
+        authorLogin: "issue-author",
         reviewDecision: null,
         reviews: [],
         checks: [],
@@ -151,13 +159,18 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       return [...pullRequests.values()].find((candidate) => candidate.headRefName === branchName) ?? null;
     },
     async pullRequest(_project: Project, number: number) {
+      if (options.pullRequestFailure?.(number)) throw new Error(`GitHub pull request ${number} unavailable`);
       const pullRequest = pullRequests.get(number);
       if (!pullRequest) throw new Error(`pull request ${number} not found`);
       return pullRequest;
     },
     async syncPullRequestContent(_project: Project, pullRequest: GitHubPullRequest, body: string, notes: string) {
+      if (options.pullRequestContentFailure?.()) throw new Error("GitHub PR content update unavailable");
       pullRequests.set(pullRequest.number, { ...pullRequest, body });
       reviewComments.set(pullRequest.number, notes);
+    },
+    async hasWritePermission(_project: Project, username: string) {
+      return options.reviewerWritePermission?.(username) ?? username.toLowerCase() === "maintainer";
     },
     async branchProtection() {
       if (!branchPolicyAvailable) return { known: false as const, reason: "policy visibility unavailable" };
@@ -166,6 +179,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         requiredStatusChecks: options.requireExternalApproval ? ["CI"] : [],
         requiredApprovingReviewCount: options.requireExternalApproval ? 1 : 0,
         requireCodeOwnerReviews: false,
+        dismissStaleApprovals: options.dismissStaleApprovals ?? false,
       };
     },
     async mergeSquash(_project: Project, number: number, expectedHead: string) {
@@ -285,6 +299,9 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     async inspect() {
       return options.inspect?.() ?? { alive: false, identityMatches: false, reason: "finished" };
     },
+    async stop() {
+      await options.stop?.();
+    },
     async cleanup() {},
   };
 
@@ -369,7 +386,7 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
   assert.equal(completed.decisions.length, 0);
 });
 
-test("a current-head GitHub approval satisfies the external branch policy", async (t) => {
+test("required approvals count only write-eligible reviewers and allow stale approvals when configured", async (t) => {
   const harness = await createHarness(t, { requireExternalApproval: true });
   await startDefaultObjective(harness.main);
   await harness.main.runPass();
@@ -381,8 +398,8 @@ test("a current-head GitHub approval satisfies the external branch policy", asyn
   harness.setPullRequest(number, {
     reviewDecision: "APPROVED",
     reviews: [{
-      id: "approval-1",
-      author: "maintainer",
+      id: "ineligible-approval",
+      author: "reviewer-without-required-permission",
       state: "APPROVED",
       submittedAt: "2026-01-01T00:00:00Z",
       commitId: pullRequest.headRefOid,
@@ -391,9 +408,83 @@ test("a current-head GitHub approval satisfies the external branch policy", asyn
   });
 
   await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).decisions.length, 0);
+
+  harness.setPullRequest(number, {
+    reviewDecision: "APPROVED",
+    reviews: [{
+      id: "eligible-stale-approval",
+      author: "maintainer",
+      state: "APPROVED",
+      submittedAt: "2026-01-01T00:00:00Z",
+      commitId: "a".repeat(40),
+    }],
+  });
+  await harness.main.runPass();
+
   const state = await harness.main.statusSnapshot();
   assert.equal(state.workItems[0]?.state, "AwaitingMerge");
   assert.equal(state.decisions.length, 1);
+});
+
+test("dismiss-stale branch policy requires a current-head approval", async (t) => {
+  const harness = await createHarness(t, { requireExternalApproval: true, dismissStaleApprovals: true });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const [number, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number && pullRequest);
+  harness.setPullRequest(number, {
+    reviewDecision: "APPROVED",
+    reviews: [{
+      id: "stale-approval",
+      author: "maintainer",
+      state: "APPROVED",
+      submittedAt: "2026-01-01T00:00:00Z",
+      commitId: "a".repeat(40),
+    }],
+    checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }],
+  });
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).decisions.length, 0);
+
+  harness.setPullRequest(number, {
+    reviews: [{
+      id: "current-approval",
+      author: "maintainer",
+      state: "APPROVED",
+      submittedAt: "2026-01-02T00:00:00Z",
+      commitId: pullRequest.headRefOid,
+    }],
+  });
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).decisions.length, 1);
+});
+
+test("SKIPPED and NEUTRAL satisfy required status checks", async (t) => {
+  for (const conclusion of ["SKIPPED", "NEUTRAL"]) {
+    const harness = await createHarness(t, { requireExternalApproval: true });
+    await startDefaultObjective(harness.main);
+    await harness.main.runPass();
+    await harness.main.runPass();
+    await harness.main.runPass();
+    const [number, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
+    assert.ok(number && pullRequest);
+    harness.setPullRequest(number, {
+      reviewDecision: "APPROVED",
+      reviews: [{
+        id: `approval-${conclusion}`,
+        author: "maintainer",
+        state: "APPROVED",
+        submittedAt: "2026-01-02T00:00:00Z",
+        commitId: pullRequest.headRefOid,
+      }],
+      checks: [{ name: "CI", state: "COMPLETED", conclusion, detailsUrl: null }],
+    });
+    await harness.main.runPass();
+    assert.equal((await harness.main.statusSnapshot()).decisions.length, 1, `${conclusion} should satisfy CI`);
+  }
 });
 
 test("reopened issue generations use distinct branches and pull requests", async (t) => {
@@ -698,16 +789,173 @@ test("PR reconciliation repairs required body sections and canonical review note
   assert.ok(number && pullRequest);
   assert.ok(harness.reviewComments.get(number)?.includes("<!-- merro:review-notes -->"));
 
-  harness.setPullRequest(number, { body: "## Summary\n\nKeep this user-written summary." });
+  harness.setPullRequest(number, {
+    body: "## Summary\n\nKeep this user-written summary.\n\n## Verification\n\nKeep this user-written verification.",
+  });
   harness.reviewComments.delete(number);
   await harness.main.runPass();
 
   const repaired = harness.pullRequests.get(number);
   assert.ok(repaired);
   assert.match(repaired.body, /Keep this user-written summary\./);
-  assert.match(repaired.body, /## Verification/);
+  assert.match(repaired.body, /Keep this user-written verification\./);
+  assert.doesNotMatch(repaired.body, /Checked the change/);
   assert.match(repaired.body, /Closes #7/);
   assert.ok(harness.reviewComments.get(number)?.includes("<!-- merro:review-notes -->"));
+});
+
+test("failed PR-content repair blocks merge readiness and clears stale Decisions", async (t) => {
+  let failContentSync = false;
+  const harness = await createHarness(t, { pullRequestContentFailure: () => failContentSync });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const [number] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number);
+  assert.equal((await harness.main.statusSnapshot()).decisions.length, 1);
+
+  harness.setPullRequest(number, { body: "## Summary\n\nUser edited this body." });
+  failContentSync = true;
+  await harness.main.runPass();
+
+  const state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems[0]?.state, "Blocked");
+  assert.equal(state.workItems[0]?.blockedReason, "github_unavailable");
+  assert.equal(state.decisions.length, 0);
+});
+
+test("title edits stop regenerating the PR verification section", async (t) => {
+  const harness = await createHarness(t, {
+    requireExternalApproval: true,
+    result(input, launchNumber, result) {
+      if (input.role === "implement" && launchNumber === 3) {
+        return { ...result, verification: [{ kind: "manual", project: input.project.slug, summary: "New implementation verification." }] };
+      }
+      return result;
+    },
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const [number, initial] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number && initial);
+  harness.setPullRequest(number, { title: "User-maintained title" });
+  harness.setPullRequest(number, { checks: [{ name: "CI", state: "COMPLETED", conclusion: "FAILURE", detailsUrl: null }] });
+
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+
+  const updated = harness.pullRequests.get(number);
+  assert.ok(updated);
+  assert.equal(updated.title, "User-maintained title");
+  assert.match(updated.body, /Checked the change/);
+  assert.doesNotMatch(updated.body, /New implementation verification/);
+});
+
+test("one issue lookup failure blocks only its WorkItem and does not abort other Projects", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "unavailable", issueNumbers: [7] }, { slug: "healthy", issueNumbers: [8] }],
+    issueFailure: (projectSlug) => projectSlug === "unavailable",
+  });
+  const started = await harness.main.startObjective({
+    goal: "Continue independent Project work",
+    projectSlugs: ["unavailable", "healthy"],
+    issues: [{ projectSlug: "unavailable", numbers: [7] }, { projectSlug: "healthy", numbers: [8] }],
+  });
+
+  await harness.main.runPass();
+  const state = await harness.main.statusSnapshot();
+  const unavailable = started.workItems.find((item) => item.projectSlug === "unavailable");
+  const healthy = started.workItems.find((item) => item.projectSlug === "healthy");
+  assert.ok(unavailable && healthy);
+  assert.equal(state.workItems.find((item) => item.id === unavailable.id)?.blockedReason, "github_unavailable");
+  assert.equal(state.workItems.find((item) => item.id === healthy.id)?.state, "Implementing");
+  assert.deepEqual(harness.launches.map((launch) => launch.workItemId), [healthy.id]);
+});
+
+test("worker stop failure for a closed issue does not prevent other Project reconciliation", async (t) => {
+  let inspectCalls = 0;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "closing", issueNumbers: [7] }, { slug: "healthy", issueNumbers: [8] }],
+    inspect: async () => ({ alive: ++inspectCalls === 1, identityMatches: true, reason: null }),
+    stop: async () => { throw new Error("tmux stop unavailable"); },
+  });
+  const started = await harness.main.startObjective({
+    goal: "Continue independent Project work",
+    projectSlugs: ["closing", "healthy"],
+    issues: [{ projectSlug: "closing", numbers: [7] }, { projectSlug: "healthy", numbers: [8] }],
+  });
+  await harness.main.runPass();
+  harness.setIssueState("closing", 7, "CLOSED");
+
+  await harness.main.runPass();
+
+  const state = await harness.main.statusSnapshot();
+  const closing = started.workItems.find((item) => item.projectSlug === "closing");
+  const healthy = started.workItems.find((item) => item.projectSlug === "healthy");
+  assert.ok(closing && healthy);
+  assert.equal(state.workItems.find((item) => item.id === closing.id)?.blockedReason, "github_unavailable");
+  assert.equal(state.workItems.find((item) => item.id === healthy.id)?.state, "Reviewing");
+});
+
+test("active worker inspection failure does not abort reconciliation of other Tasks", async (t) => {
+  let inspectCalls = 0;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "first", issueNumbers: [7] }, { slug: "second", issueNumbers: [8] }],
+    inspect: async () => {
+      inspectCalls += 1;
+      if (inspectCalls === 1) throw new Error("tmux unavailable");
+      return { alive: true, identityMatches: true, reason: null };
+    },
+  });
+  await harness.main.startObjective({
+    goal: "Continue independent Project work",
+    projectSlugs: ["first", "second"],
+    issues: [{ projectSlug: "first", numbers: [7] }, { projectSlug: "second", numbers: [8] }],
+  });
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 2);
+  for (const launch of harness.launches) {
+    await rm(join(harness.workspacePath, "worker-results", launch.taskId, "result.json"), { force: true });
+  }
+
+  await assert.doesNotReject(harness.main.runPass());
+  assert.equal(inspectCalls, 2);
+  const state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems.filter((item) => item.blockedReason === "github_unavailable").length, 1);
+  assert.ok(harness.notifications.some((message) => message.includes("Could not inspect active Task")));
+});
+
+test("closed-issue PR lookup failure is isolated and clears its merge Decision", async (t) => {
+  let unavailablePullRequest: number | null = null;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "closing", issueNumbers: [7] }, { slug: "healthy", issueNumbers: [8] }],
+    pullRequestFailure: (number) => number === unavailablePullRequest,
+  });
+  const started = await harness.main.startObjective({
+    goal: "Continue independent Project work",
+    projectSlugs: ["closing", "healthy"],
+    issues: [{ projectSlug: "closing", numbers: [7] }, { projectSlug: "healthy", numbers: [8] }],
+  });
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const closingPr = [...harness.pullRequests.values()].find((pr) => pr.headRefName.includes("issue-7-for-closing"));
+  const closing = started.workItems.find((item) => item.projectSlug === "closing");
+  const healthy = started.workItems.find((item) => item.projectSlug === "healthy");
+  assert.ok(closingPr && closing && healthy);
+  harness.setIssueState("closing", 7, "CLOSED");
+  unavailablePullRequest = closingPr.number;
+
+  await harness.main.runPass();
+
+  const state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems.find((item) => item.id === closing.id)?.blockedReason, "github_unavailable");
+  assert.equal(state.workItems.find((item) => item.id === healthy.id)?.state, "AwaitingMerge");
+  assert.deepEqual(state.decisions.map((decision) => decision.subjectId), [healthy.id]);
 });
 
 test("unchanged effective diff survives an external PR head rewrite", async (t) => {
@@ -988,7 +1236,8 @@ test("new Main consumes a healthy worker result after a crash without restarting
       async createPullRequest() { throw new Error("not reached"); },
       async pullRequest() { throw new Error("not reached"); },
       async syncPullRequestContent() {},
-      async branchProtection() { return { known: true, requiredStatusChecks: [], requiredApprovingReviewCount: 0, requireCodeOwnerReviews: false }; },
+      async branchProtection() { return { known: true, requiredStatusChecks: [], requiredApprovingReviewCount: 0, requireCodeOwnerReviews: false, dismissStaleApprovals: false }; },
+      async hasWritePermission() { return false; },
       async mergeSquash() {},
     },
     workers: {
@@ -1345,6 +1594,7 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
 
   for (const [number, pullRequest] of pullRequests) {
     setPullRequest(number, {
+      reviewDecision: "APPROVED",
       checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }],
       reviews: [{ id: `approval-${number}`, author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: pullRequest.headRefOid }],
     });
@@ -1370,6 +1620,7 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
   const webPullRequest = [...pullRequests.entries()].find(([, pr]) => pr.headRefName.includes("2"));
   assert.ok(webPullRequest);
   setPullRequest(webPullRequest[0], {
+    reviewDecision: "APPROVED",
     checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }],
     reviews: [{ id: `approval-${webPullRequest[0]}`, author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: webPullRequest[1].headRefOid }],
   });
