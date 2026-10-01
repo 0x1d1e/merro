@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -287,4 +287,9 @@ export const MIGRATION_10 = `
 ALTER TABLE objectives ADD COLUMN issue_scopes_json TEXT CHECK (issue_scopes_json IS NULL OR json_valid(issue_scopes_json));
 ALTER TABLE work_item_runtime ADD COLUMN base_update_json TEXT CHECK (base_update_json IS NULL OR json_valid(base_update_json));
 ALTER TABLE task_runtime ADD COLUMN base_update_json TEXT CHECK (base_update_json IS NULL OR json_valid(base_update_json));
+`;
+
+export const MIGRATION_11 = `
+ALTER TABLE objective_work_items ADD COLUMN in_scope INTEGER NOT NULL DEFAULT 1 CHECK (in_scope IN (0, 1));
+ALTER TABLE relations ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0 CHECK (automatic IN (0, 1));
 `;

@@ -5,7 +5,7 @@ import type { MerroConfig } from "../config.js";
 import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type WorkItem } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
-import { findRequiresCycle } from "../domain/relations.js";
+import { analyzeIssueRelations, findRequiresCycle } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
 import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
 import { GitHubClient, GitHubMergeError, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
@@ -557,20 +557,26 @@ export class MainOrchestrator {
     await this.#withStore(async (store) => {
       try {
         const unavailableProjects = await this.#reconcileProjects(store);
+        const scopeGates = new Set<string>();
         for (const objective of store.listObjectives()) {
           if (objective.state === "Active" && objective.issueScopes?.some((scope) => "query" in scope)) {
-            await this.#refreshObjectiveScope(store, objective, unavailableProjects);
+            await this.#refreshObjectiveScope(store, objective, unavailableProjects, scopeGates);
           }
         }
         await this.#reconcileIssues(store, unavailableProjects);
         await this.#reconcileTasks(store, unavailableProjects);
+        store.settleScopeDetachments();
+        for (const item of store.listWorkItems()) this.#obsoleteIfUnowned(store, item);
         await this.#reconcilePullRequests(store, unavailableProjects);
-        this.#deriveReady(store, unavailableProjects);
+        const relationGates = await this.#rebuildRelations(store, unavailableProjects);
+        for (const id of scopeGates) relationGates.add(id);
+        this.#deriveReady(store, unavailableProjects, relationGates);
         const tasks = store.listTasks();
         const active = tasks.filter((task) => task.status === "active");
         const items = store.listWorkItems();
         const result = schedule({
-          workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id) && !unavailableProjects.has(item.projectSlug)),
+          workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id)
+            && !unavailableProjects.has(item.projectSlug) && !relationGates.has(item.id)),
           relations: store.listRelations(),
           activeTaskCount: active.length,
           activeWorkItemIds: active.map((task) => task.workItemId),
@@ -852,7 +858,7 @@ export class MainOrchestrator {
   #createReopenedIssueGeneration(store: MerroStore, previous: WorkItem, issue: GitHubIssue): void {
     const owners = store.listObjectives().filter((objective) => objective.state === "Active"
       && objective.projectSlugs.includes(previous.projectSlug)
-      && store.listWorkItems(objective.id).some((item) => item.id === previous.id));
+      && store.listWorkItems(objective.id, true).some((item) => item.id === previous.id));
     if (owners.length === 0) return;
     const existing = store.findNonTerminalWorkItem(previous.projectSlug, "issue", String(issue.number));
     if (existing) {
@@ -871,9 +877,9 @@ export class MainOrchestrator {
       sourceType: "issue",
       sourceRef: String(issue.number),
       generation,
-      state: "Ready",
+      state: "Planned",
       priority: owners.map((owner) => owner.priority).sort((left, right) => priorityRank(left) - priorityRank(right))[0] ?? previous.priority,
-      readySince: new Date().toISOString(),
+      readySince: null,
       blockedReason: null,
       blockedResumeState: null,
     };
@@ -1368,13 +1374,47 @@ export class MainOrchestrator {
     const current = store.getWorkItem(item.id);
     if (current && !terminal(current) && !store.activeTask(item.id)) {
       store.transitionWorkItem(item.id, "Obsolete");
-      this.#resolveMergeDecisions(store, item.id);
+      this.#resolvePullRequestDecisions(store, item.id);
       this.#notify(`WorkItem ${item.id} is obsolete because no active Objective owns it.`);
     }
     return true;
   }
 
-  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>): void {
+  async #rebuildRelations(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<Set<string>> {
+    const gated = new Set<string>();
+    const analyzed: string[] = [];
+    const relations: Relation[] = [];
+    const objectives = store.listObjectives().filter((objective) => objective.state === "Active");
+    for (const item of store.listWorkItems()) {
+      if (terminal(item) || !store.hasActiveObjectiveForWorkItem(item.id)) { analyzed.push(item.id); continue; }
+      if (unavailableProjects.has(item.projectSlug)) { gated.add(item.id); continue; }
+      if (item.sourceType !== "issue") { analyzed.push(item.id); continue; }
+      try {
+        const project = store.getProject(item.projectSlug)!;
+        const issue = await this.#github.issue(project, Number(item.sourceRef));
+        const approved = new Map<string, WorkItem>();
+        for (const objective of objectives) {
+          const attached = store.listWorkItems(objective.id, true);
+          if (!attached.some((candidate) => candidate.id === item.id)) continue;
+          for (const candidate of attached) approved.set(candidate.id, candidate);
+        }
+        const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
+        analyzed.push(item.id);
+        relations.push(...analysis.relations);
+        if (analysis.unresolved.length > 0) {
+          gated.add(item.id);
+          this.#notify(`WorkItem ${item.id} awaits relation analysis: unresolved references ${analysis.unresolved.join(", ")} outside approved work.`, "warning");
+        }
+      } catch (error) {
+        gated.add(item.id);
+        this.#notify(`WorkItem ${item.id} awaits relation analysis: ${errorText(error)}`, "warning");
+      }
+    }
+    store.rebuildAutomaticRelations(analyzed, relations);
+    return gated;
+  }
+
+  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>, relationGates: ReadonlySet<string>): void {
     const items = store.listWorkItems();
     const byId = new Map(items.map((item) => [item.id, item]));
     const relations = store.listRelations();
@@ -1389,7 +1429,7 @@ export class MainOrchestrator {
         continue;
       }
       const requirements = relations.filter((relation) => relation.kind === "Requires" && relation.from === item.id);
-      const ready = requirements.every((relation) => byId.get(relation.to)?.state === "Done");
+      const ready = !relationGates.has(item.id) && requirements.every((relation) => byId.get(relation.to)?.state === "Done");
       if (item.state === "Planned" && ready) store.transitionWorkItem(item.id, "Ready");
       else if (item.state === "Ready" && !ready) store.transitionWorkItem(item.id, "Planned");
     }
@@ -1422,7 +1462,7 @@ export class MainOrchestrator {
   #reviewLimit(store: MerroStore, item: WorkItem): number | "unlimited" {
     const limits = store.listObjectives()
       .filter((objective) => objective.state === "Active"
-        && store.listWorkItems(objective.id).some((workItem) => workItem.id === item.id))
+        && store.listWorkItems(objective.id, true).some((workItem) => workItem.id === item.id))
       .map((objective) => objective.maxReviewRounds ?? this.#config.max_review_rounds);
     if (limits.length === 0 || limits.every((limit) => limit === "unlimited")) return "unlimited";
     return Math.min(...limits.filter((limit): limit is number => limit !== "unlimited"));
@@ -1473,8 +1513,8 @@ export class MainOrchestrator {
     const generation = store.nextGeneration(projectSlug, "issue", String(issue.number));
     const item: WorkItem = {
       id: sourceId(projectSlug, issue.number, generation), projectSlug, sourceType: "issue",
-      sourceRef: String(issue.number), generation, state: "Ready", priority: objective.priority,
-      readySince: new Date().toISOString(), blockedReason: null, blockedResumeState: null,
+      sourceRef: String(issue.number), generation, state: "Planned", priority: objective.priority,
+      readySince: null, blockedReason: null, blockedResumeState: null,
     };
     store.createWorkItem(item);
     store.attachWorkItem(objective.id, item.id);
@@ -1484,7 +1524,7 @@ export class MainOrchestrator {
     return item;
   }
 
-  async #refreshObjectiveScope(store: MerroStore, objective: Objective, unavailableProjects: ReadonlySet<string> = new Set()): Promise<boolean> {
+  async #refreshObjectiveScope(store: MerroStore, objective: Objective, unavailableProjects: ReadonlySet<string> = new Set(), schedulingGates: Set<string> = new Set()): Promise<boolean> {
     try {
       let scopes = objective.issueScopes;
       if (scopes === undefined) {
@@ -1500,6 +1540,7 @@ export class MainOrchestrator {
         store.restoreObjectiveIssueScopes(objective.id, scopes);
       }
       const discovered: Array<{ projectSlug: string; issue: GitHubIssue }> = [];
+      const queryResults = new Map<string, Set<number>>();
       let refreshed = true;
       for (const scope of scopes) {
         try {
@@ -1508,12 +1549,32 @@ export class MainOrchestrator {
           const issues = "query" in scope
             ? await this.#github.listOpenIssues(project, scope.query)
             : await Promise.all(scope.numbers.map((number) => this.#github.issue(project, number)));
-          for (const issue of issues) {
-            if (issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue)) discovered.push({ projectSlug: project.slug, issue });
-          }
+          const matching = issues.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue));
+          if ("query" in scope) queryResults.set(project.slug, new Set(matching.map((issue) => issue.number)));
+          for (const issue of matching) discovered.push({ projectSlug: project.slug, issue });
         } catch (error) {
           refreshed = false;
+          for (const item of store.listWorkItems(objective.id)) {
+            if (item.projectSlug === scope.projectSlug) schedulingGates.add(item.id);
+          }
           this.#notify(`Objective ${objective.id} remains Active: approved scope for Project '${scope.projectSlug}' could not be refreshed: ${errorText(error)}`, "warning");
+        }
+      }
+      for (const item of store.listWorkItems(objective.id)) {
+        if (item.sourceType !== "issue" || !queryResults.has(item.projectSlug)
+          || queryResults.get(item.projectSlug)!.has(Number(item.sourceRef))) continue;
+        try {
+          const issue = await this.#github.issue(store.getProject(item.projectSlug)!, Number(item.sourceRef));
+          // Closure is authoritative satisfaction, not scope removal. Issue reconciliation handles it.
+          if (issue.state.toUpperCase() === "CLOSED") continue;
+          const scope = scopes.find((entry) => entry.projectSlug === item.projectSlug)!;
+          if (matchesIssueScope(scope, issue)) throw new Error(`issue #${issue.number} changed during scope enumeration`);
+          store.detachWorkItem(objective.id, item.id);
+          this.#obsoleteIfUnowned(store, item);
+        } catch (error) {
+          refreshed = false;
+          schedulingGates.add(item.id);
+          this.#notify(`Objective ${objective.id} scope removal for ${item.id} could not be checked: ${errorText(error)}`, "warning");
         }
       }
       const attached = new Map<string, WorkItem>();
@@ -1526,6 +1587,10 @@ export class MainOrchestrator {
         const key = `${projectSlug}\0${issue.number}`;
         const existing = attached.get(key);
         if (existing) {
+          store.attachWorkItem(objective.id, existing.id);
+          if (!terminal(existing) && priorityRank(objective.priority) < priorityRank(existing.priority)) {
+            store.setWorkItemPriority(existing.id, objective.priority);
+          }
           if ((existing.state === "Done" || existing.state === "Obsolete")
             && store.getWorkItemRuntime(existing.id)?.lastIssueState === "CLOSED") {
             this.#createReopenedIssueGeneration(store, existing, issue);
@@ -1536,6 +1601,7 @@ export class MainOrchestrator {
       }
       return refreshed;
     } catch (error) {
+      for (const item of store.listWorkItems(objective.id)) schedulingGates.add(item.id);
       this.#notify(`Objective ${objective.id} remains Active: approved GitHub scope could not be refreshed: ${errorText(error)}`, "warning");
       return false;
     }

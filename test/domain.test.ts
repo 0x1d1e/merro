@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Relation, WorkItem } from "../src/domain/model.js";
-import { findRequiresCycle, normalizeRelation } from "../src/domain/relations.js";
+import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../src/domain/relations.js";
 import { schedule } from "../src/domain/scheduler.js";
 import { assertWorkItemTransition } from "../src/domain/work-item.js";
 
@@ -53,6 +53,23 @@ test("Conflicts are canonicalized symmetrically", () => {
   const relation = normalizeRelation({ kind: "Conflicts", from: "z", to: "a", confidence: "high", rationale: "x", evidence: "x" });
   assert.equal(relation.from, "a");
   assert.equal(relation.to, "z");
+});
+
+test("issue relation analysis accepts affirmative references and rejects speculative or quoted evidence", () => {
+  const source = { ...item("source", "Planned"), sourceRef: "8" };
+  const target = { ...item("target", "Ready"), sourceRef: "7" };
+  for (const body of ["Requires #7", "Depends on: #7", "Blocked by #7", "#8 requires #7"]) {
+    assert.equal(analyzeIssueRelations(source, { title: "Work", body }, [source, target]).relations[0]?.to, target.id);
+  }
+  for (const body of ["Does not require #7", "Does not depend on #7", "Never requires #7", "If this requires #7", "Requires #7?", "Example: requires #7", "Requires #7 or #99",
+    "`Requires #7`", "> Requires #7", "```\nRequires #7\n```", 'Example: "requires #7"']) {
+    assert.deepEqual(analyzeIssueRelations(source, { title: "Work", body }, [source, target]).relations, []);
+  }
+  const newer = { ...target, id: "newer", generation: 2 };
+  assert.equal(analyzeIssueRelations(source, { title: "Work", body: "Requires #7" }, [source, target, newer]).relations[0]?.to, "newer");
+  assert.deepEqual(analyzeIssueRelations(source, { title: "Work", body: "Requires #99 and #8" }, [source, target]).unresolved, ["#99", "#8"]);
+  const crossProject = { ...target, projectSlug: "q" };
+  assert.equal(analyzeIssueRelations(source, { title: "Work", body: "Requires q#7" }, [source, crossProject]).relations[0]?.to, target.id);
 });
 
 test("Requires cycles are detected", () => {

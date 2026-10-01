@@ -49,6 +49,27 @@ test("objectives preserve linked Projects and per-Objective review limits", () =
   }
 });
 
+test("automatic relation rebuild preserves manual evidence and effective Requires precedence", () => {
+  const store = makeStore();
+  try {
+    store.createWorkItem(item("a"));
+    store.createWorkItem(item("b"));
+    const manual = { kind: "Requires" as const, from: "a", to: "b", confidence: "explicit" as const, rationale: "Approved", evidence: "User" };
+    const inferred = { ...manual, confidence: "high" as const, rationale: "Inferred", evidence: "Requires #7" };
+    store.replaceRelations([manual]);
+    store.rebuildAutomaticRelations(["a", "b"], [inferred, { ...inferred, kind: "Conflicts" }]);
+    assert.deepEqual(store.listRelations(), [manual]);
+    store.rebuildAutomaticRelations(["a", "b"], []);
+    assert.deepEqual(store.listRelations(), [manual]);
+    store.replaceRelations([]);
+    store.rebuildAutomaticRelations(["a", "b"], [inferred]);
+    assert.deepEqual(store.listRelations(), [inferred]);
+    store.rebuildAutomaticRelations(["a", "b"], []);
+    assert.equal(store.listRelations().length, 0);
+    assert.ok(store.listRelations(true).length > 0);
+  } finally { store.close(); }
+});
+
 test("runtime metadata, relation history, and Decisions survive store round trips", () => {
   const store = makeStore();
   try {

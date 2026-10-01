@@ -10,7 +10,7 @@ Read before changing states, relations, scheduling, PR or merge flow, reconcilia
 4. New WorkItems inside approved scope are added automatically. Scope expansion, new Project, unregistered Project, splitting an issue → structural Decision.
 5. Rejected structural change → affected WorkItems Blocked, wait for freeform direction.
 
-Goal or scope change: log it, reconcile. Irrelevant untouched WorkItems → Obsolete. Active one finishes its Task, then Obsolete.
+Goal or scope change: log it, reconcile. Query membership is current, not additive: an open issue losing a required label or milestone leaves that Objective. Detach shared work and recompute its priority; obsolete exclusive unfinished work. An active Task finishes before detachment is finalized, with no successor unless another active Objective owns the WorkItem. Re-entry before Task completion restores ownership. Failed scope checks gate scheduling for affected work.
 Done: freshly enumerate the persisted GitHub scope, add newly matching WorkItems, then require all attached work to be terminal. A failed scope check keeps the Objective Active; never use a cached discovery result to complete it. Older Objectives without persisted scopes retain their attached issue numbers as fixed selections, not a query inferred from the goal. Blocked work keeps it Active. Externally closed issues count as satisfied. Reopened issue under an active Objective → new generation.
 Stop is soft only: active Tasks finish, exclusive unfinished WorkItems → Obsolete, shared ones continue.
 Multiple Objectives share one backlog. Shared WorkItem uses the highest active Objective priority.
@@ -34,7 +34,7 @@ Dependents of a Blocked WorkItem stay Planned; they are listed in the failure re
 - `Conflicts`: high confidence only. No concurrent execution; Main orders by priority, then downstream unblock count, then repo context. Follower may start when predecessor finishes implement+review, before merge. Predecessor rework does not interrupt a running follower.
 - Requires > Conflicts on order.
 - Any cycle → involved WorkItems Blocked(cycle), Main asks user. No auto cycle-breaking in v0.1.
-- Relation stores evidence, rationale, confidence, history of effective changes. Startup rebuilds active relations. High-confidence new relations inside approved scope apply automatically.
+- Relation stores evidence, rationale, confidence, history of effective changes. Rebuild automatic relations before every scheduling pass, including startup and discovery. Newly created WorkItems remain Planned until scope and relation checks succeed. Infer high-confidence affirmative `requires`, `depends on`, `blocked by`, and `conflicts with` statements referencing `#n` or `<project-slug>#n` in issue titles/bodies; quoted, negated, and speculative examples are not evidence. Unresolved references gate scheduling, never expand scope. Main supplies other explicit/high-confidence relations with `merro_update_relations`; automatic rebuilds preserve these and retire only superseded automatic evidence.
 - Auto-combining issues is deferred past v0.1.
 
 ## Scheduling

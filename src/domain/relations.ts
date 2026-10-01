@@ -1,4 +1,43 @@
-import type { Relation } from "./model.js";
+import type { Relation, WorkItem } from "./model.js";
+
+/** Conservative inference from affirmative issue-reference statements, never general prose overlap. */
+export function analyzeIssueRelations(
+  item: WorkItem,
+  issue: { title: string; body: string },
+  approvedItems: readonly WorkItem[],
+): { relations: Relation[]; unresolved: string[] } {
+  const relations: Relation[] = [];
+  const unresolved: string[] = [];
+  let fenced = false;
+  for (const raw of `${issue.title}\n${issue.body}`.split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(raw)) { fenced = !fenced; continue; }
+    if (fenced || /^\s*>/.test(raw)) continue;
+    const line = raw.replace(/`[^`]*`/g, "");
+    const statements = /\b(requires|depends on|blocked by|conflicts with)\s*:?\s+((?:(?:[A-Za-z0-9._/-]+)?#[1-9][0-9]*)(?:(?:\s*,\s*|\s+and\s+)(?:[A-Za-z0-9._/-]+)?#[1-9][0-9]*)*)/gi;
+    for (const match of line.matchAll(statements)) {
+      // Questions, quoted examples, and negated or conditional statements are not high-confidence evidence.
+      const prefix = line.slice(0, match.index).trim();
+      if (/\b(not|never|no|if|unless|whether|might|may|could|should|example)\b/i.test(prefix)
+        || /\bor\b|[?"']/i.test(line)) continue;
+      const kind = match[1]!.toLowerCase() === "conflicts with" ? "Conflicts" : "Requires";
+      for (const reference of match[2]!.matchAll(/([A-Za-z0-9._/-]+)?#([1-9][0-9]*)/g)) {
+        const projectSlug = reference[1] ?? item.projectSlug;
+        const number = reference[2]!;
+        const target = approvedItems.filter((candidate) => candidate.projectSlug === projectSlug
+          && candidate.sourceType === "issue" && candidate.sourceRef === number)
+          .sort((left, right) => right.generation - left.generation)[0];
+        if (!target || target.state === "Obsolete" || target.state === "Cancelled") {
+          unresolved.push(reference[0]);
+          continue;
+        }
+        if (target.id === item.id) { unresolved.push(reference[0]); continue; }
+        relations.push({ kind, from: item.id, to: target.id, confidence: "high",
+          rationale: "Affirmative issue-reference statement inside approved scope.", evidence: raw.trim() });
+      }
+    }
+  }
+  return { relations: effectiveRelations(relations), unresolved: [...new Set(unresolved)] };
+}
 
 export function normalizeRelation(relation: Relation): Relation {
   if (relation.from === relation.to) {

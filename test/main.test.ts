@@ -517,6 +517,288 @@ test("approved label and milestone scope survives restart and discovers matching
   assert.equal((await restarted.statusSnapshot()).workItems.filter((item) => item.sourceRef === "8").length, 1);
 });
 
+test("query removals obsolete untouched exclusive work before scheduling", async (t) => {
+  for (const change of [{ labels: ["bug"] }, { milestone: "v2" }]) {
+    const harness = await createHarness(t);
+    const original = harness.issues.get("example:7")!;
+    harness.issues.set("example:7", { ...original, milestone: "v1" });
+    const started = await harness.main.startObjective({
+      goal: "Ship features", projectSlugs: ["example"],
+      issues: [{ projectSlug: "example", query: { labels: ["feature"], milestone: "v1" } }],
+    });
+    harness.issues.set("example:7", { ...original, milestone: "v1", ...change });
+    await harness.restartMain().runPass();
+    const snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.workItems[0]?.state, "Obsolete");
+    assert.equal(snapshot.objectives[0]?.state, "Done");
+    assert.equal(harness.launches.length, 0);
+    const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+    try { assert.equal(store.listWorkItems(started.objective.id).length, 0); } finally { store.close(); }
+  }
+});
+
+test("scope removal detaches only the query Objective and restores shared priority", async (t) => {
+  const harness = await createHarness(t);
+  const query = await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], priority: "high",
+    issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  const fixed = await harness.main.startObjective({
+    goal: "Issue seven", projectSlugs: ["example"], priority: "low",
+    issues: [{ projectSlug: "example", numbers: [7] }],
+  });
+  harness.issues.get("example:7")!.labels = ["bug"];
+  await harness.main.runPass();
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.workItems[0]?.state, "Implementing");
+  assert.equal(snapshot.workItems[0]?.priority, "low");
+  assert.equal(snapshot.objectives.find((item) => item.id === query.objective.id)?.state, "Done");
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    assert.equal(store.listWorkItems(query.objective.id).length, 0);
+    assert.equal(store.listWorkItems(fixed.objective.id).length, 1);
+  } finally { store.close(); }
+});
+
+test("active out-of-scope work finishes its current Task across restart without a successor", async (t) => {
+  let finish = false;
+  for (const role of ["implement", "review"] as const) {
+    finish = false;
+    const harness = await createHarness(t, {
+      inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+      result(input, _count, result) { return input.role === role && !finish ? null : result; },
+    });
+    const started = await harness.main.startObjective({
+      goal: "Features", projectSlugs: ["example"],
+      issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+    });
+    await harness.main.runPass();
+    if (role === "review") await harness.main.runPass();
+    harness.issues.get("example:7")!.labels = ["bug"];
+    await harness.main.runPass();
+    let snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.tasks.at(-1)?.status, "active");
+    assert.equal(snapshot.objectives[0]?.state, "Active");
+    const task = snapshot.tasks.at(-1)!;
+    const input = harness.launches.at(-1)!;
+    const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+    let resultPath: string;
+    try {
+      assert.equal(store.listWorkItems(started.objective.id).length, 1);
+      resultPath = store.getTaskRuntime(task.id)!.resultPath;
+    } finally { store.close(); }
+    await writeFile(resultPath, JSON.stringify(role === "implement" ? {
+      task_id: task.id, status: "success", summary: "Finished", commit: "a".repeat(40),
+      verification: [{ kind: "manual", project: "example", summary: "Verified" }],
+    } : {
+      task_id: task.id, status: "pass", summary: "Reviewed", reviewed_commit: input.expectedCommit,
+      findings: [], verification: [{ kind: "manual", project: "example", summary: "Verified" }],
+    }));
+    finish = true;
+    await harness.restartMain().runPass();
+    snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.tasks.at(-1)?.status, "finalized");
+    assert.equal(snapshot.workItems[0]?.state, "Obsolete");
+    assert.equal(snapshot.objectives[0]?.state, "Done");
+    assert.equal(harness.launches.length, role === "implement" ? 1 : 2);
+    assert.equal(harness.pullRequests.size, 0);
+  }
+});
+
+test("auto-discovered Requires is rebuilt before the same pass can launch its dependent", async (t) => {
+  const harness = await createHarness(t, { result: () => null, inspect: async () => ({ alive: true, identityMatches: true, reason: null }) });
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await harness.main.runPass();
+  const original = harness.issues.get("example:7")!;
+  harness.issues.set("example:8", { ...original, number: 8, title: "#8 requires #7", url: original.url.replace("/7", "/8") });
+  await harness.restartMain().runPass();
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.workItems.find((item) => item.sourceRef === "8")?.state, "Planned");
+  assert.equal(harness.launches.length, 1);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    assert.ok(store.listRelations().some((relation) => relation.kind === "Requires"
+      && relation.from === "example:issue-8:g1" && relation.to === "example:issue-7:g1"));
+  } finally { store.close(); }
+});
+
+test("unresolved Requires outside approved scope gates discovery rather than expanding scope", async (t) => {
+  const harness = await createHarness(t);
+  harness.issues.get("example:7")!.body = "Requires #99";
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Planned");
+  assert.ok(harness.notifications.some((message) => message.includes("#99")));
+});
+
+test("scope removal retires merge and conflict Decisions without closing the existing PR", async (t) => {
+  for (const conflict of [false, true]) {
+    const harness = await createHarness(t, { baseMergeConflict: conflict });
+    await harness.main.startObjective({
+      goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+    });
+    await harness.main.runPass();
+    await harness.main.runPass();
+    await harness.main.runPass();
+    if (conflict) {
+      harness.setPullRequest(13, { baseRefOid: "d".repeat(40) });
+      await harness.main.runPass();
+    }
+    assert.equal((await harness.main.statusSnapshot()).decisions.length, 1);
+    harness.issues.get("example:7")!.labels = ["bug"];
+    await harness.restartMain().runPass();
+    const snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.workItems[0]?.state, "Obsolete");
+    assert.equal(snapshot.decisions.length, 0);
+    assert.equal(harness.pullRequests.get(13)?.state, "OPEN");
+    assert.equal(harness.launches.length, 2);
+  }
+});
+
+test("relation analysis failure holds new work until a fresh analysis succeeds", async (t) => {
+  let lookups = 0;
+  const harness = await createHarness(t, { issueFailure: () => ++lookups === 2 });
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Planned");
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches.length, 1);
+});
+
+test("query refresh failure gates cached work until current membership can be checked", async (t) => {
+  let fail = false;
+  const harness = await createHarness(t, { scopeFailure: () => fail });
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  harness.issues.get("example:7")!.labels = ["bug"];
+  fail = true;
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+  assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Active");
+  fail = false;
+  await harness.restartMain().runPass();
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Obsolete");
+});
+
+test("active shared work continues for its remaining owner after deferred scope detachment", async (t) => {
+  const harness = await createHarness(t);
+  const query = await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], priority: "high",
+    issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  harness.issues.get("example:7")!.labels = ["bug"];
+  await harness.restartMain().runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review"]);
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.workItems[0]?.priority, "normal");
+  assert.equal(snapshot.objectives.find((objective) => objective.id === query.objective.id)?.state, "Done");
+});
+
+test("scope re-entry preserves a running Task and cancels its deferred detachment", async (t) => {
+  const harness = await createHarness(t, {
+    result: () => null, inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+  });
+  const started = await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await harness.main.runPass();
+  harness.issues.get("example:7")!.labels = ["bug"];
+  await harness.main.runPass();
+  harness.issues.get("example:7")!.labels = ["feature"];
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches.length, 1);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    assert.equal(store.hasActiveObjectiveForWorkItem(started.workItems[0]!.id), true);
+    assert.equal(store.listWorkItems(started.objective.id, true).length, 1);
+  } finally { store.close(); }
+});
+
+test("automatic Requires waits for merge, then unblocks its dependent", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [7, 8] }] });
+  harness.issues.get("example:8")!.body = "Depends on: #7";
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.ok(harness.launches.every((launch) => launch.workItemId === "example:issue-7:g1"));
+  const decision = (await harness.main.statusSnapshot()).decisions[0]!;
+  await harness.main.resolveMergeDecision(decision.id, true);
+  assert.ok(harness.launches.some((launch) => launch.workItemId === "example:issue-8:g1"));
+});
+
+test("startup inference catches cycles and serializes high-confidence conflicts", async (t) => {
+  for (const cycle of [true, false]) {
+    const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [7, 8] }] });
+    harness.issues.get("example:7")!.body = cycle ? "Requires #8" : "Conflicts with #8";
+    harness.issues.get("example:8")!.body = cycle ? "Requires #7" : "Independent implementation.";
+    await harness.main.startObjective({
+      goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+    });
+    await harness.restartMain().runPass();
+    const snapshot = await harness.main.statusSnapshot();
+    if (cycle) {
+      assert.equal(harness.launches.length, 0);
+      assert.ok(snapshot.workItems.every((item) => item.blockedReason === "cycle"));
+    } else assert.equal(harness.launches.length, 1);
+  }
+});
+
+test("failed inference preserves a conflict with a live worker while healthy analysis continues", async (t) => {
+  let fail = false;
+  let lookups = 0;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7, 8] }], result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+    issueFailure: (_slug, number) => fail && number === 7 && ++lookups === 2,
+  });
+  harness.issues.get("example:7")!.body = "Conflicts with #8";
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+  fail = true;
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches.length, 1);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.equal(store.listRelations()[0]?.kind, "Conflicts"); } finally { store.close(); }
+});
+
+test("removed inference is rebuilt without deleting explicit Main relations", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7, 8, 9] }], result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+  });
+  harness.issues.get("example:8")!.body = "Requires #7";
+  const started = await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  const explicit: Relation = { kind: "Requires", from: started.workItems[2]!.id, to: started.workItems[0]!.id,
+    confidence: "explicit", rationale: "Approved plan", evidence: "User direction" };
+  await harness.main.updateRelations([explicit]);
+  assert.equal(harness.launches.length, 1);
+  harness.issues.get("example:8")!.body = "Independent work.";
+  await harness.restartMain().runPass();
+  assert.ok(harness.launches.some((launch) => launch.workItemId === "example:issue-8:g1"));
+  assert.ok(!harness.launches.some((launch) => launch.workItemId === "example:issue-9:g1"));
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.deepEqual(store.listRelations(), [explicit]); } finally { store.close(); }
+});
+
 test("Objective completion requires a fresh GitHub check even for fixed issue selections", async (t) => {
   let fail = false;
   const harness = await createHarness(t, { issueFailure: () => fail });

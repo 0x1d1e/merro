@@ -21,7 +21,7 @@ import { parseObjectiveIssueScopes } from "../domain/objective.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -239,6 +239,18 @@ export class MerroStore {
         throw error;
       }
     }
+    if (version < 11) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_11);
+        this.#db.prepare("UPDATE schema_meta SET version = 11").run();
+        this.#db.exec("COMMIT");
+        version = 11;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -388,6 +400,7 @@ export class MerroStore {
           confidence = excluded.confidence,
           rationale = excluded.rationale,
           evidence = excluded.evidence,
+          automatic = 0,
           active = 1
       `);
       for (const relation of effective) {
@@ -401,9 +414,43 @@ export class MerroStore {
     }
   }
 
+  rebuildAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[]): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE automatic = 1 AND kind = 'Requires' AND from_work_item_id = ?");
+      for (const id of analyzedIds) deactivate.run(id);
+      // Either endpoint may supply a symmetric relation. Preserve it until both were checked successfully.
+      const analyzed = new Set(analyzedIds);
+      const deactivateConflict = this.#db.prepare("UPDATE relations SET active = 0 WHERE automatic = 1 AND kind = 'Conflicts' AND from_work_item_id = ? AND to_work_item_id = ?");
+      for (const relation of this.#db.prepare("SELECT from_work_item_id, to_work_item_id FROM relations WHERE automatic = 1 AND kind = 'Conflicts' AND active = 1").all()) {
+        if (analyzed.has(String(relation.from_work_item_id)) && analyzed.has(String(relation.to_work_item_id))) {
+          deactivateConflict.run(String(relation.from_work_item_id), String(relation.to_work_item_id));
+        }
+      }
+      const upsert = this.#db.prepare(`
+        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, active, automatic, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)
+        ON CONFLICT(kind, from_work_item_id, to_work_item_id) DO UPDATE SET
+          confidence = excluded.confidence, rationale = excluded.rationale, evidence = excluded.evidence, active = 1, automatic = 1
+        WHERE relations.automatic = 1 OR relations.active = 0
+      `);
+      for (const relation of relations.map(normalizeRelation)) {
+        upsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence, now());
+      }
+      const rebuilt = this.listRelations();
+      const previous = this.#db.prepare("SELECT payload_json FROM event_log WHERE entity_type = 'Relations' AND event_type = 'rebuilt' ORDER BY id DESC LIMIT 1").get();
+      if (previous?.payload_json !== JSON.stringify(rebuilt)) this.appendEvent("Relations", "workspace", "rebuilt", rebuilt);
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   listRelations(includeInactive = false): Relation[] {
     const where = includeInactive ? "" : "WHERE active = 1";
-    return this.#db.prepare(`SELECT * FROM relations ${where} ORDER BY id`).all().map(relationFromRow);
+    const relations = this.#db.prepare(`SELECT * FROM relations ${where} ORDER BY id`).all().map(relationFromRow);
+    return includeInactive ? relations : effectiveRelations(relations);
   }
 
   createDecision(input: Omit<Decision, "createdAt" | "resolvedAt" | "state"> & { state?: Decision["state"] }): Decision {
@@ -627,7 +674,7 @@ export class MerroStore {
     return Number(row?.generation ?? 0) + 1;
   }
 
-  listWorkItems(objectiveId?: string): WorkItem[] {
+  listWorkItems(objectiveId?: string, inScopeOnly = false): WorkItem[] {
     const rows = objectiveId === undefined
       ? this.#db.prepare(`
           SELECT w.*, s.guidance FROM work_items w
@@ -638,7 +685,7 @@ export class MerroStore {
           SELECT w.*, s.guidance FROM work_items w
           LEFT JOIN work_item_settings s ON s.work_item_id = w.id
           JOIN objective_work_items ow ON ow.work_item_id = w.id
-          WHERE ow.objective_id = ? ORDER BY w.created_at, w.id
+          WHERE ow.objective_id = ? ${inScopeOnly ? "AND ow.in_scope = 1" : ""} ORDER BY w.created_at, w.id
         `).all(objectiveId);
     return rows.map(workItemFromRow);
   }
@@ -653,18 +700,42 @@ export class MerroStore {
 
   attachWorkItem(objectiveId: string, workItemId: string): void {
     const result = this.#db.prepare(`
-      INSERT OR IGNORE INTO objective_work_items(objective_id, work_item_id)
+      INSERT INTO objective_work_items(objective_id, work_item_id)
       VALUES (?, ?)
+      ON CONFLICT(objective_id, work_item_id) DO UPDATE SET in_scope = 1 WHERE in_scope = 0
     `).run(objectiveId, workItemId);
     if (Number(result.changes) > 0) {
       this.appendEvent("WorkItem", workItemId, "attached_to_objective", { objectiveId });
     }
   }
 
+  detachWorkItem(objectiveId: string, workItemId: string): void {
+    // Retain the attachment until the current Task finishes, but stop counting it as ownership immediately.
+    const result = this.activeTask(workItemId)
+      ? this.#db.prepare("UPDATE objective_work_items SET in_scope = 0 WHERE objective_id = ? AND work_item_id = ? AND in_scope = 1").run(objectiveId, workItemId)
+      : this.#db.prepare("DELETE FROM objective_work_items WHERE objective_id = ? AND work_item_id = ?").run(objectiveId, workItemId);
+    if (Number(result.changes) === 0) return;
+    this.appendEvent("WorkItem", workItemId, "detached_from_objective", { objectiveId, deferred: this.activeTask(workItemId) !== null });
+    const item = this.getWorkItem(workItemId);
+    if (!item || item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled") return;
+    const priorities = this.#db.prepare(`
+      SELECT o.priority FROM objectives o JOIN objective_work_items ow ON ow.objective_id = o.id
+      WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1
+    `).all(workItemId).map((row) => row.priority as Priority);
+    const highest = priorities.sort((left, right) => priorityRank(left) - priorityRank(right))[0];
+    if (highest && highest !== item.priority) this.setWorkItemPriority(workItemId, highest);
+  }
+
+  settleScopeDetachments(): void {
+    this.#db.prepare(`DELETE FROM objective_work_items WHERE in_scope = 0 AND NOT EXISTS (
+      SELECT 1 FROM tasks WHERE tasks.work_item_id = objective_work_items.work_item_id AND tasks.status = 'active'
+    )`).run();
+  }
+
   hasActiveObjectiveForWorkItem(workItemId: string): boolean {
     return this.#db.prepare(`
       SELECT 1 FROM objective_work_items ow JOIN objectives o ON o.id = ow.objective_id
-      WHERE ow.work_item_id = ? AND o.state = 'Active' LIMIT 1
+      WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1 LIMIT 1
     `).get(workItemId) !== undefined;
   }
 
@@ -939,7 +1010,7 @@ export class MerroStore {
           const priorities = this.#db.prepare(`
             SELECT o.priority FROM objectives o
             JOIN objective_work_items ow ON ow.objective_id = o.id
-            WHERE ow.work_item_id = ? AND o.state = 'Active'
+            WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1
           `).all(item.id).map((row) => row.priority as Priority);
           const highest = priorities.sort((left, right) => priorityRank(left) - priorityRank(right))[0];
           if (highest && highest !== item.priority) this.setWorkItemPriority(item.id, highest);
