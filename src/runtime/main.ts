@@ -35,6 +35,14 @@ export interface MainOptions {
   notify?: (message: string, level?: "info" | "warning" | "error") => void;
 }
 
+export interface ObjectiveProposal {
+  id: string;
+  workItems: WorkItem[];
+  relations: Relation[];
+  unresolved: Array<{ workItemId: string; references: string[] }>;
+  cycle: string[] | null;
+}
+
 export interface ObjectiveStartInput {
   goal: string;
   projectSlugs: string[];
@@ -50,6 +58,11 @@ const emptyRuntime = (workItemId: string): WorkItemRuntimeRecord => ({
   lastIssueState: null, reviewedDiffHash: null, reviewRound: 0,
   infrastructureRetries: 0, implementationAttempt: 0, lastReworkTrigger: null, lastReconciledAt: null,
 });
+
+function proposalFingerprint(graph: Omit<ObjectiveProposal, "id">): string {
+  return JSON.stringify({ workItems: graph.workItems.map((item) => item.id), relations: graph.relations,
+    unresolved: graph.unresolved, cycle: graph.cycle });
+}
 
 function sourceId(projectSlug: string, number: number, generation: number): string {
   return `${projectSlug}:issue-${number}:g${generation}`;
@@ -273,6 +286,8 @@ export class MainOrchestrator {
   readonly #github: GitHubAdapter;
   readonly #workers: WorkerAdapter;
   readonly #commands: CommandRunner;
+  #storeQueue: Promise<unknown> = Promise.resolve();
+  readonly #proposals = new Map<string, { input: string; graph: string }>();
   readonly #pendingNotifications: Array<{ event: string; subjectId: string; message: string }> = [];
 
   constructor(options: MainOptions) {
@@ -311,6 +326,14 @@ export class MainOrchestrator {
     }));
   }
 
+  async statusSummary(): Promise<ReturnType<MerroStore["statusSummary"]>> {
+    return this.#withStore((store) => store.statusSummary());
+  }
+
+  async exportSnapshot(): Promise<ReturnType<MerroStore["snapshot"]>> {
+    return this.#withStore((store) => store.snapshot());
+  }
+
   async updateRelations(relations: readonly Relation[]): Promise<void> {
     await this.#withStore((store) => {
       for (const relation of relations) {
@@ -342,27 +365,80 @@ export class MainOrchestrator {
     });
   }
 
-  async startObjective(input: ObjectiveStartInput): Promise<{ objective: Objective; workItems: WorkItem[] }> {
+  async proposeObjective(input: ObjectiveStartInput): Promise<ObjectiveProposal> {
+    return this.#withStore(async (store) => {
+      const prepared = await this.#prepareObjective(store, input);
+      const id = randomUUID();
+      const proposal = { id, ...prepared.graph };
+      this.#proposals.clear();
+      this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph) });
+      return proposal;
+    });
+  }
+
+  async #prepareObjective(store: MerroStore, input: ObjectiveStartInput) {
+    const projects = [...new Set(input.projectSlugs)].map((slug) => {
+      const project = store.getProject(slug);
+      if (!project) throw new Error(`unknown Project: ${slug}`);
+      return project;
+    });
+    const issueScopes = parseObjectiveIssueScopes(input.issues, projects.map((project) => project.slug));
+    const issueRows = new Map<string, GitHubIssue>();
+    for (const scope of issueScopes) {
+      const project = projects.find((candidate) => candidate.slug === scope.projectSlug)!;
+      const open = await this.#github.listOpenIssues(project, "query" in scope ? scope.query : undefined);
+      const selected = open.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue));
+      if ("numbers" in scope) {
+        for (const number of scope.numbers) {
+          if (!selected.some((issue) => issue.number === number)) throw new Error(`issue #${number} is not open in Project '${project.slug}'`);
+        }
+      }
+      for (const issue of selected.sort((a, b) => a.number - b.number)) issueRows.set(`${project.slug}\0${issue.number}`, issue);
+    }
+    const workItems = [...issueRows].map(([key, issue]): WorkItem => {
+      const projectSlug = key.split("\0")[0]!;
+      const existing = store.findNonTerminalWorkItem(projectSlug, "issue", String(issue.number));
+      if (existing) return existing;
+      const generation = store.nextGeneration(projectSlug, "issue", String(issue.number));
+      return { id: sourceId(projectSlug, issue.number, generation), projectSlug, sourceType: "issue",
+        sourceRef: String(issue.number), generation, state: "Planned", priority: input.priority ?? "normal",
+        readySince: null, blockedReason: null, blockedResumeState: null };
+    });
+    // Shared WorkItems retain relations to work already approved by another active Objective.
+    const objectives = store.listObjectives().filter((candidate) => candidate.state === "Active");
+    const relations: Relation[] = [];
+    const unresolved: ObjectiveProposal["unresolved"] = [];
+    for (const item of workItems) {
+      const issue = issueRows.get(`${item.projectSlug}\0${item.sourceRef}`)!;
+      const approved = new Map(workItems.map((candidate) => [candidate.id, candidate]));
+      for (const objective of objectives) {
+        const attached = store.listWorkItems(objective.id, true);
+        if (attached.some((candidate) => candidate.id === item.id)) {
+          for (const candidate of attached) approved.set(candidate.id, candidate);
+        }
+      }
+      const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
+      relations.push(...analysis.relations);
+      if (analysis.unresolved.length) unresolved.push({ workItemId: item.id, references: analysis.unresolved });
+    }
+    const ids = new Set(workItems.map((item) => item.id));
+    const effective = store.previewAutomaticRelations([...ids], relations)
+      .filter((relation) => ids.has(relation.from) || ids.has(relation.to));
+    return { projects, issueScopes, issueRows, automaticRelations: relations,
+      graph: { workItems, relations: effective, unresolved, cycle: findRequiresCycle(effective) } };
+  }
+
+  async startObjective(input: ObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; workItems: WorkItem[] }> {
     if (!input.goal.trim()) throw new Error("Objective goal must not be empty");
     if (input.projectSlugs.length === 0) throw new Error("Objective requires at least one Project");
     return this.#withStore(async (store) => {
-      const projects = [...new Set(input.projectSlugs)].map((slug) => {
-        const project = store.getProject(slug);
-        if (!project) throw new Error(`unknown Project: ${slug}`);
-        return project;
-      });
-      const issueScopes = parseObjectiveIssueScopes(input.issues, projects.map((project) => project.slug));
-      const issueRows = new Map<string, GitHubIssue>();
-      for (const scope of issueScopes) {
-        const project = projects.find((candidate) => candidate.slug === scope.projectSlug)!;
-        const open = await this.#github.listOpenIssues(project, "query" in scope ? scope.query : undefined);
-        const selected = open.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue));
-        if ("numbers" in scope) {
-          for (const number of scope.numbers) {
-            if (!selected.some((issue) => issue.number === number)) throw new Error(`issue #${number} is not open in Project '${project.slug}'`);
-          }
+      const { projects, issueScopes, issueRows, graph, automaticRelations } = await this.#prepareObjective(store, input);
+      if (proposalId !== undefined) {
+        const proposal = this.#proposals.get(proposalId);
+        if (!proposal || proposal.input !== JSON.stringify(input) || proposal.graph !== proposalFingerprint(graph)) {
+          throw new Error("Objective proposal changed or expired. Run merro_propose_objective and obtain approval again.");
         }
-        for (const issue of selected) issueRows.set(`${project.slug}\0${issue.number}`, issue);
+        this.#proposals.delete(proposalId);
       }
 
       const objective: Objective = {
@@ -376,6 +452,7 @@ export class MainOrchestrator {
         const projectSlug = key.split("\0")[0] ?? "";
         items.push(this.#attachIssue(store, objective, projectSlug, issue));
       }
+      store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations);
       this.#notify(`Objective ${objective.id} approved with ${items.length} WorkItem(s).`);
       return { objective, workItems: items };
     });
@@ -620,6 +697,33 @@ export class MainOrchestrator {
   }
 
   async #withStore<T>(action: (store: MerroStore) => T | Promise<T>): Promise<T> {
+    let notifications: Array<{ event: string; subjectId: string; message: string }> = [];
+    const operation = this.#storeQueue.then(async () => {
+      try {
+        return await this.#lockedStore(action);
+      } finally {
+        notifications = this.#pendingNotifications.splice(0);
+      }
+    });
+    this.#storeQueue = operation.catch(() => undefined);
+    try {
+      return await operation;
+    } finally {
+      // Hooks run after ownership and serialization are released; they may query Main.
+      for (const notification of notifications) {
+        try {
+          await this.#commands.run("bash", ["-lc", this.#config.notify_command!], {
+            cwd: this.#workspacePath,
+            env: { MERRO_EVENT: notification.event, MERRO_SUBJECT_ID: notification.subjectId, MERRO_MESSAGE: notification.message },
+          });
+        } catch (error) {
+          this.#notify(`notify_command failed: ${errorText(error)}`, "warning");
+        }
+      }
+    }
+  }
+
+  async #lockedStore<T>(action: (store: MerroStore) => T | Promise<T>): Promise<T> {
     await mkdir(this.#stateDirectory, { recursive: true, mode: 0o700 });
     const lock = new MainLock(join(this.#stateDirectory, "main.lock.db"));
     await lock.acquire();
@@ -632,17 +736,6 @@ export class MainOrchestrator {
         store?.close();
       } finally {
         await lock.release();
-        const notifications = this.#pendingNotifications.splice(0);
-        for (const notification of notifications) {
-          try {
-            await this.#commands.run("bash", ["-lc", this.#config.notify_command!], {
-              cwd: this.#workspacePath,
-              env: { MERRO_EVENT: notification.event, MERRO_SUBJECT_ID: notification.subjectId, MERRO_MESSAGE: notification.message },
-            });
-          } catch (error) {
-            this.#notify(`notify_command failed: ${errorText(error)}`, "warning");
-          }
-        }
       }
     }
   }

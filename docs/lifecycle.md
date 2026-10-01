@@ -5,8 +5,8 @@ Read before changing states, relations, scheduling, PR or merge flow, reconcilia
 ## Objective flow
 
 1. User states Objective + Projects.
-2. Main inspects repos and GitHub (open issues only), proposes WorkItems and relations.
-3. User approves. Approval covers scope, structure, current plan. Persist exactly one approved issue scope per linked Project: fixed issue numbers, or a query matching all specified labels and an optional milestone title. An empty query covers all open issues.
+2. Main inspects repos and GitHub (open issues only), then calls `merro_propose_objective` to display WorkItems, authoritative relations, unresolved references, and cycles. The proposal uses the same issue-reference analysis as persistence; conversational prose must not add inferred edges.
+3. User approves. `merro_start_objective` requires the displayed proposal ID and identical inputs. A changed scope, generation, or relation graph requires a fresh proposal and approval; proposals expire on restart or replacement. Approval covers scope, structure, current plan. Persist exactly one approved issue scope per linked Project: fixed issue numbers, or a query matching all specified labels and an optional milestone title. An empty query covers all open issues.
 4. New WorkItems inside approved scope are added automatically. Scope expansion, new Project, unregistered Project, splitting an issue → structural Decision.
 5. Rejected structural change → affected WorkItems Blocked, wait for freeform direction.
 

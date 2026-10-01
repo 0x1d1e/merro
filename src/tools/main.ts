@@ -64,6 +64,7 @@ interface MainTool {
 
 export interface MainToolAPI {
   registerTool(tool: MainTool): void;
+  sendMessage?(message: { customType: string; content: string; display: boolean; details?: unknown }): void;
 }
 
 function result(text: string, details: unknown = undefined): { content: Array<{ type: "text"; text: string }>; details: unknown } {
@@ -118,11 +119,13 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
     },
   });
 
-  pi.registerTool({
-    name: "merro_start_objective",
-    label: "Approve Objective and start work",
-    description: "Create an Objective and schedule work. Each Project issue scope is either fixed numbers or a query: all specified labels AND an optional milestone title; an empty query means all open issues. Query scopes automatically include future matching issues. Call only after the user explicitly approves the goal, Project scope, issue scopes, and proposed relations. This call records that approval.",
-    parameters: objectiveParameters,
+  for (const propose of [true, false]) pi.registerTool({
+    name: propose ? "merro_propose_objective" : "merro_start_objective",
+    label: propose ? "Propose Objective and relations" : "Approve Objective and start work",
+    description: propose
+      ? "Analyze the proposed issue scope and display the authoritative relations for user approval. Use this before asking approval; never infer additional relations in conversational prose. Fixed numbers or query scopes (all labels AND optional milestone, empty query means all open issues) are supported. Re-propose after user edits."
+      : "Create an Objective and schedule work only after explicit user approval of the displayed merro_propose_objective result. Supply its proposal_id and exactly the same inputs. Changed graphs require a new proposal and approval. Query scopes include future matching issues.",
+    parameters: propose ? objectiveParameters : Type.Object({ ...objectiveParameters.properties, proposal_id: Type.String() }, { additionalProperties: false }),
     async execute(_id, args) {
       const goal = stringArgument(args, "goal");
       const projectSlugs = stringArray(args, "project_slugs");
@@ -144,7 +147,13 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
         ...(args.priority === undefined ? {} : { priority: args.priority as NonNullable<ObjectiveStartInput["priority"]> }),
         ...(args.max_review_rounds === undefined ? {} : { maxReviewRounds: args.max_review_rounds as NonNullable<ObjectiveStartInput["maxReviewRounds"]> }),
       };
-      const started = await main.startObjective(input);
+      if (propose) {
+        const proposal = await main.proposeObjective(input);
+        const text = `Merro Objective proposal ${proposal.id}\nGoal: ${goal}\nScope: ${JSON.stringify(issues)}\nWorkItems: ${proposal.workItems.map((item) => item.id).join(", ")}\nRelations:\n${proposal.relations.map((edge) => `${edge.from} ${edge.kind} ${edge.to} (${edge.evidence})`).join("\n") || "None"}\nUnresolved: ${JSON.stringify(proposal.unresolved)}\nCycle: ${JSON.stringify(proposal.cycle)}`;
+        pi.sendMessage?.({ customType: "merro-proposal", content: text, display: true, details: proposal });
+        return result(text, proposal);
+      }
+      const started = await main.startObjective(input, stringArgument(args, "proposal_id"));
       await main.runPass();
       const details = { objective: started.objective, workItems: started.workItems };
       return result(`Objective ${started.objective.id} approved with ${started.workItems.length} WorkItem(s): ${started.workItems.map((item) => item.id).join(", ")}.`, details);

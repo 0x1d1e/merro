@@ -228,6 +228,7 @@ export class WorkerRuntime {
     const environment: Record<string, string> = {
       HOME: join(TASK_MOUNT, "home"),
       PI_CODING_AGENT_DIR: join(TASK_MOUNT, "pi-config"),
+      MERRO_RUNTIME: "worker",
       MERRO_TASK_ID: input.taskId,
       MERRO_TASK_ROLE: input.role,
       MERRO_RESULT_PATH: join(TASK_MOUNT, ".merro-result.json"),

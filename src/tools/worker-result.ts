@@ -1,6 +1,8 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { link, mkdir, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 import { Type } from "typebox";
 import { parseImplementResult, parseReviewResult } from "../protocol/result.js";
 import type { TaskRole } from "../domain/model.js";
@@ -25,6 +27,26 @@ const parameters = Type.Object({
 export interface WorkerResultToolOptions {
   role: TaskRole;
   resultPath: string;
+  checkoutPath?: string;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function validateLocalCommit(commit: string, checkoutPath: string): Promise<void> {
+  const correction = "Run `git rev-parse HEAD` and submit the exact commit.";
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commit)) {
+    throw new Error(`Submitted commit must be a full Git commit ID. ${correction}`);
+  }
+  let resolved: string;
+  try {
+    resolved = (await execFileAsync("git", ["rev-parse", "--verify", `${commit}^{commit}`], { cwd: checkoutPath })).stdout.trim();
+  } catch {
+    throw new Error(`Submitted commit ${commit} does not resolve locally. ${correction}`);
+  }
+  const head = (await execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], { cwd: checkoutPath })).stdout.trim();
+  if (resolved !== head) {
+    throw new Error(`Submitted commit ${commit} does not match worker HEAD ${head}. ${correction}`);
+  }
 }
 
 export interface WorkerResultToolAPI {
@@ -47,7 +69,7 @@ export function registerWorkerResultTool(pi: WorkerResultToolAPI, options: Worke
   pi.registerTool({
     name: "merro_submit_result",
     label: "Submit Task result",
-    description: "Submit the final validated result for this Merro Task. Call exactly once after completing or failing the Task.",
+    description: "Submit the final result for this Merro Task. Correct rejected submissions and retry; stop after one accepted submission.",
     parameters,
     async execute(_toolCallId, args) {
       const taskId = typeof process.env.MERRO_TASK_ID === "string" ? process.env.MERRO_TASK_ID : "";
@@ -55,6 +77,11 @@ export function registerWorkerResultTool(pi: WorkerResultToolAPI, options: Worke
       const result = options.role === "implement" ? parseImplementResult(args) : parseReviewResult(args);
       if (result.task_id !== taskId) {
         throw new Error(`task_id mismatch: worker Task is ${taskId}, submitted result is for ${result.task_id}`);
+      }
+      // Failed implementers may report an unusable checkout; preserve that failure contract.
+      if ("reviewed_commit" in result || result.status === "success") {
+        await validateLocalCommit("reviewed_commit" in result ? result.reviewed_commit : result.commit,
+          options.checkoutPath ?? process.cwd());
       }
       await mkdir(dirname(options.resultPath), { recursive: true });
       const temporaryPath = `${options.resultPath}.${randomUUID()}.tmp`;
@@ -77,6 +104,15 @@ export default function merroWorker(pi: WorkerResultToolAPI): void {
   const role = process.env.MERRO_TASK_ROLE;
   const resultPath = process.env.MERRO_RESULT_PATH;
   if (role !== "implement" && role !== "review") throw new Error("MERRO_TASK_ROLE must be implement or review");
-  if (!resultPath) throw new Error("MERRO_RESULT_PATH is missing");
-  registerWorkerResultTool(pi, { role, resultPath });
+  if (process.env.MERRO_RUNTIME !== "worker") throw new Error("MERRO_RUNTIME must be worker");
+  const configPath = process.env.PI_CODING_AGENT_DIR;
+  const checkoutRelative = resultPath ? relative(process.cwd(), resolve(resultPath)) : "";
+  const outsideCheckout = checkoutRelative === ".." || checkoutRelative.startsWith(`..${sep}`) || isAbsolute(checkoutRelative);
+  if (!resultPath || !isAbsolute(resultPath) || !configPath || !isAbsolute(configPath)
+    || basename(resolve(configPath)) !== "pi-config"
+    || resolve(resultPath) !== join(dirname(resolve(configPath)), ".merro-result.json")
+    || !outsideCheckout) {
+    throw new Error("MERRO_RESULT_PATH must be the Task scratch result beside pi-config, outside the checkout");
+  }
+  registerWorkerResultTool(pi, { role, resultPath, checkoutPath: process.cwd() });
 }

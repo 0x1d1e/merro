@@ -15,6 +15,117 @@ import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import { WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
+async function approveProposal(tools: Map<string, Parameters<MainToolAPI["registerTool"]>[0]>, args: Record<string, unknown>) {
+  const proposal = await tools.get("merro_propose_objective")!.execute("propose", args);
+  return tools.get("merro_start_objective")!.execute("approve", { ...args, proposal_id: (proposal.details as { id: string }).id });
+}
+
+test("live status and export queue behind reconciliation without competing for ownership", async (t) => {
+  let hold = false;
+  let release!: () => void;
+  let entered!: () => void;
+  const inside = new Promise<void>((resolve) => { entered = resolve; });
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }],
+    result: () => null, inspect: async () => {
+      if (hold) { entered(); await barrier; }
+      return { alive: true, identityMatches: true, reason: null };
+    } });
+  const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
+  registerCommands({ registerCommand(name, definition) { commands.set(name, definition); } }, harness.workspacePath, harness.main);
+  const messages: string[] = [];
+  const ctx = { ui: { notify(message: string) { messages.push(message); } } };
+  await commands.get("status")!.handler("", ctx);
+  assert.match(messages.pop()!, /0 active objective.*0 active WorkItem.*0 active Task.*0 blocked/);
+  await harness.main.startObjective({ goal: "test", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] });
+  await harness.main.runPass();
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  store.transitionWorkItem("example:issue-2:g1", "Blocked", "task_failed");
+  store.close();
+  hold = true;
+  const pass = harness.main.runPass();
+  await inside;
+  const status = commands.get("status")!.handler("", ctx);
+  const exported = commands.get("merro-export")!.handler("", ctx);
+  await commands.get("unlock")!.handler("", ctx);
+  assert.match(messages.pop()!, /already holds the workspace lock/);
+  release();
+  await Promise.all([pass, status, exported]);
+  assert.ok(messages.some((message) => /1 active objective.*2 active WorkItem.*2 active Task.*1 blocked/.test(message)));
+  const before = await harness.main.exportSnapshot();
+  const snapshot = JSON.parse(await readFile(join(harness.workspacePath, ".merro", "export.json"), "utf8"));
+  assert.deepEqual(snapshot, JSON.parse(JSON.stringify(before)));
+  await commands.get("merro-export")!.handler("", ctx);
+  assert.deepEqual(await harness.main.exportSnapshot(), before);
+  await rm(join(harness.workspacePath, ".merro", "export.json"));
+  await mkdir(join(harness.workspacePath, ".merro", "export.json"));
+  await assert.rejects(async () => commands.get("merro-export")!.handler("", ctx), /EISDIR/);
+});
+
+test("authoritative proposal and approval persist exactly the acceptance graph", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2, 3, 4] }], result: () => null });
+  harness.issues.get("example:2")!.body = "This issue requires #1.";
+  harness.issues.get("example:4")!.body = 'This issue requires #2.\nUses the utility from #3.\nExample: requires #3.\n> requires #3\n`requires #3`\nNot requires #3.\nMay depend on #3.';
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  const displayed: string[] = [];
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { displayed.push(message.content); } }, harness.main);
+  const args = { goal: "acceptance", project_slugs: ["example"], issues: [{ project_slug: "example", numbers: [1, 2, 3, 4] }] };
+  await assert.rejects(tools.get("merro_start_objective")!.execute("no-proposal", args), /proposal_id/);
+  const proposed = await tools.get("merro_propose_objective")!.execute("proposal", args);
+  const proposal = proposed.details as import("../src/runtime/main.js").ObjectiveProposal;
+  const edges = proposal.relations.map((edge) => [edge.from, edge.to]);
+  assert.deepEqual(edges, [["example:issue-2:g1", "example:issue-1:g1"], ["example:issue-4:g1", "example:issue-2:g1"]]);
+  assert.ok(displayed[0]?.includes("example:issue-4:g1 Requires example:issue-2:g1"));
+  assert.ok(!displayed[0]?.includes("example:issue-4:g1 Requires example:issue-3:g1"));
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
+  await tools.get("merro_start_objective")!.execute("approved", { ...args, proposal_id: proposal.id });
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.deepEqual(store.listRelations(), proposal.relations); } finally { store.close(); }
+  assert.deepEqual(harness.launches.map((input) => input.workItemId).sort(), ["example:issue-1:g1", "example:issue-3:g1"]);
+});
+
+test("changed relation graphs require fresh proposal approval and unresolved references stay gated", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }], result: () => null });
+  const input = { goal: "test", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] };
+  const proposal = await harness.main.proposeObjective(input);
+  harness.issues.get("example:2")!.body = "Requires #99.";
+  await assert.rejects(harness.main.startObjective(input, proposal.id), /proposal changed/);
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
+  const updated = await harness.main.proposeObjective(input);
+  assert.deepEqual(updated.unresolved, [{ workItemId: "example:issue-2:g1", references: ["#99"] }]);
+  await harness.main.startObjective(input, updated.id);
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+  assert.equal(harness.launches[0]?.workItemId, "example:issue-1:g1");
+});
+
+test("proposal includes preserved incoming relations on shared active WorkItems", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }], result: () => null });
+  harness.issues.get("example:2")!.body = "Conflicts with #1.";
+  await harness.main.startObjective({ goal: "existing", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] });
+  await harness.main.runPass();
+  const input = { goal: "shared", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1] }] };
+  const proposal = await harness.main.proposeObjective(input);
+  assert.deepEqual(proposal.relations.map((edge) => [edge.kind, edge.from, edge.to]),
+    [["Conflicts", "example:issue-1:g1", "example:issue-2:g1"]]);
+  await harness.main.startObjective(input, proposal.id);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.deepEqual(store.listRelations(), proposal.relations); } finally { store.close(); }
+});
+
+test("proposal surfaces cycles without changing cycle safety semantics", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }] });
+  harness.issues.get("example:1")!.body = "Requires #2.";
+  harness.issues.get("example:2")!.body = "Requires #1.";
+  const input = { goal: "cycle", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] };
+  const proposal = await harness.main.proposeObjective(input);
+  assert.ok(proposal.cycle);
+  await harness.main.startObjective(input, proposal.id);
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+  assert.ok((await harness.main.statusSnapshot()).workItems.every((item) => item.blockedReason === "cycle"));
+});
+
 interface FixtureProject {
   slug: string;
   issueNumbers: number[];
@@ -527,7 +638,7 @@ test("approved label and milestone scope survives restart and discovers matching
   harness.issues.set("example:7", { ...original, milestone: "v1" } as GitHubIssue);
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
-  await tools.get("merro_start_objective")!.execute("approve", {
+  await approveProposal(tools, {
     goal: "Ship all v1 features", project_slugs: ["example"],
     issues: [{ project_slug: "example", query: { labels: ["feature"], milestone: "v1" } }],
   });
@@ -1420,7 +1531,7 @@ test("query scope failures keep a satisfied Objective Active until a fresh check
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
   // The approval check finds work; the next check fails after all attached work becomes satisfied.
-  await tools.get("merro_start_objective")!.execute("approve", {
+  await approveProposal(tools, {
     goal: "Ship features", project_slugs: ["example"],
     issues: [{ project_slug: "example", query: { labels: ["feature"] } }],
   });

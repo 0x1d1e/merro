@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MainOrchestrator } from "../runtime/main.js";
 import { MainAlreadyRunningError, MainLock } from "../runtime/main-lock.js";
@@ -42,7 +43,7 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
   pi.registerCommand("status", {
     description: "Show Merro workspace status",
     async handler(_args, ctx) {
-      const status = await withStore(cwd, (store) => store.statusSummary());
+      const status = main ? await main.statusSummary() : await withStore(cwd, (store) => store.statusSummary());
       report(ctx, `Merro: ${status.objectives} active objective(s), ${status.workItems} active WorkItem(s), ${status.activeTasks} active Task(s), ${status.blockedWorkItems} blocked.`);
     },
   });
@@ -50,9 +51,15 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
   pi.registerCommand("merro-export", {
     description: "Export Merro SQLite state to .merro/export.json",
     async handler(_args, ctx) {
-      const snapshot = await withStore(cwd, (store) => store.snapshot());
+      const snapshot = main ? await main.exportSnapshot() : await withStore(cwd, (store) => store.snapshot());
       const path = join(cwd, ".merro", "export.json");
-      await writeFile(path, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+      const temporary = `${path}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        await rename(temporary, path);
+      } finally {
+        await rm(temporary, { force: true });
+      }
       report(ctx, `Merro state exported to ${path}`);
     },
   });
