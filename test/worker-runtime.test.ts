@@ -1,14 +1,14 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { promisify } from "node:util";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { Project } from "../src/domain/model.js";
-import { WorkerRuntime } from "../src/runtime/worker-runtime.js";
 import type { CommandRunner } from "../src/runtime/commands.js";
+import { WorkerRuntime } from "../src/runtime/worker-runtime.js";
 
 const exists = async (path: string): Promise<boolean> => access(path).then(() => true, () => false);
 const execFileAsync = promisify(execFile);
@@ -122,6 +122,10 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.equal(await readFile(join(stagedConfig, "auth.json"), "utf8"), '{"apiKey":"test-secret"}\n');
   assert.deepEqual((await readdir(stagedConfig)).sort(), ["auth.json", "settings.json"]);
   assert.equal(await exists(environmentFile), false);
+  const extensionRoot = join(root, "runtime", "tasks", "task-1", "merro-runtime");
+  assert.equal(await exists(join(extensionRoot, "tools", "worker-result.js")), true);
+  assert.equal(await exists(join(extensionRoot, "protocol", "result.js")), true);
+  assert.equal(await exists(join(extensionRoot, "node_modules", "typebox")), false);
   const volumeArgs = containerArgs.flatMap((arg, index) => arg === "--volume" ? [containerArgs[index + 1] ?? ""] : []);
   assert.ok(volumeArgs.includes(`${clonePath}:/work:ro`));
   assert.ok(volumeArgs.includes(`${dependencyPath}:/merro-dependencies/1:ro`));
@@ -129,7 +133,8 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(!volumeArgs.some((value) => value.startsWith(`${projectPath}:`)));
   assert.ok(containerArgs.includes("--read-only"));
   assert.ok(containerArgs.includes("--cap-drop"));
-  const start = calls.find((call) => call.file === "tmux" && call.args[0] === "new-session")!;
+  const start = calls.find((call) => call.file === "tmux" && call.args[0] === "new-session");
+  assert.ok(start);
   assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-task-1");
   assert.ok(start.args.includes("@merro_owner"));
   assert.ok(start.args.includes("@merro_task_id"));
@@ -406,6 +411,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   const fakePi = join(binPath, "pi");
   const capturePath = join(root, "pi-invocation.txt");
   await mkdir(binPath);
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: These are literal shell parameter expansions.
   await writeFile(fakePi, "#!/bin/sh\n[ -z \"${GH_TOKEN+x}\" ] && [ -z \"${GITHUB_TOKEN+x}\" ] || exit 91\nprintf '%s\\n' \"$HOME\" \"$PI_CODING_AGENT_DIR\" \"$MERRO_RESULT_PATH\" \"$@\" > \"$MERRO_TEST_CAPTURE\"\n", { mode: 0o700 });
   await execFileAsync("bash", [workerScript], {
     env: {

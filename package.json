@@ -26,7 +26,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepare": "npm run build",
+    "prepare": "npm run build -- --noCheck",
     "prepack": "npm run build",
     "ci": "bash scripts/run-ci.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -35,7 +35,12 @@
   },
   "dependencies": {
     "@types/node": "^22.0.0",
-    "typebox": "1.3.27",
     "typescript": "^5.8.0"
+  },
+  "devDependencies": {
+    "typebox": "1.3.27"
+  },
+  "peerDependencies": {
+    "typebox": "*"
   }
 }

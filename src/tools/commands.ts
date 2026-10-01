@@ -1,8 +1,8 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { MerroStore } from "../store/store.js";
-import { MainAlreadyRunningError, MainLock } from "../runtime/main-lock.js";
 import type { MainOrchestrator } from "../runtime/main.js";
+import { MainAlreadyRunningError, MainLock } from "../runtime/main-lock.js";
+import { MerroStore } from "../store/store.js";
 
 interface CommandContext {
   ui?: { notify(message: string, level?: "info" | "warning" | "error"): void };
@@ -47,7 +47,7 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
     },
   });
 
-  pi.registerCommand("export", {
+  pi.registerCommand("merro-export", {
     description: "Export Merro SQLite state to .merro/export.json",
     async handler(_args, ctx) {
       const snapshot = await withStore(cwd, (store) => store.snapshot());

@@ -1,21 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { createRequire } from "node:module";
-import { existsSync, type Dirent, type Stats } from "node:fs";
+import { type Dirent, existsSync, type Stats } from "node:fs";
+import { chmod, copyFile, link, lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { chmod, copyFile, link, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import type { MerroConfig } from "../config.js";
+import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
-import { CommandError, systemCommandRunner, type CommandRunner } from "./commands.js";
+import { CommandError, type CommandRunner, systemCommandRunner } from "./commands.js";
 
 const GENERIC_IMAGE = "merro-worker:0.1.0";
 const TASK_MOUNT = "/merro-task";
 const CLONE_MOUNT = "/work";
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRoot = findPackageRoot(moduleDirectory);
-const require = createRequire(import.meta.url);
 
 function findPackageRoot(start: string): string {
   let directory = resolve(start);
@@ -607,9 +605,6 @@ export class WorkerRuntime {
     await copyFile(workerExtension, join(tools, "worker-result.js"));
     await copyFile(resultProtocol, join(protocol, "result.js"));
     await writeFile(join(target, "package.json"), '{"type":"module"}\n', { encoding: "utf8", mode: 0o600 });
-    const typeboxEntry = require.resolve("typebox");
-    const typeboxRoot = resolve(dirname(typeboxEntry), "..");
-    await copyTree(typeboxRoot, join(target, "node_modules", "typebox"));
   }
 
   async #hostProcessStartedAt(pid: number): Promise<string> {

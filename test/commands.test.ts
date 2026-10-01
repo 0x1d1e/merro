@@ -1,10 +1,10 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
 import { MainLock } from "../src/runtime/main-lock.js";
-import { registerCommands, type PiExtensionLike } from "../src/tools/commands.js";
+import { type PiExtensionLike, registerCommands } from "../src/tools/commands.js";
 
 type CommandConfig = Parameters<PiExtensionLike["registerCommand"]>[1];
 
@@ -35,6 +35,21 @@ test("commands serialize state access and show workspace status", async (t) => {
 
   assert.match(messages[0] ?? "", /0 active objective/);
   assert.ok(commands.has("unlock"));
+});
+
+test("state export uses a namespaced command without shadowing Pi's built-in export", async (t) => {
+  const cwd = await tempDirectory();
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const commands = commandRegistry(cwd);
+  assert.equal(commands.has("export"), false);
+  const exportState = commands.get("merro-export");
+  assert.ok(exportState);
+  const messages: string[] = [];
+  await exportState.handler("", { ui: { notify: (message) => messages.push(message) } });
+  const path = join(cwd, ".merro", "export.json");
+  const snapshot = JSON.parse(await readFile(path, "utf8"));
+  assert.deepEqual(snapshot.projects, []);
+  assert.ok(messages[0]?.includes(path));
 });
 
 test("unlock does not release a live Main lock", async (t) => {
