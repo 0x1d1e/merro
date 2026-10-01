@@ -615,6 +615,56 @@ test("auto-discovered Requires is rebuilt before the same pass can launch its de
   } finally { store.close(); }
 });
 
+for (const body of ["Requires #99 if optional mode is enabled", "Depends on #99 unless compatibility mode is disabled"]) {
+  test(`conditional suffix does not gate scheduling: ${body}`, async (t) => {
+    const harness = await createHarness(t, { result: () => null });
+    harness.issues.get("example:7")!.body = body;
+    await harness.main.startObjective({
+      goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }],
+    });
+    await harness.restartMain().runPass();
+    assert.equal(harness.launches.length, 1);
+    assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Implementing");
+    assert.equal(harness.notifications.some((message) => message.includes("unresolved references")), false);
+  });
+}
+
+test("apostrophes in affirmative prose preserve Requires and prevent premature scheduling", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7, 8] }], result: () => null,
+  });
+  harness.issues.get("example:8")!.body = "Requires #7 because it's shared";
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7, 8] }],
+  });
+  await harness.restartMain().runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.workItemId), ["example:issue-7:g1"]);
+  assert.equal((await harness.main.statusSnapshot()).workItems.find((item) => item.sourceRef === "8")?.state, "Planned");
+});
+
+test("incomplete v11 Objective scopes remain readable and reconcile after upgrade", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "api", issueNumbers: [7] }, { slug: "web", issueNumbers: [8, 9] }], result: () => null,
+  });
+  const { objective } = await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["api", "web"],
+    issues: [{ projectSlug: "api", query: { labels: ["feature"] } }, { projectSlug: "web", numbers: [8] }],
+  });
+  const database = new DatabaseSync(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    database.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?")
+      .run(JSON.stringify([{ projectSlug: "api", query: { labels: ["feature"] } }]), objective.id);
+    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; UPDATE schema_meta SET version = 11;");
+  } finally { database.close(); }
+  const restarted = harness.restartMain();
+  assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, [
+    { projectSlug: "api", query: { labels: ["feature"] } }, { projectSlug: "web", numbers: [8] },
+  ]);
+  await restarted.runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.workItemId).sort(), ["api:issue-7:g1", "web:issue-8:g1"]);
+  assert.equal((await restarted.statusSnapshot()).workItems.some((item) => item.sourceRef === "9"), false);
+});
+
 test("unresolved Requires outside approved scope gates discovery rather than expanding scope", async (t) => {
   const harness = await createHarness(t);
   harness.issues.get("example:7")!.body = "Requires #99";
@@ -1358,10 +1408,10 @@ test("a base that moves again during implementation requires another verified im
 });
 
 test("legacy Objectives retain fixed selections rather than inferring a query from their goal", async (t) => {
-  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [7, 8] }] });
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [7, 8] }, { slug: "web", issueNumbers: [9] }] });
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    store.createObjective({ id: "legacy", goal: "Ship all features", priority: "normal", state: "Active", projectSlugs: ["example"] });
+    store.createObjective({ id: "legacy", goal: "Ship all features", priority: "normal", state: "Active", projectSlugs: ["example", "web"] });
     store.createWorkItem({
       id: "example:issue-7:g1", projectSlug: "example", sourceType: "issue", sourceRef: "7", generation: 1,
       state: "Ready", priority: "normal", readySince: "2026-01-01T00:00:00Z", blockedReason: null, blockedResumeState: null,
@@ -1372,7 +1422,7 @@ test("legacy Objectives retain fixed selections rather than inferring a query fr
   await harness.restartMain().runPass();
   const snapshot = await harness.main.statusSnapshot();
   assert.equal(snapshot.objectives[0]?.state, "Done");
-  assert.deepEqual(snapshot.objectives[0]?.issueScopes, [{ projectSlug: "example", numbers: [7] }]);
+  assert.deepEqual(snapshot.objectives[0]?.issueScopes, [{ projectSlug: "example", numbers: [7] }, { projectSlug: "web", numbers: [] }]);
   assert.deepEqual(snapshot.workItems.map((item) => item.sourceRef), ["7"]);
 });
 

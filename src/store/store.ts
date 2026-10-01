@@ -113,7 +113,12 @@ export class MerroStore {
 
   constructor(path: string) {
     this.#db = new DatabaseSync(path);
-    this.#migrate();
+    try {
+      this.#migrate();
+    } catch (error) {
+      this.#db.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -263,6 +268,42 @@ export class MerroStore {
         throw error;
       }
     }
+    if (version < 13) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        // v10-v12 could persist scopes for only some linked Projects. Preserve approved
+        // scopes and recover missing selections from attached issues, never from the goal.
+        for (const objective of this.#db.prepare("SELECT id, issue_scopes_json FROM objectives WHERE issue_scopes_json IS NOT NULL").all()) {
+          const scopes: unknown = JSON.parse(String(objective.issue_scopes_json));
+          if (!Array.isArray(scopes)) throw new Error("Objective issue scopes must be an array");
+          const projects = this.#db.prepare("SELECT project_slug FROM objective_projects WHERE objective_id = ? ORDER BY project_slug")
+            .all(String(objective.id)).map((row) => String(row.project_slug));
+          let changed = false;
+          for (const projectSlug of projects) {
+            if (scopes.some((scope: unknown) => typeof scope === "object" && scope !== null
+              && "projectSlug" in scope && scope.projectSlug === projectSlug)) continue;
+            const numbers = this.#db.prepare(`
+              SELECT w.source_ref FROM work_items w
+              JOIN objective_work_items ow ON ow.work_item_id = w.id
+              WHERE ow.objective_id = ? AND w.project_slug = ? AND w.source_type = 'issue'
+            `).all(String(objective.id), projectSlug).map((row) => Number(row.source_ref));
+            scopes.push({ projectSlug, numbers });
+            changed = true;
+          }
+          const normalized = parseObjectiveIssueScopes(scopes, projects, { allowEmptyFixedSelections: true });
+          if (changed) {
+            this.#db.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?").run(JSON.stringify(normalized), String(objective.id));
+            this.appendEvent("Objective", String(objective.id), "scope_restored", normalized);
+          }
+        }
+        this.#db.prepare("UPDATE schema_meta SET version = 13").run();
+        this.#db.exec("COMMIT");
+        version = 13;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -362,7 +403,7 @@ export class MerroStore {
     const objective = this.getObjective(id);
     if (!objective) throw new Error(`unknown Objective: ${id}`);
     if (objective.issueScopes !== undefined) throw new Error("Objective already has approved issue scopes");
-    const normalized = parseObjectiveIssueScopes(scopes, objective.projectSlugs);
+    const normalized = parseObjectiveIssueScopes(scopes, objective.projectSlugs, { allowEmptyFixedSelections: true });
     this.#db.prepare("UPDATE objectives SET issue_scopes_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(normalized), now(), id);
     this.appendEvent("Objective", id, "scope_restored", normalized);
   }
@@ -632,7 +673,7 @@ export class MerroStore {
       state: row.state as Objective["state"],
       projectSlugs,
       maxReviewRounds: reviewRoundLimit(row.max_review_rounds),
-      ...(row.issue_scopes_json === null ? {} : { issueScopes: parseObjectiveIssueScopes(JSON.parse(String(row.issue_scopes_json)), projectSlugs) }),
+      ...(row.issue_scopes_json === null ? {} : { issueScopes: parseObjectiveIssueScopes(JSON.parse(String(row.issue_scopes_json)), projectSlugs, { allowEmptyFixedSelections: true }) }),
     };
   }
 

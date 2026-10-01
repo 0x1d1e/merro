@@ -1,6 +1,10 @@
 import type { IssueQuery, ObjectiveIssueScope } from "./model.js";
 
-export function parseObjectiveIssueScopes(value: unknown, projectSlugs: readonly string[]): ObjectiveIssueScope[] {
+export function parseObjectiveIssueScopes(
+  value: unknown,
+  projectSlugs: readonly string[],
+  options: { allowEmptyFixedSelections?: boolean } = {},
+): ObjectiveIssueScope[] {
   if (!Array.isArray(value)) throw new Error("Objective issue scopes must be an array");
   const linkedProjects = new Set(projectSlugs);
   const projects = new Set<string>();
@@ -12,7 +16,7 @@ export function parseObjectiveIssueScopes(value: unknown, projectSlugs: readonly
     projects.add(row.projectSlug);
     if (("numbers" in row) === ("query" in row)) throw new Error("issue scope requires either numbers or query, not both");
     if ("numbers" in row) {
-      if (!Array.isArray(row.numbers) || row.numbers.length === 0
+      if (!Array.isArray(row.numbers) || (!options.allowEmptyFixedSelections && row.numbers.length === 0)
         || row.numbers.some((number) => !Number.isSafeInteger(number) || number < 1)) throw new Error("issue scope requires positive issue numbers");
       return { projectSlug: row.projectSlug, numbers: [...new Set(row.numbers as number[])].sort((a, b) => a - b) };
     }

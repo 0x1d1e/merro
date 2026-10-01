@@ -1622,14 +1622,14 @@ export class MainOrchestrator {
       let scopes = objective.issueScopes;
       if (scopes === undefined) {
         // Older databases record selections only through attached WorkItems. Never infer a broader query from the goal.
-        const numbers = new Map<string, number[]>();
+        const numbers = new Map<string, number[]>(objective.projectSlugs.map((slug) => [slug, []]));
         for (const item of store.listWorkItems(objective.id)) {
           if (item.sourceType !== "issue") continue;
           const selected = numbers.get(item.projectSlug) ?? [];
           selected.push(Number(item.sourceRef));
           numbers.set(item.projectSlug, selected);
         }
-        scopes = parseObjectiveIssueScopes([...numbers].map(([projectSlug, selected]) => ({ projectSlug, numbers: selected })), objective.projectSlugs);
+        scopes = parseObjectiveIssueScopes([...numbers].map(([projectSlug, selected]) => ({ projectSlug, numbers: selected })), objective.projectSlugs, { allowEmptyFixedSelections: true });
         store.restoreObjectiveIssueScopes(objective.id, scopes);
       }
       const discovered: Array<{ projectSlug: string; issue: GitHubIssue }> = [];

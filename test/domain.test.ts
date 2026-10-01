@@ -38,6 +38,8 @@ test("Objective issue scopes cover exactly the normalized linked Project set", (
   assert.throws(() => parseObjectiveIssueScopes([], ["api"]), /missing issue scope for Project 'api'/);
   assert.throws(() => parseObjectiveIssueScopes(scopes, ["api"]), /unlinked Project/);
   assert.throws(() => parseObjectiveIssueScopes([...scopes, { projectSlug: "api", numbers: [7] }], ["api", "web"]), /duplicate issue scope/);
+  assert.throws(() => parseObjectiveIssueScopes([{ projectSlug: "api", numbers: [] }], ["api"]), /positive issue numbers/);
+  assert.deepEqual(parseObjectiveIssueScopes([{ projectSlug: "api", numbers: [] }], ["api"], { allowEmptyFixedSelections: true }), [{ projectSlug: "api", numbers: [] }]);
 });
 
 test("terminal WorkItems cannot reactivate", () => {
@@ -82,6 +84,31 @@ test("issue relation analysis accepts affirmative references and rejects specula
   assert.deepEqual(analyzeIssueRelations(source, { title: "Work", body: "Requires #99 and #8" }, [source, target]).unresolved, ["#99", "#8"]);
   const crossProject = { ...target, projectSlug: "q" };
   assert.equal(analyzeIssueRelations(source, { title: "Work", body: "Requires q#7" }, [source, crossProject]).relations[0]?.to, target.id);
+});
+
+test("relation inference distinguishes conditional clauses, quotations, and apostrophes", () => {
+  const source = { ...item("source", "Planned"), sourceRef: "8" };
+  const target = { ...item("target", "Ready"), sourceRef: "7" };
+  for (const body of ["Requires #7 if optional mode is enabled", "Depends on #7 unless compatibility mode is disabled",
+    "Requires #99 if optional mode is enabled", '"Requires #99"', "'Requires #99'", '"Requires #99 because it\'s shared"',
+    "'Requires #99 because it's shared'", 'Requires "#99"', "Requires '#99'", "If enabled, requires #99.",
+    "“Requires #99”", "‘Requires #99 because it’s shared’"]) {
+    assert.deepEqual(analyzeIssueRelations(source, { title: "Work", body }, [source, target]), { relations: [], unresolved: [] }, body);
+  }
+  for (const body of ["Requires #7 because it's shared", "Depends on #7 because the team's API is shared",
+    'Requires #7 because the "common" API is shared', "Requires #7 because the teams' API is shared",
+    "Requires #7 because it’s shared",
+    '"Unrelated quotation"; Requires #7', "'Unrelated quotation'; Requires #7",
+    "Requires #7. If enabled, requires #99.", "If enabled, requires #99; requires #7."]) {
+    const result = analyzeIssueRelations(source, { title: "Work", body }, [source, target]);
+    assert.equal(result.relations.length, 1, body);
+    assert.equal(result.relations[0]?.to, target.id, body);
+    assert.deepEqual(result.unresolved, [], body);
+  }
+  for (const projectSlug of ["example", "may", "if"]) {
+    assert.equal(analyzeIssueRelations(source, { title: "Work", body: `Requires ${projectSlug}#7` },
+      [source, { ...target, projectSlug }]).relations[0]?.to, target.id);
+  }
 });
 
 test("Requires cycles are detected", () => {

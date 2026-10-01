@@ -1,5 +1,31 @@
 import type { Relation, WorkItem } from "./model.js";
 
+function maskQuotedSpans(line: string): string {
+  const characters = [...line];
+  const closingQuotes: Record<string, string> = { '"': '"', "'": "'", "“": "”", "‘": "’" };
+  let quote: string | null = null;
+  let start = 0;
+  let escaped = false;
+  for (let index = 0; index < characters.length; index++) {
+    const character = characters[index] ?? "";
+    if (escaped) { escaped = false; continue; }
+    if (character === "\\") { escaped = true; continue; }
+    const followsWord = /[\p{L}\p{N}]/u.test(characters[index - 1] ?? "");
+    // Apostrophes within words, including contractions, are not quotation marks.
+    if ((character === "'" || character === "’") && followsWord
+      && /[\p{L}\p{N}]/u.test(characters[index + 1] ?? "")) continue;
+    const closingQuote = closingQuotes[character];
+    if (quote === character) {
+      characters.fill(" ", start, index + 1);
+      quote = null;
+    } else if (quote === null && closingQuote && (character !== "'" || !followsWord)) {
+      quote = closingQuote;
+      start = index;
+    }
+  }
+  return characters.join("");
+}
+
 /** Conservative inference from affirmative issue-reference statements, never general prose overlap. */
 export function analyzeIssueRelations(
   item: WorkItem,
@@ -12,13 +38,15 @@ export function analyzeIssueRelations(
   for (const raw of `${issue.title}\n${issue.body}`.split(/\r?\n/)) {
     if (/^\s*(```|~~~)/.test(raw)) { fenced = !fenced; continue; }
     if (fenced || /^\s*>/.test(raw)) continue;
-    const line = raw.replace(/`[^`]*`/g, "");
+    const line = maskQuotedSpans(raw.replace(/`[^`]*`/g, " "));
     const statements = /\b(requires|depends on|blocked by|conflicts with)\s*:?\s+((?:(?:[A-Za-z0-9._/-]+)?#[1-9][0-9]*)(?:(?:\s*,\s*|\s+and\s+)(?:[A-Za-z0-9._/-]+)?#[1-9][0-9]*)*)/gi;
     for (const match of line.matchAll(statements)) {
-      // Questions, quoted examples, and negated or conditional statements are not high-confidence evidence.
-      const prefix = line.slice(0, match.index).trim();
-      if (/\b(not|never|no|if|unless|whether|might|may|could|should|example)\b/i.test(prefix)
-        || /\bor\b|[?"']/i.test(line)) continue;
+      // Evaluate both sides of this statement, not unrelated sentences on the same line.
+      const prefix = line.slice(0, match.index).split(/[.;](?:\s+|$)/).at(-1) ?? "";
+      const suffix = line.slice(match.index + match[0].length).split(/[.;](?:\s+|$)/)[0] ?? "";
+      const context = `${prefix} ${suffix}`;
+      if (/\b(not|never|no)\b/i.test(prefix)
+        || /\b(if|unless|whether|might|may|could|should|example|or)\b|\?/i.test(context)) continue;
       const kind = match[1]!.toLowerCase() === "conflicts with" ? "Conflicts" : "Requires";
       for (const reference of match[2]!.matchAll(/([A-Za-z0-9._/-]+)?#([1-9][0-9]*)/g)) {
         const projectSlug = reference[1] ?? item.projectSlug;
