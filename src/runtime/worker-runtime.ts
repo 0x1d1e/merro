@@ -8,6 +8,7 @@ import type { MerroConfig } from "../config.js";
 import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
 import { CommandError, type CommandRunner, systemCommandRunner } from "./commands.js";
+import { dockerBindMount } from "./docker-mount.js";
 
 const GENERIC_IMAGE = "merro-worker:0.1.0";
 const TASK_MOUNT = "/merro-task";
@@ -88,7 +89,7 @@ function taskWindow(input: WorkerLaunchInput): string {
 
 function missingTmuxTarget(error: unknown): boolean {
   const detail = error instanceof CommandError ? error.stderr : String(error);
-  return /no such (?:session|window|pane)|missing (?:session|window|pane)|can't find (?:session|window|pane)|no server running|error connecting.*(?:No such file|Connection refused)/i.test(detail);
+  return /no such (?:session|window|pane)|missing (?:session|window|pane)|(?:can't|cannot|could not) find (?:session|window|pane)|no server running|error connecting.*(?:No such file|Connection refused)/i.test(detail);
 }
 
 function parseDockerInspect(text: string): Record<string, unknown> {
@@ -171,7 +172,7 @@ export class WorkerRuntime {
     }
     const image = await this.#resolveImage(project, settings);
     const args = ["run", "--rm", "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
-      "--env", "HOME=/tmp", "--workdir", CLONE_MOUNT, "--volume", `${resolve(clonePath)}:${CLONE_MOUNT}`];
+      "--env", "HOME=/tmp", "--workdir", CLONE_MOUNT, ...dockerBindMount(resolve(clonePath), CLONE_MOUNT)];
     if (network === "off") args.push("--network", "none");
     args.push(image, "sh", "-lc", settings.setupCommand);
     await this.#commands.run("docker", args);
@@ -262,7 +263,7 @@ export class WorkerRuntime {
         launchSecretPath = environmentPath;
         await mkdir(secretRoot, { recursive: true, mode: 0o700 });
         await writeFile(environmentPath, `${Object.entries(environment).map(([key, value]) => `${key}=${value}`).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
-        const dependencyVolumes = (input.dependencies ?? []).flatMap((dependency) => {
+        const dependencyMounts = (input.dependencies ?? []).flatMap((dependency) => {
           const checkoutPath = resolve(dependency.checkoutPath);
           const checkoutRelative = relative(scratchPath, checkoutPath);
           if (!checkoutRelative || checkoutRelative === ".." || checkoutRelative.startsWith(`..${sep}`) || isAbsolute(checkoutRelative)) {
@@ -271,7 +272,7 @@ export class WorkerRuntime {
           if (!/^\/merro-dependencies\/[1-9][0-9]*$/.test(dependency.mountPath)) {
             throw new Error(`invalid dependency mount path: ${dependency.mountPath}`);
           }
-          return ["--volume", `${checkoutPath}:${dependency.mountPath}:ro`];
+          return dockerBindMount(checkoutPath, dependency.mountPath, { readOnly: true });
         });
         const dockerArgs = [
           "run", "--rm", "--cidfile", cidPath,
@@ -283,9 +284,9 @@ export class WorkerRuntime {
           "--label", `merro.clone_path=${resolve(input.clonePath)}`,
           "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
           "--workdir", CLONE_MOUNT,
-          "--volume", `${resolve(input.clonePath)}:${CLONE_MOUNT}${input.role === "review" ? ":ro" : ""}`,
-          "--volume", `${scratchPath}:${TASK_MOUNT}`,
-          ...dependencyVolumes,
+          ...dockerBindMount(resolve(input.clonePath), CLONE_MOUNT, { readOnly: input.role === "review" }),
+          ...dockerBindMount(scratchPath, TASK_MOUNT),
+          ...dependencyMounts,
           "--network", network === "off" ? "none" : "bridge",
           "--read-only", "--tmpfs", "/tmp:rw,nosuid,size=1g",
           "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -381,9 +382,14 @@ export class WorkerRuntime {
         if (windowLaunchAttempted) {
           const target = paneId ?? `${session}:${window}`;
           await this.#commands.run("tmux", ["kill-window", "-t", target]).catch(async (killError: unknown) => {
-            const exists = await this.#commands.run("tmux", ["display-message", "-p", "-t", target, "#{pane_id}"])
-              .then(() => true, () => false);
-            if (exists) throw killError;
+            if (missingTmuxTarget(killError)) return;
+            try {
+              await this.#commands.run("tmux", ["display-message", "-p", "-t", target, "#{pane_id}"]);
+            } catch (lookupError) {
+              if (missingTmuxTarget(lookupError)) return;
+              throw new AggregateError([killError, lookupError], "Cannot verify tmux rollback target");
+            }
+            throw killError;
           });
           await this.stop(partial, input.taskId);
         }

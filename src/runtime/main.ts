@@ -13,6 +13,7 @@ import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, WorkItemRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
 import { MainLock } from "./main-lock.js";
+import { workItemPathName } from "./filesystem-identity.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
@@ -657,12 +658,11 @@ export class MainOrchestrator {
     let workerLaunchStarted = false;
     try {
       assertProjectSlug(project.slug);
-      if (item.id === "." || item.id === ".." || /[/\\\\]/.test(item.id)) throw new Error(`invalid WorkItem path identity: ${item.id}`);
       const issue = item.sourceType === "issue" ? await this.#github.issue(project, Number(item.sourceRef)) : null;
       if (!runtime.clonePath || !runtime.branchName) {
         const localSlug = item.sourceRef.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 44) || "work";
         const branch = issue ? branchName(issue, item.generation) : `chore/local-${localSlug}-g${item.generation}`;
-        const clonePath = join(this.#workRoot, project.slug, item.id);
+        const clonePath = join(this.#workRoot, project.slug, workItemPathName(item.id));
         const clone = await this.#git.createWorkItemClone(project, clonePath, branch);
         runtime = { ...runtime, branchName: clone.branchName, clonePath: clone.path, baseCommit: clone.baseCommit };
         store.saveWorkItemRuntime(runtime);

@@ -4,11 +4,11 @@ Read before changing Task files, the result tool, container/tmux launch, process
 
 ## Isolation
 
-- Each WorkItem gets a full local clone at `<work_root>/<project>/<workitem>/` (`git clone --local` from the source repo, then remotes re-pointed to the real base/push URLs). The source repo is never mounted or modified. Same clone serves implement, rework, review, PR, merge.
+- Each WorkItem gets a full local clone at `<work_root>/<project>/<derived-name>/` (`git clone --local` from the source repo, then remotes re-pointed to the real base/push URLs). New clone names are bounded readable slugs with a stable hash of the authoritative WorkItem ID; persisted clone paths remain unchanged. The source repo is never mounted or modified. Same clone serves implement, rework, review, PR, merge.
 - Clone creation runs the Project's setup command (deps, env files) inside the image.
 - Review of a dependency Project uses a throwaway read-only checkout at the exact merged commit. No cache in v0.1.
 - Task = one Docker container running Pi as a foreground process in one tmux window. Attach with `tmux attach -t merro-<project>`, then the window.
-- Mounts: clone (rw for implement, ro for review), per-Task scratch dir, copied Pi config dir (`pi_config: copy`, never the real one) or empty (`clean`). Model auth via env passthrough or copied auth file.
+- Mounts: clone (rw for implement, ro for review), per-Task scratch dir, copied Pi config dir (`pi_config: copy`, never the real one) or empty (`clean`). Model auth via env passthrough or copied auth file. Docker bind mounts use CSV-escaped `--mount` fields, never colon-delimited host-path parsing, including setup and dependency checkouts.
 - `worker_github: on` passes `GH_TOKEN` derived from the user's `gh` auth. Push, PR, and merge remain Main-only by contract. Branch protection is the real guard. `off` removes the token.
 - Network on by default. `sandbox: none` runs the same Task on the host in the clone.
 - Image: Merro generic (Node, git, common build tools), overridable per Project by image name or Dockerfile.

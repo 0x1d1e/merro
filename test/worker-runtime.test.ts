@@ -7,7 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { Project } from "../src/domain/model.js";
-import type { CommandRunner } from "../src/runtime/commands.js";
+import { CommandError, type CommandRunner } from "../src/runtime/commands.js";
 import { WorkerRuntime } from "../src/runtime/worker-runtime.js";
 
 const exists = async (path: string): Promise<boolean> => access(path).then(() => true, () => false);
@@ -17,9 +17,10 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   const root = await mkdtemp(join(tmpdir(), "merro-worker-runtime-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const projectPath = join(root, "source-project");
-  const clonePath = join(root, "worker-clone");
+  const clonePath = join(root, 'worker: clone,"quoted",it\'s');
+  const workspacePath = join(root, 'runtime: workspace,"quoted"');
   const piConfigPath = join(root, "pi-config");
-  const dependencyPath = join(root, "runtime", "tasks", "task-1", "dependencies", "1");
+  const dependencyPath = join(workspacePath, "tasks", "task-1", "dependencies", "dependency: checkout");
   await Promise.all([mkdir(projectPath), mkdir(clonePath), mkdir(piConfigPath), mkdir(dependencyPath, { recursive: true })]);
   await writeFile(join(piConfigPath, "settings.json"), '{"theme":"host-theme"}\n');
   await writeFile(join(piConfigPath, "auth.json"), '{"apiKey":"test-secret"}\n');
@@ -49,12 +50,13 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
           return { stdout: "", stderr: "" };
         }
         if (args[0] === "show-option") {
-          return { stdout: args.at(-1) === "@merro_project" ? "example\n" : await readFile(join(root, "runtime", "workspace-owner"), "utf8"), stderr: "" };
+          return { stdout: args.at(-1) === "@merro_project" ? "example\n" : await readFile(join(workspacePath, "workspace-owner"), "utf8"), stderr: "" };
         }
         if (args[0] === "new-window" || args[0] === "new-session") {
           sessionExists = true;
           const launchCommand = String(args[args.indexOf("-c") + 2]);
-          const tokens = [...launchCommand.matchAll(/'([^']*)'/g)].map((match) => match[1] ?? "");
+          const output = await execFileAsync("sh", ["-c", `set -- ${launchCommand}; printf '%s\\0' "$@"`]);
+          const tokens = output.stdout.split("\0").slice(0, -1);
           const cidIndex = tokens.indexOf("--cidfile");
           const envIndex = tokens.indexOf("--env-file");
           assert.ok(cidIndex >= 0 && envIndex >= 0);
@@ -91,14 +93,14 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   };
 
   const runtime = new WorkerRuntime({
-    workspacePath: join(root, "runtime"),
+    workspacePath,
     config: { ...DEFAULT_CONFIG, sandbox: "none", pi_config: "copy" },
     commands,
     piConfigPath,
   });
   const record = await runtime.launch({
     taskId: "task-1",
-    workItemId: "work-1",
+    workItemId: "merro-acceptance:issue-1:g1",
     role: "review",
     project,
     clonePath,
@@ -117,20 +119,23 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
 
   assert.equal(record.containerId, containerId);
   assert.equal(record.processPid, 1);
-  const stagedConfig = join(root, "runtime", "tasks", "task-1", "pi-config");
+  const stagedConfig = join(workspacePath, "tasks", "task-1", "pi-config");
   assert.equal(await readFile(join(stagedConfig, "settings.json"), "utf8"), '{"theme":"host-theme"}\n');
   assert.equal(await readFile(join(stagedConfig, "auth.json"), "utf8"), '{"apiKey":"test-secret"}\n');
   assert.deepEqual((await readdir(stagedConfig)).sort(), ["auth.json", "settings.json"]);
   assert.equal(await exists(environmentFile), false);
-  const extensionRoot = join(root, "runtime", "tasks", "task-1", "merro-runtime");
+  const extensionRoot = join(workspacePath, "tasks", "task-1", "merro-runtime");
   assert.equal(await exists(join(extensionRoot, "tools", "worker-result.js")), true);
   assert.equal(await exists(join(extensionRoot, "protocol", "result.js")), true);
   assert.equal(await exists(join(extensionRoot, "node_modules", "typebox")), false);
-  const volumeArgs = containerArgs.flatMap((arg, index) => arg === "--volume" ? [containerArgs[index + 1] ?? ""] : []);
-  assert.ok(volumeArgs.includes(`${clonePath}:/work:ro`));
-  assert.ok(volumeArgs.includes(`${dependencyPath}:/merro-dependencies/1:ro`));
-  assert.ok(volumeArgs.some((value) => value.includes("/merro-task")));
-  assert.ok(!volumeArgs.some((value) => value.startsWith(`${projectPath}:`)));
+  const mountArgs = containerArgs.flatMap((arg, index) => arg === "--mount" ? [containerArgs[index + 1] ?? ""] : []);
+  assert.ok(!containerArgs.includes("--volume"));
+  assert.deepEqual(mountArgs, [
+    `type=bind,"src=${clonePath.replaceAll('"', '""')}",dst=/work,readonly`,
+    `type=bind,"src=${workspacePath.replaceAll('"', '""')}/tasks/task-1",dst=/merro-task`,
+    `type=bind,"src=${dependencyPath.replaceAll('"', '""')}",dst=/merro-dependencies/1,readonly`,
+  ]);
+  assert.ok(!mountArgs.some((value) => value.includes(projectPath)));
   assert.ok(containerArgs.includes("--read-only"));
   assert.ok(containerArgs.includes("--cap-drop"));
   const start = calls.find((call) => call.file === "tmux" && call.args[0] === "new-session");
@@ -138,26 +143,31 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-task-1");
   assert.ok(start.args.includes("@merro_owner"));
   assert.ok(start.args.includes("@merro_task_id"));
-  const owner = (await readFile(join(root, "runtime", "workspace-owner"), "utf8")).trim();
+  const owner = (await readFile(join(workspacePath, "workspace-owner"), "utf8")).trim();
   assert.ok(containerArgs.includes(`merro.owner=${owner}`));
   assert.equal(start.args[start.args.indexOf("MERRO_OWNER") + 1], owner);
   assert.equal(start.args[start.args.indexOf("@merro_owner") + 1], owner);
-  assert.ok(containerArgs.includes("merro.work_item_id=work-1"));
+  assert.ok(containerArgs.includes("merro.work_item_id=merro-acceptance:issue-1:g1"));
+  assert.ok(start.args.includes("merro-acceptance:issue-1:g1"));
   assert.ok(calls.some((call) => call.file === "docker" && call.args[0] === "build"));
-  assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), true);
+  assert.equal(await exists(join(workspacePath, "container-ids", "task-1.cid")), true);
 
   await runtime.cleanup(record);
-  assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), false);
+  assert.equal(await exists(join(workspacePath, "container-ids", "task-1.cid")), false);
   assert.equal(await exists(record.resultPath), false);
 
   const movedPath = join(root, "moved-project");
   await rename(projectPath, movedPath);
   containerId = "b".repeat(64);
-  const restarted = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: DEFAULT_CONFIG, commands, piConfigPath });
-  const successor = await restarted.launch({ taskId: "task-2", workItemId: "work-2", role: "implement",
-    project: { ...project, path: movedPath }, clonePath, taskFile: "Implement after Project adoption.",
+  const restarted = new WorkerRuntime({ workspacePath, config: DEFAULT_CONFIG, commands, piConfigPath });
+  const legacyClonePath = join(root, "merro-acceptance:issue-1:g1");
+  await mkdir(legacyClonePath);
+  const successor = await restarted.launch({ taskId: "task-2", workItemId: "merro-acceptance:issue-1:g1", role: "implement",
+    project: { ...project, path: movedPath }, clonePath: legacyClonePath, taskFile: "Implement after Project adoption.",
     expectedCommit: "b".repeat(40), projectSettings: null });
   assert.equal(successor.containerId, containerId);
+  assert.equal(successor.clonePath, legacyClonePath);
+  assert.ok(containerArgs.includes(`type=bind,src=${legacyClonePath},dst=/work`));
   assert.ok(containerArgs.includes(`merro.owner=${owner}`));
   assert.equal(calls.filter(call => call.file === "tmux" && call.args[0] === "new-session").length, 1);
   assert.equal(calls.filter(call => call.file === "tmux" && call.args[0] === "new-window").length, 1);
@@ -283,6 +293,98 @@ test("partial host launch rolls back the owned tmux window before removing Task 
   assert.equal(await exists(join(root, ".merro-task.md")), false);
 });
 
+for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"] as const) {
+  test(`Docker launch rollback handles ${scenario} without obscuring the launch error`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "merro-docker-rollback-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const workspacePath = join(root, "runtime");
+    const taskId = "failed-docker";
+    const cidPath = join(workspacePath, "container-ids", `${taskId}.cid`);
+    const original = new Error("Docker launch failed before recording worker identity");
+    let containerAlive = scenario === "unrecorded container";
+    let stops = 0;
+    const runtime = new WorkerRuntime({ workspacePath,
+      config: { ...DEFAULT_CONFIG, worker_github: "on", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
+        async run(file, args) {
+          if (file === "gh") return { stdout: "launch-secret\n", stderr: "" };
+          if (file === "tmux") {
+            if (args[0] === "has-session") throw new Error("missing session");
+            if (args[0] === "new-session") {
+              if (scenario === "missing cidfile") return { stdout: "%5", stderr: "" };
+              if (containerAlive) await writeFile(cidPath, "a".repeat(64));
+              throw original;
+            }
+            if (args[0] === "kill-window" || args[0] === "display-message") {
+              const detail = "could not find pane";
+              throw new CommandError(file, args, Object.assign(new Error(detail), { code: 1 }), detail);
+            }
+          }
+          if (file === "docker") {
+            if (args[0] === "image") return { stdout: "[]", stderr: "" };
+            if (args[0] === "inspect") {
+              if (!containerAlive) throw new Error("No such container");
+              assert.equal(args[1], `merro-${taskId}`);
+              return { stdout: JSON.stringify([{ Id: "a".repeat(64), State: { Running: true }, Config: { Labels: { "merro.task_id": taskId } } }]), stderr: "" };
+            }
+            if (args[0] === "exec") return { stdout: "pi --print", stderr: "" };
+            if (args[0] === "stop") { stops++; containerAlive = false; return { stdout: "", stderr: "" }; }
+          }
+          throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+        },
+      },
+    });
+    const input = { taskId, workItemId: "merro-acceptance:issue-1:g1", role: "implement" as const,
+      project: { slug: "rollback", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" },
+      clonePath: root, taskFile: "implement", expectedCommit: "a".repeat(40), projectSettings: null };
+    await assert.rejects(runtime.launch(input), (error: unknown) => {
+      if (scenario === "missing cidfile") assert.match(String(error), /Docker did not start a container \(missing cidfile/);
+      else assert.equal(error, original);
+      assert.ok(!(error instanceof AggregateError));
+      return true;
+    });
+    assert.equal(containerAlive, false);
+    assert.equal(stops, scenario === "unrecorded container" ? 1 : 0);
+    assert.equal(await exists(cidPath), false);
+    assert.equal(await exists(join(workspacePath, "tasks", taskId)), false);
+    assert.equal(await exists(join(root, ".merro-task.md")), false);
+    assert.deepEqual(await readdir(join(workspacePath, "launch-secrets")), []);
+  });
+}
+
+test("Docker launch rollback reports real tmux cleanup failures alongside the original error", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-docker-rollback-error-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const original = new Error("original launch error");
+  const killError = new Error("tmux permission denied");
+  const lookupError = new Error("tmux connection lost");
+  const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"),
+    config: { ...DEFAULT_CONFIG, worker_github: "off", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
+      async run(file, args) {
+        if (file === "docker" && args[0] === "image") return { stdout: "[]", stderr: "" };
+        if (file === "tmux") {
+          if (args[0] === "has-session") throw new Error("missing session");
+          if (args[0] === "new-session") throw original;
+          if (args[0] === "kill-window") throw killError;
+          if (args[0] === "display-message") throw lookupError;
+        }
+        throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+      },
+    },
+  });
+  await assert.rejects(runtime.launch({ taskId: "failed", workItemId: "work", role: "implement",
+    project: { slug: "rollback", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" },
+    clonePath: root, taskFile: "implement", expectedCommit: "a".repeat(40), projectSettings: null }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors[0], original);
+    const rollback = error.errors[1] as AggregateError;
+    assert.deepEqual(rollback.errors, [killError, lookupError]);
+    return true;
+  });
+  assert.deepEqual(await readdir(join(root, "runtime", "launch-secrets")), []);
+  // Keep Task artifacts when process cleanup cannot be confirmed.
+  assert.equal(await exists(join(root, "runtime", "tasks", "failed")), true);
+});
+
 test("host network isolation is rejected before any setup command runs", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-setup-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -295,9 +397,10 @@ test("host network isolation is rejected before any setup command runs", async (
   assert.equal(await exists(marker), false);
 });
 
-test("Docker setup uses the worker UID and GID", async (t) => {
+test("Docker setup uses structured writable bind mounts and the worker UID and GID", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-setup-user-"));
   t.after(() => rm(root, { recursive: true, force: true }));
+  const clonePath = join(root, "clone: setup space");
   let setupArgs: readonly string[] = [];
   const runtime = new WorkerRuntime({ workspacePath: root, config: DEFAULT_CONFIG, commands: {
     async run(file, args) {
@@ -306,12 +409,14 @@ test("Docker setup uses the worker UID and GID", async (t) => {
       return { stdout: "", stderr: "" };
     },
   } });
-  await runtime.prepareClone({ slug: "setup", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, root, {
+  await runtime.prepareClone({ slug: "setup", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, clonePath, {
     guidance: "", image: "test-image", setupCommand: "npm install", sandbox: "docker", network: "on", workerGithub: false,
   });
   const userIndex = setupArgs.indexOf("--user");
   assert.ok(userIndex >= 0);
   assert.equal(setupArgs[userIndex + 1], `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`);
+  assert.ok(!setupArgs.includes("--volume"));
+  assert.equal(setupArgs[setupArgs.indexOf("--mount") + 1], `type=bind,src=${clonePath},dst=/work`);
 });
 
 test("sandbox none launches Pi with host paths and no Docker dependency", async (t) => {
