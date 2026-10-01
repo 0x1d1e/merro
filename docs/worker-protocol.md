@@ -24,7 +24,7 @@ Read before changing Task files, the result tool, container/tmux launch, process
 ## Process identity
 
 Runtime record per active Task: Task ID, WorkItem, role, Project, tmux session/window, container ID, Pi PID inside container, start time, clone path.
-Host identity uses the pane ID, PID, and OS process start time (`ps`), not the unsupported tmux `pane_start_time` format. Window existence alone is not proof. Gone process + no valid result → failed. Identity mismatch → failed. No rediscovery or adoption.
+Host identity uses the pane ID, PID, and OS process start time (`ps`), not the unsupported tmux `pane_start_time` format. Window existence alone is not proof. Gone process + no valid result → failed. Identity mismatch → failed. No rediscovery or adoption. Owned-worker inventory may use finalized runtime identity to deduplicate a legacy Docker pane and container and recover their WorkItem; the worker remains an orphan, never an active Task. Match pane, session, and window together to avoid reusing another Task's pane ID; fall back to session/window only when the stored pane ID is absent.
 Pi exited but valid matching result exists → consume it.
 
 ## Task input: `.merro-task.md`

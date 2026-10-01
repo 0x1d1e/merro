@@ -88,6 +88,23 @@ for (const activeEndpoint of ["a", "b"]) {
   });
 }
 
+for (const occupiedEndpoint of ["a", "b"]) {
+  test(`automatic conflicts touching orphan ${occupiedEndpoint} survive successful analysis until exit`, () => {
+    const store = makeStore();
+    try {
+      store.createWorkItem(item("a"));
+      store.createWorkItem(item("b"));
+      const conflict = { kind: "Conflicts" as const, from: "a", to: "b", confidence: "high" as const,
+        rationale: "Scoped conflict", evidence: "Conflicts with #8" };
+      store.rebuildAutomaticRelations(["a", "b"], [conflict]);
+      store.rebuildAutomaticRelations(["a", "b"], [], [occupiedEndpoint]);
+      assert.deepEqual(store.listRelations(), [conflict]);
+      store.rebuildAutomaticRelations(["a", "b"], []);
+      assert.equal(store.listRelations().length, 0);
+    } finally { store.close(); }
+  });
+}
+
 test("runtime metadata, relation history, and Decisions survive store round trips", () => {
   const store = makeStore();
   try {

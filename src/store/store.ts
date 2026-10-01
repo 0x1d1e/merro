@@ -414,13 +414,14 @@ export class MerroStore {
     }
   }
 
-  rebuildAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[]): void {
+  rebuildAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[], occupiedWorkItemIds: readonly string[] = []): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE automatic = 1 AND kind = 'Requires' AND from_work_item_id = ?");
       for (const id of analyzedIds) deactivate.run(id);
       // Either endpoint may supply a symmetric relation. Preserve it until both were checked successfully.
       const analyzed = new Set(analyzedIds);
+      const occupied = new Set(occupiedWorkItemIds);
       const deactivateConflict = this.#db.prepare(`
         UPDATE relations SET active = 0
         WHERE automatic = 1 AND kind = 'Conflicts' AND from_work_item_id = ? AND to_work_item_id = ?
@@ -430,7 +431,8 @@ export class MerroStore {
           )
       `);
       for (const relation of this.#db.prepare("SELECT from_work_item_id, to_work_item_id FROM relations WHERE automatic = 1 AND kind = 'Conflicts' AND active = 1").all()) {
-        if (analyzed.has(String(relation.from_work_item_id)) && analyzed.has(String(relation.to_work_item_id))) {
+        if (analyzed.has(String(relation.from_work_item_id)) && analyzed.has(String(relation.to_work_item_id))
+          && !occupied.has(String(relation.from_work_item_id)) && !occupied.has(String(relation.to_work_item_id))) {
           deactivateConflict.run(String(relation.from_work_item_id), String(relation.to_work_item_id));
         }
       }

@@ -826,6 +826,24 @@ for (const labeled of [true, false]) {
   });
 }
 
+test("legacy pane matching does not confuse a current Task with a finalized Task reusing its pane ID", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, { ownedWorkers: async () => workers,
+    result: (_input, number, result) => number === 1 ? result : null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+  });
+  await harness.main.startObjective({ goal: "Ship", projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }] });
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const current = harness.launches[1]!;
+  workers.push({ taskId: null, projectSlug: "example", workItemId: current.workItemId,
+    clonePath: current.clonePath, tmuxSession: "merro-example", tmuxWindow: `review-${current.taskId}`, paneId: "%1", containerId: null });
+  await harness.restartMain().runPass();
+  assert.equal(harness.notifications.some((message) => /orphan|Worker for finalized Task/i.test(message)), false);
+  assert.equal(harness.launches.length, 2);
+});
+
 test("live workers attached to finalized Tasks gate successors and retain their artifacts", async (t) => {
   const workers: OwnedWorker[] = [];
   const harness = await createHarness(t, { taskArtifacts: true, ownedWorkers: async () => workers });
@@ -843,6 +861,82 @@ test("live workers attached to finalized Tasks gate successors and retain their 
   assert.ok(harness.notifications.some((message) => message.includes("Worker for finalized Task")));
   assert.match(await readFile(join(dirname(runtime.resultPath), "pi-config", "auth.json"), "utf8"), /auth/);
   assert.equal(await readFile(runtime.taskFilePath, "utf8"), input.taskFile);
+});
+
+test("unsafe Projects still refresh query scopes without obsoleting orphan-owned work", async (t) => {
+  let orphan = true;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7, 8] }],
+    ownedWorkers: async (project) => orphan ? [{ taskId: "missing", projectSlug: project.slug,
+      workItemId: "example:issue-7:g1", clonePath: "/clone", tmuxSession: null,
+      tmuxWindow: null, paneId: null, containerId: "a".repeat(64) }] : [],
+  });
+  harness.issues.get("example:8")!.labels = [];
+  const { objective } = await harness.main.startObjective({ goal: "Features", projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", query: { labels: ["feature"] } }] });
+  harness.issues.get("example:7")!.labels = [];
+  harness.issues.get("example:8")!.labels = ["feature"];
+  harness.issues.get("example:7")!.body = "Conflicts with #8";
+  await harness.main.runPass();
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  assert.deepEqual(store.listWorkItems(objective.id).map((item) => item.sourceRef), ["8"]);
+  assert.notEqual(store.getWorkItem("example:issue-7:g1")!.state, "Obsolete");
+  assert.equal(store.listRelations().filter((relation) => relation.kind === "Conflicts").length, 1);
+  store.close();
+  assert.equal(harness.launches.length, 0);
+  orphan = false;
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).workItems.find((item) => item.sourceRef === "7")!.state, "Obsolete");
+  assert.deepEqual(harness.launches.map((launch) => launch.workItemId), ["example:issue-8:g1"]);
+});
+
+for (const mutation of ["issue_closed", "pr_closed", "pr_merged"] as const) {
+  test(`orphan gating still reconciles ${mutation} without clone cleanup`, async (t) => {
+    const workers: OwnedWorker[] = [];
+    const harness = await createHarness(t, { ownedWorkers: async () => workers, taskArtifacts: true });
+    await harness.main.startObjective({ goal: "Ship", projectSlugs: ["example"],
+      issues: [{ projectSlug: "example", numbers: [7] }] });
+    await harness.main.runPass();
+    await harness.main.runPass();
+    await harness.main.runPass();
+    assert.equal(harness.launches.length, 2);
+    const input = harness.launches[1]!;
+    workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: input.workItemId,
+      clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: "legacy", paneId: "%9", containerId: null });
+    if (mutation === "issue_closed") harness.setIssueState("example", 7, "CLOSED");
+    else harness.setPullRequest(13, mutation === "pr_merged"
+      ? { state: "CLOSED", mergedAt: "2026-01-02T00:00:00Z", mergeCommitSha: "e".repeat(40) }
+      : { state: "CLOSED" });
+    await harness.restartMain().runPass();
+    const snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.workItems[0]!.state, mutation === "pr_closed" ? "Blocked" : "Done");
+    if (mutation === "pr_closed") assert.equal(snapshot.workItems[0]!.blockedReason, "pr_closed");
+    assert.equal(snapshot.decisions.length, 0);
+    assert.equal(harness.deletedClones.length, 0);
+    assert.equal(harness.launches.length, 2);
+  });
+}
+
+test("unsafe Projects still consume recorded Task results without obsolete transitions or cleanup", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, { taskArtifacts: true, ownedWorkers: async () => workers });
+  await harness.main.startObjective({ goal: "Ship", projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }] });
+  await harness.main.runPass();
+  const input = harness.launches[0]!;
+  workers.push({ taskId: "missing", projectSlug: "example", workItemId: input.workItemId,
+    clonePath: input.clonePath, tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
+  await harness.main.stopObjectives();
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.tasks[0]!.status, "finalized");
+  assert.equal(snapshot.tasks[0]!.outcome, "success");
+  assert.equal(snapshot.workItems[0]!.state, "Implementing");
+  assert.equal(harness.launches.length, 1);
+  assert.equal(harness.cleanupCalls.length, 0);
+  workers.length = 0;
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Obsolete");
+  assert.deepEqual(harness.cleanupCalls, [input.taskId]);
 });
 
 test("unidentified orphan worker gates the workspace until its ownership can be established", async (t) => {
@@ -877,6 +971,71 @@ test("orphan WorkItems remain active conflict endpoints across Projects", async 
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
 });
+
+test("orphan safety gating still discovers new cross-Project conflicts", async (t) => {
+  let orphan = true;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+    ownedWorkers: async (project) => project.slug === "example" && orphan ? [{
+      taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+      tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64),
+    }] : [],
+  });
+  await harness.main.startObjective({ goal: "Both", projectSlugs: ["example", "other"],
+    issues: [{ projectSlug: "example", numbers: [7] }, { projectSlug: "other", numbers: [8] }] });
+  harness.issues.get("example:7")!.body = "Conflicts with other#8";
+  await harness.restartMain().runPass();
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  assert.equal(store.listRelations().filter((relation) => relation.kind === "Conflicts").length, 1);
+  store.close();
+  assert.equal(harness.launches.length, 0);
+  // Removing current evidence must not free an occupied conflict endpoint.
+  harness.issues.get("example:7")!.body = "No relation declarations.";
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+  orphan = false;
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 2);
+});
+
+for (const identity of ["pane", "window"] as const) {
+  for (const cap of [1, 2]) {
+    test(`legacy finalized Docker worker consumes one slot via ${identity} identity (cap ${cap})`, async (t) => {
+      const workers: OwnedWorker[] = [];
+      const harness = await createHarness(t, {
+        maxConcurrentTasks: cap, result: () => null, taskArtifacts: true,
+        inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+        projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+        // Legacy containers without Project labels can appear in every Project inventory.
+        ownedWorkers: async (project) => project.slug === "example" ? workers : workers.filter((worker) => worker.containerId !== null),
+      });
+      await harness.main.startObjective({ goal: "A", projectSlugs: ["example"],
+        issues: [{ projectSlug: "example", numbers: [7] }] });
+      await harness.main.runPass();
+      const input = harness.launches[0]!;
+      const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+      const runtime = store.getTaskRuntime(input.taskId)!;
+      runtime.containerId = "a".repeat(64);
+      runtime.paneId = identity === "pane" ? "%9" : null;
+      store.saveTaskRuntime(runtime);
+      store.finalizeTask({ id: input.taskId, outcome: "failed", summary: "Finalized legacy record", resultJson: "{}" });
+      store.close();
+      workers.push(
+        { taskId: null, projectSlug: "example", workItemId: null, clonePath: null,
+          tmuxSession: runtime.tmuxSession, tmuxWindow: runtime.tmuxWindow, paneId: "%9", containerId: null },
+        { taskId: input.taskId, projectSlug: "example", workItemId: null, clonePath: input.clonePath,
+          tmuxSession: null, tmuxWindow: null, paneId: null, containerId: runtime.containerId },
+      );
+      await harness.main.startObjective({ goal: "B", projectSlugs: ["other"],
+        issues: [{ projectSlug: "other", numbers: [8] }] });
+      await harness.restartMain().runPass();
+      assert.deepEqual(harness.launches.slice(1).map((launch) => launch.project.slug), cap === 2 ? ["other"] : []);
+      assert.ok(harness.notifications.some((message) => message.includes("Worker for finalized Task")));
+      assert.equal(await readFile(runtime.taskFilePath, "utf8"), input.taskFile);
+      assert.equal(harness.cleanupCalls.includes(input.taskId), false);
+    });
+  }
+}
 
 for (const cap of [1, 2]) {
   test(`orphan Docker worker and its pane consume one concurrency slot (cap ${cap})`, async (t) => {

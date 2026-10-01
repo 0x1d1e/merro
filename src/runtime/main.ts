@@ -559,29 +559,28 @@ export class MainOrchestrator {
       try {
         const unavailableProjects = await this.#reconcileProjects(store);
         const orphans = await this.#reconcileWorkers(store, unsafeProjects);
-        for (const slug of unsafeProjects) unavailableProjects.add(slug);
         const scopeGates = new Set<string>();
         for (const objective of store.listObjectives()) {
           if (objective.state === "Active" && objective.issueScopes?.some((scope) => "query" in scope)) {
-            await this.#refreshObjectiveScope(store, objective, unavailableProjects, scopeGates);
+            await this.#refreshObjectiveScope(store, objective, unavailableProjects, scopeGates, unsafeProjects);
           }
         }
-        await this.#reconcileIssues(store, unavailableProjects);
-        await this.#reconcileTasks(store, unavailableProjects);
+        await this.#reconcileIssues(store, unavailableProjects, orphans.workItemIds);
+        await this.#reconcileTasks(store, unavailableProjects, unsafeProjects);
         store.settleScopeDetachments();
         for (const item of store.listWorkItems()) {
           if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
         }
-        await this.#reconcilePullRequests(store, unavailableProjects);
-        const relationGates = await this.#rebuildRelations(store, unavailableProjects);
+        await this.#reconcilePullRequests(store, unavailableProjects, unsafeProjects);
+        const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.workItemIds);
         for (const id of scopeGates) relationGates.add(id);
-        this.#deriveReady(store, unavailableProjects, relationGates);
+        this.#deriveReady(store, unavailableProjects, relationGates, unsafeProjects, orphans.workItemIds);
         const tasks = store.listTasks();
         const active = tasks.filter((task) => task.status === "active");
         const items = store.listWorkItems();
         const result = schedule({
           workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id)
-            && !unavailableProjects.has(item.projectSlug) && !relationGates.has(item.id)),
+            && !unavailableProjects.has(item.projectSlug) && !unsafeProjects.has(item.projectSlug) && !relationGates.has(item.id)),
           relations: store.listRelations(),
           activeTaskCount: active.length + orphans.count,
           activeWorkItemIds: [...active.map((task) => task.workItemId), ...orphans.workItemIds],
@@ -592,7 +591,7 @@ export class MainOrchestrator {
           if (item.state === "Ready") store.transitionWorkItem(item.id, "Implementing");
           await this.#launchTask(store, store.getWorkItem(item.id) ?? item);
         }
-        await this.#finishObjectives(store, unavailableProjects);
+        await this.#finishObjectives(store, unavailableProjects, unsafeProjects);
       } finally {
         await this.#reconcileFinalizedTasks(store, unsafeProjects);
       }
@@ -800,10 +799,10 @@ export class MainOrchestrator {
     return unavailable;
   }
 
-  async #reconcileIssues(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<void> {
+  async #reconcileIssues(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedWorkItemIds: ReadonlySet<string> = new Set()): Promise<void> {
     for (let item of store.listWorkItems()) {
       if (unavailableProjects.has(item.projectSlug)
-        || item.sourceType !== "issue" || !store.hasActiveObjectiveForWorkItem(item.id) && !store.activeTask(item.id)) continue;
+        || item.sourceType !== "issue" || !store.hasActiveObjectiveForWorkItem(item.id) && !store.activeTask(item.id) && !occupiedWorkItemIds.has(item.id)) continue;
       const project = store.getProject(item.projectSlug);
       if (!project) continue;
       try {
@@ -897,8 +896,8 @@ export class MainOrchestrator {
   }
 
   async #reconcileWorkers(store: MerroStore, unsafeProjects: Set<string>): Promise<{ count: number; workItemIds: Set<string> }> {
-    const tasks = store.listTasks().filter((task) => task.status === "active");
-    const runtimes = tasks.map((task) => store.getTaskRuntime(task.id)).filter((runtime) => runtime !== null);
+    // Finalized runtime identity still links legacy panes and containers, without adopting their workers.
+    const runtimes = store.listTasks().map((task) => store.getTaskRuntime(task.id)).filter((runtime) => runtime !== null);
     const orphanIds = new Set<string>();
     const workItemIds = new Set<string>();
     const projects = store.listProjects();
@@ -906,20 +905,26 @@ export class MainOrchestrator {
       try {
         const workers = await this.#workers.listOwnedWorkers(project, store.getProjectSettings(project.slug));
         for (const worker of workers) {
-          const recordedTask = worker.taskId !== null ? store.getTask(worker.taskId) : null;
-          const recorded = worker.taskId !== null ? recordedTask?.status === "active" : runtimes.some((runtime) =>
-            (worker.paneId !== null && runtime.paneId === worker.paneId && runtime.tmuxSession === worker.tmuxSession)
+          const matchedRuntime = worker.taskId === null ? runtimes.find((runtime) =>
+            (worker.paneId !== null && runtime.paneId === worker.paneId && runtime.tmuxSession === worker.tmuxSession
+              && runtime.tmuxWindow === worker.tmuxWindow)
             || (worker.containerId !== null && runtime.containerId === worker.containerId)
-            || (runtime.paneId === null && runtime.containerId === null && worker.tmuxWindow !== null
-              && runtime.tmuxWindow === worker.tmuxWindow && runtime.tmuxSession === worker.tmuxSession));
-          if (recorded) continue;
-          orphanIds.add(worker.taskId ?? worker.containerId ?? `${worker.tmuxSession}:${worker.paneId}`);
-          unsafeProjects.add(project.slug);
-          const item = worker.workItemId ? store.getWorkItem(worker.workItemId) : store.listWorkItems().find((candidate) =>
-            worker.clonePath !== null && store.getWorkItemRuntime(candidate.id)?.clonePath === worker.clonePath);
-          if (item?.projectSlug === project.slug) workItemIds.add(item.id);
-          else for (const registered of projects) unsafeProjects.add(registered.slug);
-          this.#notify(`${recordedTask ? "Worker for finalized Task" : "Orphan worker"} in Project ${project.slug}: Task ${worker.taskId ?? "unknown"}, tmux ${worker.tmuxSession ?? "none"}:${worker.tmuxWindow ?? "none"}, pane ${worker.paneId ?? "none"}, container ${worker.containerId ?? "none"}, clone ${worker.clonePath ?? "unknown"}. Scheduling gated; worker not adopted or stopped.`, "warning");
+            || (runtime.paneId === null && worker.tmuxWindow !== null
+              && runtime.tmuxWindow === worker.tmuxWindow && runtime.tmuxSession === worker.tmuxSession)) : undefined;
+          const taskId = worker.taskId ?? matchedRuntime?.taskId ?? null;
+          const recordedTask = taskId !== null ? store.getTask(taskId) : null;
+          if (recordedTask?.status === "active") continue;
+          orphanIds.add(taskId !== null ? `task:${taskId}` : worker.containerId !== null
+            ? `container:${worker.containerId}` : `pane:${worker.tmuxSession}:${worker.paneId}`);
+          const item = worker.workItemId ? store.getWorkItem(worker.workItemId)
+            : recordedTask ? store.getWorkItem(recordedTask.workItemId) : store.listWorkItems().find((candidate) =>
+              worker.clonePath !== null && store.getWorkItemRuntime(candidate.id)?.clonePath === worker.clonePath);
+          // Legacy containers may be returned by every Project scan. Stored identity determines their Project.
+          if (item) {
+            unsafeProjects.add(item.projectSlug);
+            workItemIds.add(item.id);
+          } else for (const registered of projects) unsafeProjects.add(registered.slug);
+          this.#notify(`${recordedTask ? "Worker for finalized Task" : "Orphan worker"} in Project ${item?.projectSlug ?? project.slug}: Task ${taskId ?? "unknown"}, tmux ${worker.tmuxSession ?? "none"}:${worker.tmuxWindow ?? "none"}, pane ${worker.paneId ?? "none"}, container ${worker.containerId ?? "none"}, clone ${worker.clonePath ?? "unknown"}. Scheduling gated; worker not adopted or stopped.`, "warning");
         }
       } catch (error) {
         // An incomplete inventory cannot prove that a clone is unowned.
@@ -931,7 +936,7 @@ export class MainOrchestrator {
     return { count: orphanIds.size, workItemIds };
   }
 
-  async #reconcileTasks(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<void> {
+  async #reconcileTasks(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<void> {
     for (const task of store.listTasks().filter((candidate) => candidate.status === "active")) {
       const item = store.getWorkItem(task.workItemId);
       if (item && unavailableProjects.has(item.projectSlug)) continue;
@@ -955,7 +960,7 @@ export class MainOrchestrator {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
           store.finalizeTask({ id: task.id, outcome: "failed", summary: "Invalid result file", resultJson: JSON.stringify({ error: errorText(error) }) });
-          if (!this.#obsoleteIfUnowned(store, item)) {
+          if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) {
             this.#block(store, item, "task_failed", `Cannot read Task result: ${errorText(error)}`);
           }
           continue;
@@ -972,7 +977,7 @@ export class MainOrchestrator {
         if (presence.alive && presence.identityMatches) continue;
         const reason = presence.reason ?? "worker exited without a result";
         store.finalizeTask({ id: task.id, outcome: "failed", summary: reason, resultJson: JSON.stringify({ taskId: task.id, reason }) });
-        if (this.#obsoleteIfUnowned(store, item)) continue;
+        if (this.#obsoleteIfUnowned(store, item, unsafeProjects)) continue;
         if (presence.alive && !presence.identityMatches) {
           this.#block(store, item, "task_failed", `Worker identity check failed: ${reason}`);
           continue;
@@ -1005,12 +1010,12 @@ export class MainOrchestrator {
         }
       } catch (error) {
         store.finalizeTask({ id: task.id, outcome: "failed", summary: "Task result validation failed", resultJson: text });
-        if (!this.#obsoleteIfUnowned(store, item)) {
+        if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) {
           this.#block(store, item, "task_failed", `Task result validation failed: ${errorText(error)}`);
         }
         continue;
       }
-      await this.#consumeResult(store, item, task, result, runtime, workRuntime);
+      await this.#consumeResult(store, item, task, result, runtime, workRuntime, unsafeProjects);
       workRuntime.infrastructureRetries = 0;
       store.saveWorkItemRuntime(workRuntime);
     }
@@ -1040,7 +1045,7 @@ export class MainOrchestrator {
     }
   }
 
-  async #consumeResult(store: MerroStore, item: WorkItem, task: Task, result: WorkerResult, runtime: TaskRuntimeRecord, workRuntime: WorkItemRuntimeRecord): Promise<void> {
+  async #consumeResult(store: MerroStore, item: WorkItem, task: Task, result: WorkerResult, runtime: TaskRuntimeRecord, workRuntime: WorkItemRuntimeRecord, unsafeProjects: ReadonlySet<string>): Promise<void> {
     const flowState = task.role === "implement" ? "Implementing" : "Reviewing";
     if (result.status !== "failed" && item.state === "Blocked" && item.blockedReason === "task_failed"
       && item.blockedResumeState === flowState) {
@@ -1052,7 +1057,7 @@ export class MainOrchestrator {
       const implementResult = result as ImplementSuccessResult | ImplementFailedResult;
       if (implementResult.status === "failed") {
         store.finalizeTask({ id: task.id, outcome: "failed", summary: implementResult.summary, resultJson: JSON.stringify(implementResult) });
-        if (!this.#obsoleteIfUnowned(store, item)) {
+        if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) {
           this.#block(store, item, "task_failed", `${implementResult.reason}${implementResult.diagnostics ? `: ${implementResult.diagnostics}` : ""}`);
         }
         return;
@@ -1064,19 +1069,19 @@ export class MainOrchestrator {
         workRuntime.baseUpdate = null;
         store.saveWorkItemRuntime(workRuntime);
       }
-      if (!this.#obsoleteIfUnowned(store, item)) store.transitionWorkItem(item.id, "Reviewing");
+      if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) store.transitionWorkItem(item.id, "Reviewing");
       return;
     }
 
     const reviewResult = result as ReviewResult | ReviewFailedResult;
     if (reviewResult.status === "failed") {
       store.finalizeTask({ id: task.id, outcome: "failed", summary: reviewResult.summary, resultJson: JSON.stringify(reviewResult), reviewedCommit: reviewResult.reviewed_commit });
-      if (!this.#obsoleteIfUnowned(store, item)) this.#block(store, item, "task_failed", `${reviewResult.reason}`);
+      if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) this.#block(store, item, "task_failed", `${reviewResult.reason}`);
       return;
     }
     const review = reviewResult;
     store.finalizeTask({ id: task.id, outcome: review.status, summary: review.summary, resultJson: JSON.stringify(review), reviewedCommit: review.reviewed_commit });
-    if (this.#obsoleteIfUnowned(store, item)) return;
+    if (this.#obsoleteIfUnowned(store, item, unsafeProjects)) return;
     if (review.status === "reject") {
       workRuntime.reviewRound += 1;
       store.saveWorkItemRuntime(workRuntime);
@@ -1119,7 +1124,7 @@ export class MainOrchestrator {
     }
   }
 
-  async #reconcilePullRequests(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<void> {
+  async #reconcilePullRequests(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<void> {
     for (let item of store.listWorkItems()) {
       if (unavailableProjects.has(item.projectSlug)) continue;
       const recovering = item.state === "Blocked"
@@ -1139,7 +1144,7 @@ export class MainOrchestrator {
                 this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
                 continue;
               }
-              await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
+              await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
               this.#resolvePullRequestDecisions(store, item.id);
               continue;
             }
@@ -1169,7 +1174,7 @@ export class MainOrchestrator {
             this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
             continue;
           }
-          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
+          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
           this.#resolvePullRequestDecisions(store, item.id);
           continue;
         }
@@ -1195,7 +1200,8 @@ export class MainOrchestrator {
           await this.#github.syncPullRequestContent(project, pullRequest, body, reviewNotes(latestReview));
           pullRequest = { ...pullRequest, body };
         }
-        if (terminalOnly) continue;
+        // Reconcile external PR state, but never restore or synchronize a clone an orphan may still use.
+        if (terminalOnly || unsafeProjects.has(item.projectSlug)) continue;
         if (store.pendingDecisions().some((decision) => decision.subjectId === item.id && decision.kind === "merge_conflict")) continue;
         if (runtime.branchName && this.#git.remoteBranchCommit) {
           const remoteHead = await this.#git.remoteBranchCommit(project, runtime.branchName);
@@ -1365,6 +1371,7 @@ export class MainOrchestrator {
     runtime: WorkItemRuntimeRecord,
     project: Project,
     pullRequest: GitHubPullRequest,
+    unsafeProjects: ReadonlySet<string> = new Set(),
   ): Promise<void> {
     if (!pullRequest.mergedAt || !isCommitSha(pullRequest.mergeCommitSha)) {
       throw new Error("cannot finalize a pull request without confirmed merge metadata");
@@ -1390,7 +1397,7 @@ export class MainOrchestrator {
       }
     }
 
-    if (runtime.clonePath && this.#git.deleteClone) {
+    if (runtime.clonePath && this.#git.deleteClone && !unsafeProjects.has(item.projectSlug)) {
       try {
         await this.#git.deleteClone(this.#workRoot, runtime.clonePath);
       } catch (error) {
@@ -1409,8 +1416,9 @@ export class MainOrchestrator {
     store.saveWorkItemRuntime(runtime);
   }
 
-  #obsoleteIfUnowned(store: MerroStore, item: WorkItem): boolean {
+  #obsoleteIfUnowned(store: MerroStore, item: WorkItem, unsafeProjects: ReadonlySet<string> = new Set()): boolean {
     if (store.hasActiveObjectiveForWorkItem(item.id)) return false;
+    if (unsafeProjects.has(item.projectSlug)) return true;
     const current = store.getWorkItem(item.id);
     if (current && !terminal(current) && !store.activeTask(item.id)) {
       store.transitionWorkItem(item.id, "Obsolete");
@@ -1420,14 +1428,14 @@ export class MainOrchestrator {
     return true;
   }
 
-  async #rebuildRelations(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<Set<string>> {
+  async #rebuildRelations(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedWorkItemIds: ReadonlySet<string>): Promise<Set<string>> {
     const gated = new Set<string>();
     const analyzed: string[] = [];
     const relations: Relation[] = [];
     const objectives = store.listObjectives().filter((objective) => objective.state === "Active");
     for (const item of store.listWorkItems()) {
       if (unavailableProjects.has(item.projectSlug)) { gated.add(item.id); continue; }
-      if (terminal(item) || !store.hasActiveObjectiveForWorkItem(item.id)) {
+      if ((terminal(item) || !store.hasActiveObjectiveForWorkItem(item.id)) && !occupiedWorkItemIds.has(item.id)) {
         if (!store.activeTask(item.id)) analyzed.push(item.id);
         continue;
       }
@@ -1438,7 +1446,7 @@ export class MainOrchestrator {
         const approved = new Map<string, WorkItem>();
         for (const objective of objectives) {
           const attached = store.listWorkItems(objective.id, true);
-          if (!attached.some((candidate) => candidate.id === item.id)) continue;
+          if (!occupiedWorkItemIds.has(item.id) && !attached.some((candidate) => candidate.id === item.id)) continue;
           for (const candidate of attached) approved.set(candidate.id, candidate);
         }
         const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
@@ -1453,17 +1461,18 @@ export class MainOrchestrator {
         this.#notify(`WorkItem ${item.id} awaits relation analysis: ${errorText(error)}`, "warning");
       }
     }
-    store.rebuildAutomaticRelations(analyzed, relations);
+    store.rebuildAutomaticRelations(analyzed, relations, [...occupiedWorkItemIds]);
     return gated;
   }
 
-  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>, relationGates: ReadonlySet<string>): void {
+  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>, relationGates: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>, occupiedWorkItemIds: ReadonlySet<string>): void {
     const items = store.listWorkItems();
     const byId = new Map(items.map((item) => [item.id, item]));
     const relations = store.listRelations();
     const active = new Set([
       ...store.listTasks().filter((task) => task.status === "active").map((task) => task.workItemId),
       ...items.filter((item) => unavailableProjects.has(item.projectSlug)).map((item) => item.id),
+      ...occupiedWorkItemIds,
     ]);
     const cycle = findRequiresCycle(relations);
     if (cycle) this.#blockCycle(store, cycle, active);
@@ -1471,6 +1480,7 @@ export class MainOrchestrator {
       if (unavailableProjects.has(item.projectSlug)
         || (item.state !== "Planned" && item.state !== "Ready") || active.has(item.id)) continue;
       if (!store.hasActiveObjectiveForWorkItem(item.id)) {
+        if (unsafeProjects.has(item.projectSlug)) continue;
         store.transitionWorkItem(item.id, "Obsolete");
         continue;
       }
@@ -1570,7 +1580,7 @@ export class MainOrchestrator {
     return item;
   }
 
-  async #refreshObjectiveScope(store: MerroStore, objective: Objective, unavailableProjects: ReadonlySet<string> = new Set(), schedulingGates: Set<string> = new Set()): Promise<boolean> {
+  async #refreshObjectiveScope(store: MerroStore, objective: Objective, unavailableProjects: ReadonlySet<string> = new Set(), schedulingGates: Set<string> = new Set(), unsafeProjects: ReadonlySet<string> = new Set()): Promise<boolean> {
     try {
       let scopes = objective.issueScopes;
       if (scopes === undefined) {
@@ -1616,7 +1626,7 @@ export class MainOrchestrator {
           const scope = scopes.find((entry) => entry.projectSlug === item.projectSlug)!;
           if (matchesIssueScope(scope, issue)) throw new Error(`issue #${issue.number} changed during scope enumeration`);
           store.detachWorkItem(objective.id, item.id);
-          this.#obsoleteIfUnowned(store, item);
+          this.#obsoleteIfUnowned(store, item, unsafeProjects);
         } catch (error) {
           refreshed = false;
           schedulingGates.add(item.id);
@@ -1653,12 +1663,12 @@ export class MainOrchestrator {
     }
   }
 
-  async #finishObjectives(store: MerroStore, unavailableProjects: ReadonlySet<string> = new Set()): Promise<void> {
+  async #finishObjectives(store: MerroStore, unavailableProjects: ReadonlySet<string> = new Set(), unsafeProjects: ReadonlySet<string> = new Set()): Promise<void> {
     for (const objective of store.listObjectives()) {
       if (objective.state !== "Active") continue;
       const items = store.listWorkItems(objective.id);
       if (!items.every(terminal) || (items.length === 0 && !objective.issueScopes?.some((scope) => "query" in scope))) continue;
-      if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects)) continue;
+      if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects, new Set(), unsafeProjects)) continue;
       if (!store.listWorkItems(objective.id).every(terminal)) continue;
       store.setObjectiveState(objective.id, "Done");
       const message = `Objective ${objective.id} is Done.`;
