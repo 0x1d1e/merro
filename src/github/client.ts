@@ -114,6 +114,27 @@ function statusCheckNames(value: unknown): string[] {
   ];
 }
 
+function hasPinnedCheckIdentity(value: unknown, field: "app_id" | "integration_id"): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.some((check) => {
+    if (typeof check !== "object" || check === null) return false;
+    const identity = (check as Record<string, unknown>)[field];
+    return identity !== undefined && identity !== null;
+  });
+}
+
+function ruleParameterEnabled(parameters: Record<string, unknown>, name: string): boolean {
+  const value = parameters[name];
+  if (value === undefined) return false;
+  if (typeof value !== "boolean") throw new Error(`ruleset pull_request has invalid ${name} parameter`);
+  return value;
+}
+
+function rejectUnknownRuleParameters(parameters: Record<string, unknown>, supported: ReadonlySet<string>): void {
+  const unsupported = Object.keys(parameters).find((name) => !supported.has(name));
+  if (unsupported) throw new Error(`ruleset contains unsupported merge requirement '${unsupported}'`);
+}
+
 function isNotFound(error: unknown): boolean {
   const text = error instanceof CommandError ? `${error.message} ${error.stderr}` : String(error);
   return /\b404\b/i.test(text);
@@ -392,9 +413,9 @@ export class GitHubClient {
     }
   }
 
-  async branchProtection(project: Project): Promise<BranchPolicy> {
+  async branchProtection(project: Project, branchName = project.defaultBranch): Promise<BranchPolicy> {
     const repository = await this.repository(project.baseRemote);
-    const branch = encodeURIComponent(project.defaultBranch);
+    const branch = encodeURIComponent(branchName);
     const classicPath = `repos/${repository.nameWithOwner}/branches/${branch}/protection`;
     const rulesPath = `repos/${repository.nameWithOwner}/rules/branches/${branch}`;
     let classicChecks: string[] = [];
@@ -405,10 +426,22 @@ export class GitHubClient {
     try {
       const result = await this.#commands.run("gh", ["api", classicPath], { cwd: project.path });
       const row = object(parseJson(result.stdout, "gh api branch protection"), "gh api branch protection");
+      if (hasPinnedCheckIdentity((row.required_status_checks as Record<string, unknown> | null)?.checks, "app_id")) {
+        throw new Error("classic branch protection pins required checks to an unsupported GitHub App identity");
+      }
+      const conversationResolution = typeof row.required_conversation_resolution === "object" && row.required_conversation_resolution !== null
+        ? row.required_conversation_resolution as Record<string, unknown>
+        : {};
+      if (conversationResolution.enabled === true) {
+        throw new Error("classic branch protection requires unsupported review-thread resolution");
+      }
       classicChecks = statusCheckNames(row.required_status_checks);
       const reviews = typeof row.required_pull_request_reviews === "object" && row.required_pull_request_reviews !== null
         ? row.required_pull_request_reviews as Record<string, unknown>
         : {};
+      if (reviews.require_last_push_approval === true) {
+        throw new Error("classic branch protection requires unsupported last-push approval");
+      }
       classicApprovals = typeof reviews.required_approving_review_count === "number"
         ? reviews.required_approving_review_count
         : 0;
@@ -432,14 +465,37 @@ export class GitHubClient {
           ? rule.parameters as Record<string, unknown>
           : {};
         if (rule.type === "required_status_checks") {
+          rejectUnknownRuleParameters(parameters, new Set([
+            "required_status_checks", "strict_required_status_checks_policy", "do_not_enforce_on_create",
+          ]));
+          if (hasPinnedCheckIdentity(parameters.required_status_checks, "integration_id")) {
+            throw new Error("ruleset pins required checks to an unsupported GitHub App identity");
+          }
           requiredStatusChecks.push(...statusCheckNames({ checks: parameters.required_status_checks }));
         } else if (rule.type === "pull_request") {
+          rejectUnknownRuleParameters(parameters, new Set([
+            "dismiss_stale_reviews_on_push", "require_code_owner_review", "require_last_push_approval",
+            "required_approving_review_count", "required_review_thread_resolution",
+          ]));
+          if (ruleParameterEnabled(parameters, "require_last_push_approval")) {
+            throw new Error("ruleset requires unsupported last-push approval");
+          }
+          if (ruleParameterEnabled(parameters, "required_review_thread_resolution")) {
+            throw new Error("ruleset requires unsupported review-thread resolution");
+          }
+          if (typeof parameters.required_approving_review_count === "number" && parameters.required_approving_review_count < 0) {
+            throw new Error("ruleset has an invalid required approval count");
+          }
           if (typeof parameters.required_approving_review_count === "number") {
             requiredApprovingReviewCount = Math.max(requiredApprovingReviewCount, parameters.required_approving_review_count);
           }
           requireCodeOwnerReviews ||= parameters.require_code_owner_review === true
             || parameters.require_code_owner_reviews === true;
           dismissStale ||= parameters.dismiss_stale_reviews_on_push === true;
+        } else if (rule.type === "required_reviewers" || rule.type === "required_review_thread_resolution") {
+          throw new Error(`ruleset contains unsupported merge requirement '${String(rule.type)}'`);
+        } else if (rule.type !== "creation" && rule.type !== "deletion") {
+          throw new Error(`ruleset contains unsupported branch rule '${String(rule.type)}'`);
         }
       }
       return {

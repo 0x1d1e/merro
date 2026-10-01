@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -261,4 +261,24 @@ END;
 export const MIGRATION_8 = `
 ALTER TABLE work_item_runtime ADD COLUMN last_issue_state TEXT;
 ALTER TABLE work_item_runtime ADD COLUMN reviewed_diff_hash TEXT;
+`;
+
+export const MIGRATION_9 = `
+CREATE TABLE final_summaries (
+  work_item_id TEXT PRIMARY KEY REFERENCES work_items(id),
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER final_summaries_immutable_update
+BEFORE UPDATE ON final_summaries
+BEGIN
+  SELECT RAISE(ABORT, 'final summaries are immutable');
+END;
+
+CREATE TRIGGER final_summaries_immutable_delete
+BEFORE DELETE ON final_summaries
+BEGIN
+  SELECT RAISE(ABORT, 'final summaries are immutable');
+END;
 `;

@@ -38,6 +38,7 @@ interface HarnessOptions {
   issueFailure?: (projectSlug: string, number: number) => boolean;
   pullRequestFailure?: (number: number) => boolean;
   pullRequestContentFailure?: () => boolean;
+  deleteCloneFailure?: boolean;
   result?: (input: WorkerLaunchInput, launchNumber: number, defaultResult: Record<string, unknown>) => Record<string, unknown> | null;
 }
 
@@ -53,6 +54,10 @@ interface MainHarness {
   synchronizedHeads: string[];
   baseMerges: Array<{ path: string; defaultBranch: string }>;
   restoredClones: Array<{ projectSlug: string; branchName: string; headCommit: string }>;
+  cloneBaseBranches: string[];
+  deletedClones: string[];
+  branchPolicyBranches: string[];
+  setProjectState(projectSlug: string, update: Partial<Project>): void;
   setPullRequest(number: number, update: Partial<GitHubPullRequest>): void;
   setIssueState(projectSlug: string, number: number, state: string): void;
   setBaseMergeConflict(conflicts: boolean): void;
@@ -71,6 +76,9 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   const cloneBranches = new Map<string, { projectSlug: string; branchName: string }>();
   const synchronizedHeads: string[] = [];
   const restoredClones: Array<{ projectSlug: string; branchName: string; headCommit: string }> = [];
+  const cloneBaseBranches: string[] = [];
+  const deletedClones: string[] = [];
+  const branchPolicyBranches: string[] = [];
   for (const fixture of fixtures) {
     const path = join(workspacePath, fixture.slug);
     await mkdir(path);
@@ -112,7 +120,19 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         nameWithOwner: `example/${project.slug}`,
         url: `https://github.com/example/${project.slug}`,
         sshUrl: `git@github.com:example/${project.slug}.git`,
-        defaultBranch: "main",
+        defaultBranch: project.defaultBranch,
+      };
+    },
+    async repository(reference: string) {
+      const slug = reference.match(/(?:\/|:)([^/:]+?)(?:\.git)?$/)?.[1] ?? "example";
+      const project = projects.get(slug) ?? [...projects.values()].find((candidate) => reference === candidate.baseRemote || reference === candidate.pushRemote);
+      const projectSlug = project?.slug ?? slug;
+      const defaultBranch = project?.defaultBranch ?? "main";
+      return {
+        nameWithOwner: `example/${projectSlug}`,
+        url: `https://github.com/example/${projectSlug}`,
+        sshUrl: `git@github.com:example/${projectSlug}.git`,
+        defaultBranch,
       };
     },
     async listOpenIssues(project: Project) {
@@ -143,7 +163,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         mergeCommitSha: null,
         mergeable: "MERGEABLE",
         headRefName: branchName,
-        baseRefName: "main",
+        baseRefName: project.defaultBranch,
         headRefOid,
         baseRefOid: "base-sha",
         authorLogin: "issue-author",
@@ -172,7 +192,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     async hasWritePermission(_project: Project, username: string) {
       return options.reviewerWritePermission?.(username) ?? username.toLowerCase() === "maintainer";
     },
-    async branchProtection() {
+    async branchProtection(_project: Project, branchName?: string) {
+      branchPolicyBranches.push(branchName ?? _project.defaultBranch);
       if (!branchPolicyAvailable) return { known: false as const, reason: "policy visibility unavailable" };
       return {
         known: true as const,
@@ -203,6 +224,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       return { ...project, path };
     },
     async createWorkItemClone(project: Project, path: string, branchName: string) {
+      cloneBaseBranches.push(project.defaultBranch);
       cloneBranches.set(path, { projectSlug: project.slug, branchName });
       heads.set(path, "base-sha");
       return { path, branchName, baseCommit: "base-sha" };
@@ -251,6 +273,10 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     },
     async effectiveDiffFingerprint(_project: Project, _path: string, _baseRefName: string, _baseCommit: string, headCommit: string) {
       return options.effectiveDiffFingerprint?.(headCommit) ?? headCommit;
+    },
+    async deleteClone(_workRoot: string, path: string) {
+      if (options.deleteCloneFailure) throw new Error("clone cleanup failed");
+      deletedClones.push(path);
     },
   };
 
@@ -327,6 +353,14 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     notifications,
     synchronizedHeads,
     restoredClones,
+    cloneBaseBranches,
+    deletedClones,
+    branchPolicyBranches,
+    setProjectState(projectSlug, update) {
+      const current = projects.get(projectSlug);
+      assert.ok(current, `unknown Project ${projectSlug}`);
+      projects.set(projectSlug, { ...current, ...update });
+    },
     setPullRequest(number, update) {
       const current = pullRequests.get(number);
       assert.ok(current, `unknown pull request ${number}`);
@@ -363,8 +397,9 @@ async function startDefaultObjective(main: MainOrchestrator): Promise<string> {
 }
 
 test("Main runs one issue through implement, review, PR approval, merge, and Objective completion", async (t) => {
-  const { main } = await createHarness(t);
-  await startDefaultObjective(main);
+  const harness = await createHarness(t);
+  const { main } = harness;
+  const workItemId = await startDefaultObjective(main);
 
   await main.runPass();
   await main.runPass();
@@ -384,6 +419,90 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
   assert.equal(completed.workItems[0]?.state, "Done");
   assert.equal(completed.objectives[0]?.state, "Done");
   assert.equal(completed.decisions.length, 0);
+  assert.equal(harness.deletedClones.length, 1);
+  assert.ok(harness.notifications.some((message) => message.includes("issue #7 remains open")));
+
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    const finalSummary = store.getFinalSummary(workItemId);
+    assert.ok(finalSummary);
+    const payload = finalSummary.payload as {
+      diff: { effectiveFingerprint: string | null };
+      pullRequest: { number: number; mergeCommitSha: string };
+      implementerSummaries: Array<{ summary: string }>;
+      reviewerOutcomes: Array<{ outcome: string }>;
+    };
+    assert.equal(payload.pullRequest.number, [...harness.pullRequests.keys()][0]);
+    assert.match(payload.pullRequest.mergeCommitSha, /^[0-9a-f]{40}$/);
+    assert.ok(payload.diff.effectiveFingerprint);
+    assert.equal(payload.implementerSummaries.length, 1);
+    assert.equal(payload.reviewerOutcomes.at(-1)?.outcome, "pass");
+  } finally {
+    store.close();
+  }
+});
+
+test("merge finalization remains complete when terminal clone cleanup fails", async (t) => {
+  const harness = await createHarness(t, { deleteCloneFailure: true });
+  const workItemId = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const decision = (await harness.main.statusSnapshot()).decisions[0];
+  assert.ok(decision);
+
+  await harness.main.resolveMergeDecision(decision.id, true);
+
+  const completed = await harness.main.statusSnapshot();
+  assert.equal(completed.workItems.find((item) => item.id === workItemId)?.state, "Done");
+  assert.ok(harness.notifications.some((message) => message.includes("Could not clean up terminal WorkItem clone")));
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    assert.ok(store.getFinalSummary(workItemId));
+  } finally {
+    store.close();
+  }
+});
+
+test("runPass reconciles Project remotes and default branch before creating future work", async (t) => {
+  const harness = await createHarness(t);
+  const project = harness.projects.get("example");
+  assert.ok(project);
+  harness.setProjectState("example", {
+    baseRemote: "git@github.com:example/example.git",
+    pushRemote: "git@github.com:example/example.git",
+    defaultBranch: "trunk",
+  });
+
+  await harness.main.runPass();
+  const reconciled = (await harness.main.statusSnapshot()).projects[0];
+  assert.equal(reconciled?.baseRemote, "git@github.com:example/example.git");
+  assert.equal(reconciled?.pushRemote, "git@github.com:example/example.git");
+  assert.equal(reconciled?.defaultBranch, "trunk");
+
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.deepEqual(harness.cloneBaseBranches, ["trunk"]);
+  assert.equal([...harness.pullRequests.values()][0]?.baseRefName, "trunk");
+  assert.ok(harness.branchPolicyBranches.includes("trunk"));
+});
+
+test("branch policy is evaluated against the pull request base branch", async (t) => {
+  const harness = await createHarness(t);
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const pullRequest = [...harness.pullRequests.values()][0];
+  assert.ok(pullRequest);
+  harness.setPullRequest(pullRequest.number, { baseRefName: "release" });
+
+  await harness.main.runPass();
+
+  assert.equal(harness.branchPolicyBranches.at(-1), "release");
 });
 
 test("required approvals count only write-eligible reviewers and allow stale approvals when configured", async (t) => {
@@ -1226,6 +1345,9 @@ test("new Main consumes a healthy worker result after a crash without restarting
       async fetchAndMergeBase() { return { baseCommit: "base-sha", headCommit: "base-sha", merged: false }; },
     },
     github: {
+      async repository() {
+        return { nameWithOwner: "example/repo", url: "https://github.com/example/repo", sshUrl: "git@github.com:example/repo.git", defaultBranch: "main" };
+      },
       async repositoryInDirectory(path) {
         const project = [...harness.projects.values()].find((candidate) => candidate.path === path);
         assert.ok(project);
@@ -1530,6 +1652,76 @@ test("review cap blocks after the configured round and continue grants a fresh r
   assert.equal((await main.statusSnapshot()).workItems[0]?.state, "Implementing");
 });
 
+test("review cap ignores stopped Objective owners and uses the strictest active owner limit", async (t) => {
+  const harness = await createHarness(t, {
+    result(input, launchNumber, result) {
+      if (input.role === "review" && launchNumber === 2) {
+        return {
+          task_id: input.taskId,
+          status: "reject",
+          summary: "A blocking issue remains.",
+          reviewed_commit: input.expectedCommit,
+          findings: [{ severity: "blocking", summary: "Fix it." }],
+          verification: [],
+        };
+      }
+      return result;
+    },
+  });
+  const stoppedOwner = await harness.main.startObjective({
+    goal: "Strict but stopped owner",
+    projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }],
+    maxReviewRounds: 1,
+  });
+  const activeOwner = await harness.main.startObjective({
+    goal: "Active unlimited owner",
+    projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }],
+    maxReviewRounds: "unlimited",
+  });
+  assert.equal(activeOwner.workItems[0]?.id, stoppedOwner.workItems[0]?.id);
+  await harness.main.stopObjectives(stoppedOwner.objective.id);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const state = await harness.main.statusSnapshot();
+  assert.equal(state.workItems[0]?.state, "Implementing");
+  assert.equal(state.workItems[0]?.blockedReason, null);
+  assert.equal(harness.launches.map((launch) => launch.role).join(","), "implement,review,implement");
+
+  const capped = await createHarness(t, {
+    result(input, launchNumber, result) {
+      if (input.role === "review" && launchNumber === 2) {
+        return {
+          task_id: input.taskId,
+          status: "reject",
+          summary: "A blocking issue remains.",
+          reviewed_commit: input.expectedCommit,
+          findings: [{ severity: "blocking", summary: "Fix it." }],
+          verification: [],
+        };
+      }
+      return result;
+    },
+  });
+  await capped.main.startObjective({
+    goal: "Permissive active owner",
+    projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }],
+    maxReviewRounds: 3,
+  });
+  await capped.main.startObjective({
+    goal: "Strict active owner",
+    projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [7] }],
+    maxReviewRounds: 1,
+  });
+  await capped.main.runPass();
+  await capped.main.runPass();
+  await capped.main.runPass();
+  assert.equal((await capped.main.statusSnapshot()).workItems[0]?.blockedReason, "review_cap");
+});
+
 test("cross-Project Objective reconciles dependencies, rework, external checks, approvals, and merges", async (t) => {
   let apiReviewCount = 0;
   const { main, launches, pullRequests, setPullRequest } = await createHarness(t, {
@@ -1790,7 +1982,7 @@ test("a policy_unknown WorkItem automatically resumes when policy visibility ret
 });
 
 test("an external merge completes the WorkItem and resolves its pending merge Decision", async (t) => {
-  const { main, pullRequests, setPullRequest } = await createHarness(t);
+  const { main, workspacePath, deletedClones, pullRequests, setPullRequest, setIssueState } = await createHarness(t);
   await startDefaultObjective(main);
   await main.runPass();
   await main.runPass();
@@ -1808,10 +2000,18 @@ test("an external merge completes the WorkItem and resolves its pending merge De
     mergedAt: "2026-01-03T00:00:00Z",
     mergeCommitSha: "f".repeat(40),
   });
+  setIssueState("example", 7, "CLOSED");
   await main.runPass();
   const completed = await main.statusSnapshot();
   assert.equal(completed.workItems[0]?.state, "Done");
   assert.equal(completed.objectives[0]?.state, "Done");
   assert.equal(completed.decisions.length, 0);
   assert.equal(completed.tasks.filter((task) => task.status === "finalized").length, 2);
+  assert.equal(deletedClones.length, 1);
+  const store = new MerroStore(join(workspacePath, ".merro", "state.db"));
+  try {
+    assert.ok(store.getFinalSummary(runtime.id));
+  } finally {
+    store.close();
+  }
 });

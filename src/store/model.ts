@@ -36,6 +36,12 @@ export interface WorkItemRuntimeRecord {
   lastReconciledAt: string | null;
 }
 
+export interface FinalSummaryRecord {
+  workItemId: string;
+  payload: unknown;
+  createdAt: string;
+}
+
 export interface TaskRuntimeRecord {
   taskId: string;
   runtimeKind: "docker" | "host" | null;

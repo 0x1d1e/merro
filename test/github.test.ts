@@ -268,7 +268,7 @@ test("branch protection combines classic settings with active rulesets", async (
       stdout: JSON.stringify([
         {
           type: "required_status_checks",
-          parameters: { required_status_checks: [{ context: "ruleset-ci", integration_id: 1 }] },
+          parameters: { required_status_checks: [{ context: "ruleset-ci" }] },
         },
         {
           type: "pull_request",
@@ -333,4 +333,56 @@ test("branch rulesets remain authoritative when classic protection returns 404",
     requireCodeOwnerReviews: false,
     dismissStaleApprovals: false,
   });
+});
+
+test("branch policy is unknown when classic merge requirements are not modeled", async (t) => {
+  const requirements = [
+    { name: "last-push approval", protection: { required_pull_request_reviews: { require_last_push_approval: true } } },
+    { name: "review-thread resolution", protection: { required_conversation_resolution: { enabled: true } } },
+    { name: "check app identity", protection: { required_status_checks: { checks: [{ context: "CI", app_id: 42 }] } } },
+  ];
+  for (const requirement of requirements) {
+    await t.test(requirement.name, async () => {
+      const commands = new FakeCommands([
+        { stdout: repository("acme/widget"), stderr: "" },
+        { stdout: JSON.stringify(requirement.protection), stderr: "" },
+        { stdout: "[]", stderr: "" },
+      ]);
+      const policy = await new GitHubClient(commands).branchProtection(project);
+      assert.equal(policy.known, false, "unsupported active merge requirement must fail closed");
+    });
+  }
+});
+
+test("branch policy is unknown for unsupported active ruleset requirements", async (t) => {
+  for (const rule of [
+    { type: "required_reviewers", parameters: { required_reviewers: [{ reviewer: { id: 123 } }] } },
+    { type: "pull_request", parameters: { required_review_thread_resolution: true } },
+    { type: "pull_request", parameters: { required_reviewers: [{ reviewer: { id: 123 } }] } },
+    { type: "required_review_thread_resolution", parameters: {} },
+    { type: "required_status_checks", parameters: { required_status_checks: [{ context: "CI", integration_id: 42 }] } },
+  ]) {
+    await t.test(rule.type, async () => {
+      const commands = new FakeCommands([
+        { stdout: repository("acme/widget"), stderr: "" },
+        new Error("HTTP 404: Branch not protected"),
+        { stdout: JSON.stringify([rule]), stderr: "" },
+      ]);
+      const policy = await new GitHubClient(commands).branchProtection(project);
+      assert.equal(policy.known, false, "unsupported active merge requirement must fail closed");
+    });
+  }
+});
+
+test("branch protection queries the supplied PR base branch", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 404: Branch not protected"),
+    { stdout: "[]", stderr: "" },
+  ]);
+
+  await new GitHubClient(commands).branchProtection(project, "release/stable");
+
+  assert.equal(commands.calls[1]?.args[1], "repos/acme/widget/branches/release%2Fstable/protection");
+  assert.equal(commands.calls[2]?.args[1], "repos/acme/widget/rules/branches/release%2Fstable");
 });

@@ -17,8 +17,8 @@ import {
 } from "../domain/model.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
-import type { ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, SCHEMA_VERSION } from "./schema.js";
+import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -212,6 +212,18 @@ export class MerroStore {
         throw error;
       }
     }
+    if (version < 9) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_9);
+        this.#db.prepare("UPDATE schema_meta SET version = 9").run();
+        this.#db.exec("COMMIT");
+        version = 9;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -228,6 +240,19 @@ export class MerroStore {
   getProject(slug: string): Project | null {
     const row = this.#db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug);
     return row ? projectFromRow(row) : null;
+  }
+
+  updateProject(project: Project): void {
+    const current = this.getProject(project.slug);
+    if (!current) throw new Error(`unknown Project: ${project.slug}`);
+    if (current.path === project.path && current.baseRemote === project.baseRemote
+      && current.pushRemote === project.pushRemote && current.defaultBranch === project.defaultBranch) return;
+    this.#db.prepare(`
+      UPDATE projects
+      SET path = ?, base_remote = ?, push_remote = ?, default_branch = ?
+      WHERE slug = ?
+    `).run(project.path, project.baseRemote, project.pushRemote, project.defaultBranch, project.slug);
+    this.appendEvent("Project", project.slug, "reconciled", { from: current, to: project });
   }
 
   listProjects(): Project[] {
@@ -621,6 +646,71 @@ export class MerroStore {
       WHERE w.id = ?
     `).get(id);
     return row ? workItemFromRow(row) : null;
+  }
+
+  getFinalSummary(workItemId: string): FinalSummaryRecord | null {
+    const row = this.#db.prepare("SELECT * FROM final_summaries WHERE work_item_id = ?").get(workItemId);
+    if (!row) return null;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(String(row.payload_json));
+    } catch (error) {
+      throw new Error(`invalid final summary for WorkItem ${workItemId}`, { cause: error });
+    }
+    return { workItemId, payload, createdAt: String(row.created_at) };
+  }
+
+  listFinalSummaries(): FinalSummaryRecord[] {
+    return this.#db.prepare("SELECT * FROM final_summaries ORDER BY created_at, work_item_id").all()
+      .map((row) => {
+        const workItemId = String(row.work_item_id);
+        const summary = this.getFinalSummary(workItemId);
+        if (!summary) throw new Error(`missing final summary for WorkItem ${workItemId}`);
+        return summary;
+      });
+  }
+
+  completeWorkItemAfterMerge(id: string, payload: unknown): boolean {
+    const serialized = JSON.stringify(payload);
+    if (serialized === undefined) throw new Error("final summary must be JSON serializable");
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const item = this.getWorkItem(id);
+      if (!item) throw new Error(`unknown WorkItem: ${id}`);
+      const existing = this.getFinalSummary(id);
+      if (existing) {
+        if (item.state !== "Done") throw new Error(`WorkItem ${id} has a final summary but is not Done`);
+        this.#db.exec("COMMIT");
+        return false;
+      }
+      if (item.state !== "AwaitingMerge" && item.state !== "Blocked" && item.state !== "Done") {
+        throw new Error(`WorkItem ${id} is not awaiting a pull request merge`);
+      }
+      if (this.activeTask(id)) throw new Error(`WorkItem ${id} still has an active Task`);
+      const createdAt = now();
+      this.#db.prepare("INSERT INTO final_summaries(work_item_id, payload_json, created_at) VALUES (?, ?, ?)")
+        .run(id, serialized, createdAt);
+      if (item.state !== "Done") {
+        this.#db.prepare(`
+          UPDATE work_items
+          SET state = 'Done', blocked_reason = NULL, blocked_resume_state = NULL, updated_at = ?
+          WHERE id = ?
+        `).run(createdAt, id);
+        this.appendEvent("WorkItem", id, "state_changed", {
+          from: item.state,
+          to: "Done",
+          reason: "pull_request_merged",
+          blockedReason: null,
+          blockedResumeState: null,
+        });
+      }
+      this.appendEvent("WorkItem", id, "final_summary_written", { createdAt });
+      this.#db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   completeWorkItemAfterExternalMerge(id: string): void {

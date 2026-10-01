@@ -16,8 +16,8 @@ import { WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitBaseMergeConflictError, GitClient } from "../vcs/git.js";
 
 type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchAndMergeBase" | "syncBranchHead" | "effectiveDiffFingerprint">
-  & Partial<Pick<GitClient, "remoteBranchCommit" | "ensureWorkItemClone" | "createReadOnlyCheckout">>;
-type GitHubAdapter = Pick<GitHubClient, "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
+  & Partial<Pick<GitClient, "remoteBranchCommit" | "ensureWorkItemClone" | "createReadOnlyCheckout" | "deleteClone">>;
+type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup">
   & Partial<Pick<WorkerRuntime, "plan" | "stop">>;
@@ -112,6 +112,44 @@ function finalVerification(store: MerroStore, item: WorkItem, review: ReviewResu
   return `### Implementer\n${verificationText(implementationVerification)}\n\n### Reviewer\n${verificationText(review.verification)}`;
 }
 
+function finalMergeSummary(
+  store: MerroStore,
+  item: WorkItem,
+  runtime: WorkItemRuntimeRecord,
+  pullRequest: GitHubPullRequest,
+): Record<string, unknown> {
+  const tasks = store.listTasks(item.id);
+  return {
+    workItem: {
+      id: item.id,
+      projectSlug: item.projectSlug,
+      sourceType: item.sourceType,
+      sourceRef: item.sourceRef,
+      generation: item.generation,
+    },
+    diff: {
+      baseRefOid: pullRequest.baseRefOid,
+      headRefOid: pullRequest.headRefOid,
+      effectiveFingerprint: runtime.reviewedDiffHash,
+    },
+    pullRequest: {
+      number: pullRequest.number,
+      title: pullRequest.title,
+      url: pullRequest.url,
+      baseRefName: pullRequest.baseRefName,
+      baseRefOid: pullRequest.baseRefOid,
+      headRefName: pullRequest.headRefName,
+      headRefOid: pullRequest.headRefOid,
+      mergedAt: pullRequest.mergedAt,
+      mergeCommitSha: pullRequest.mergeCommitSha,
+    },
+    implementerSummaries: tasks.filter((task) => task.role === "implement" && task.outcome === "success")
+      .map((task) => ({ attempt: task.attempt, summary: task.summary, commitSha: task.commitSha })),
+    reviewerOutcomes: tasks.filter((task) => task.role === "review")
+      .map((task) => ({ attempt: task.attempt, outcome: task.outcome, summary: task.summary, reviewedCommit: task.reviewedCommit })),
+  };
+}
+
 function reviewNotes(review: ReviewResult): string {
   const findings = review.findings.filter((finding) => finding.severity !== "blocking");
   const notes = findings.length > 0
@@ -122,6 +160,28 @@ function reviewNotes(review: ReviewResult): string {
 
 function terminal(item: WorkItem): boolean {
   return item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled";
+}
+
+function remoteRepositoryIdentity(remote: string): string | null {
+  const value = remote.trim();
+  const ssh = value.match(/^([^@]+@)?([^:]+):(.+)$/);
+  if (ssh && !value.includes("://")) {
+    return `${ssh[2]?.toLowerCase()}/${ssh[3]?.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "").toLowerCase()}`;
+  }
+  try {
+    const url = new URL(value);
+    const path = url.pathname.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+    return path ? `${url.hostname.toLowerCase()}/${path.toLowerCase()}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameRemoteRepository(current: string, discovered: string): boolean {
+  if (current === discovered) return true;
+  const currentIdentity = remoteRepositoryIdentity(current);
+  const discoveredIdentity = remoteRepositoryIdentity(discovered);
+  return currentIdentity !== null && currentIdentity === discoveredIdentity;
 }
 
 function requiredCheckFailed(pullRequest: GitHubPullRequest, policy: BranchPolicy): boolean {
@@ -383,14 +443,13 @@ export class MainOrchestrator {
         let pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
         this.#savePullRequest(store, runtime, pullRequest);
         if (pullRequest.mergedAt) {
-          store.resolveDecision(decisionId, "resolved");
           if (!isCommitSha(pullRequest.mergeCommitSha)) {
+            store.resolveDecision(decisionId, "resolved");
             this.#block(store, item, "github_unavailable", "Merged pull request has no valid merge commit SHA");
             return;
           }
-          runtime.mergedCommitSha = pullRequest.mergeCommitSha;
-          store.saveWorkItemRuntime(runtime);
-          store.transitionWorkItem(item.id, "Done");
+          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
+          store.resolveDecision(decisionId, "resolved");
           this.#finishObjectives(store);
           return;
         }
@@ -418,7 +477,7 @@ export class MainOrchestrator {
           : null;
         const latestReview = store.listTasks(item.id).reverse()
           .find((task) => task.role === "review" && task.outcome === "pass");
-        const policy = await this.#github.branchProtection(project);
+        const policy = await this.#github.branchProtection(project, pullRequest.baseRefName);
         const remoteHead = runtime.branchName && this.#git.remoteBranchCommit
           ? await this.#git.remoteBranchCommit(project, runtime.branchName)
           : pullRequest.headRefOid;
@@ -450,13 +509,8 @@ export class MainOrchestrator {
         pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
         if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
         if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("GitHub did not report a valid merged commit SHA");
-        runtime.mergedCommitSha = pullRequest.mergeCommitSha;
-        store.saveWorkItemRuntime(runtime);
+        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
         store.resolveDecision(decisionId, "approved");
-        store.transitionWorkItem(item.id, "Done");
-        runtime.pullRequestState = "MERGED";
-        store.saveWorkItemRuntime(runtime);
-        this.#notify(`WorkItem ${item.id} merged and Done.`);
       } catch (error) {
         store.resolveDecision(decisionId, "resolved");
         const unavailable = !mergeAttempted || mergeCommandSucceeded
@@ -492,10 +546,9 @@ export class MainOrchestrator {
       let pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
       this.#savePullRequest(store, runtime, pullRequest);
       if (pullRequest.mergedAt) {
+        if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("merged pull request has no valid merge commit SHA");
+        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
         store.resolveDecision(decisionId, "resolved");
-        if (isCommitSha(pullRequest.mergeCommitSha)) runtime.mergedCommitSha = pullRequest.mergeCommitSha;
-        store.saveWorkItemRuntime(runtime);
-        store.completeWorkItemAfterExternalMerge(item.id);
         return;
       }
       if (pullRequest.state !== "OPEN") {
@@ -524,15 +577,16 @@ export class MainOrchestrator {
 
   async runPass(): Promise<void> {
     await this.#withStore(async (store) => {
-      await this.#reconcileIssues(store);
-      await this.#reconcileTasks(store);
-      await this.#reconcilePullRequests(store);
-      this.#deriveReady(store);
+      const unavailableProjects = await this.#reconcileProjects(store);
+      await this.#reconcileIssues(store, unavailableProjects);
+      await this.#reconcileTasks(store, unavailableProjects);
+      await this.#reconcilePullRequests(store, unavailableProjects);
+      this.#deriveReady(store, unavailableProjects);
       const tasks = store.listTasks();
       const active = tasks.filter((task) => task.status === "active");
       const items = store.listWorkItems();
       const result = schedule({
-        workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id)),
+        workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id) && !unavailableProjects.has(item.projectSlug)),
         relations: store.listRelations(),
         activeTaskCount: active.length,
         activeWorkItemIds: active.map((task) => task.workItemId),
@@ -689,9 +743,40 @@ export class MainOrchestrator {
     }
   }
 
-  async #reconcileIssues(store: MerroStore): Promise<void> {
+  async #reconcileProjects(store: MerroStore): Promise<Set<string>> {
+    const unavailable = new Set<string>();
+    for (const current of store.listProjects()) {
+      try {
+        const discovered = await this.#git.discoverProject(current.path, current.slug);
+        if (!sameRemoteRepository(current.baseRemote, discovered.baseRemote)
+          || !sameRemoteRepository(current.pushRemote, discovered.pushRemote)) {
+          throw new Error("Git remotes now identify a different repository; explicit confirmation is required");
+        }
+        const repository = await this.#github.repository(discovered.baseRemote);
+        const reconciled = { ...discovered, defaultBranch: repository.defaultBranch };
+        store.updateProject(reconciled);
+        for (const item of store.listWorkItems().filter((candidate) => candidate.projectSlug === current.slug)) {
+          if (item.state === "Blocked" && item.blockedReason === "project_unavailable" && item.blockedResumeState) {
+            store.transitionWorkItem(item.id, item.blockedResumeState);
+          }
+        }
+      } catch (error) {
+        unavailable.add(current.slug);
+        for (const item of store.listWorkItems().filter((candidate) => candidate.projectSlug === current.slug)) {
+          if (!terminal(item) && item.state !== "Blocked") {
+            this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${errorText(error)}`);
+          }
+        }
+        this.#notify(`Project ${current.slug} is unavailable: ${errorText(error)}`, "warning");
+      }
+    }
+    return unavailable;
+  }
+
+  async #reconcileIssues(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<void> {
     for (let item of store.listWorkItems()) {
-      if (item.sourceType !== "issue" || !store.hasActiveObjectiveForWorkItem(item.id) && !store.activeTask(item.id)) continue;
+      if (unavailableProjects.has(item.projectSlug)
+        || item.sourceType !== "issue" || !store.hasActiveObjectiveForWorkItem(item.id) && !store.activeTask(item.id)) continue;
       const project = store.getProject(item.projectSlug);
       if (!project) continue;
       try {
@@ -787,9 +872,10 @@ export class MainOrchestrator {
     this.#notify(`Reopened issue #${issue.number} created WorkItem generation ${generation}.`);
   }
 
-  async #reconcileTasks(store: MerroStore): Promise<void> {
+  async #reconcileTasks(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<void> {
     for (const task of store.listTasks().filter((candidate) => candidate.status === "active")) {
       const item = store.getWorkItem(task.workItemId);
+      if (item && unavailableProjects.has(item.projectSlug)) continue;
       const runtime = store.getTaskRuntime(task.id);
       const workRuntime = item && store.getWorkItemRuntime(item.id);
       if (!item || !runtime || !workRuntime) continue;
@@ -940,8 +1026,9 @@ export class MainOrchestrator {
     }
   }
 
-  async #reconcilePullRequests(store: MerroStore): Promise<void> {
+  async #reconcilePullRequests(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<void> {
     for (let item of store.listWorkItems()) {
+      if (unavailableProjects.has(item.projectSlug)) continue;
       const recovering = item.state === "Blocked"
         && item.blockedResumeState === "AwaitingMerge"
         && (item.blockedReason === "github_unavailable" || item.blockedReason === "policy_unknown");
@@ -955,9 +1042,14 @@ export class MainOrchestrator {
           if (runtime.pullRequestNumber !== null) {
             const pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
             this.#savePullRequest(store, runtime, pullRequest);
-            if (pullRequest.mergedAt && isCommitSha(pullRequest.mergeCommitSha)) {
-              runtime.mergedCommitSha = pullRequest.mergeCommitSha;
-              store.saveWorkItemRuntime(runtime);
+            if (pullRequest.mergedAt) {
+              if (!isCommitSha(pullRequest.mergeCommitSha)) {
+                this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
+                continue;
+              }
+              await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
+              this.#resolvePullRequestDecisions(store, item.id);
+              continue;
             }
           }
           this.#completeClosedIssue(store, store.getWorkItem(item.id) ?? item);
@@ -985,11 +1077,8 @@ export class MainOrchestrator {
             this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
             continue;
           }
-          runtime.mergedCommitSha = pullRequest.mergeCommitSha;
-          store.saveWorkItemRuntime(runtime);
+          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
           this.#resolvePullRequestDecisions(store, item.id);
-          if (item.state === "Blocked") store.completeWorkItemAfterExternalMerge(item.id);
-          else store.transitionWorkItem(item.id, "Done");
           continue;
         }
         if (pullRequest.state === "CLOSED") {
@@ -1045,7 +1134,7 @@ export class MainOrchestrator {
             continue;
           }
         }
-        const policy = await this.#github.branchProtection(project);
+        const policy = await this.#github.branchProtection(project, pullRequest.baseRefName);
         if (!policy.known) {
           if (recovering && item.blockedReason !== "policy_unknown") {
             store.transitionWorkItem(item.id, item.blockedResumeState!);
@@ -1213,6 +1302,46 @@ export class MainOrchestrator {
     }
   }
 
+  async #completeMergedWorkItem(
+    store: MerroStore,
+    item: WorkItem,
+    runtime: WorkItemRuntimeRecord,
+    project: Project,
+    pullRequest: GitHubPullRequest,
+  ): Promise<void> {
+    if (!pullRequest.mergedAt || !isCommitSha(pullRequest.mergeCommitSha)) {
+      throw new Error("cannot finalize a pull request without confirmed merge metadata");
+    }
+    this.#savePullRequest(store, runtime, pullRequest);
+    runtime.pullRequestState = "MERGED";
+    runtime.mergedCommitSha = pullRequest.mergeCommitSha;
+    store.saveWorkItemRuntime(runtime);
+    const newlyCompleted = store.completeWorkItemAfterMerge(
+      item.id,
+      finalMergeSummary(store, item, runtime, pullRequest),
+    );
+    if (newlyCompleted) this.#notify(`WorkItem ${item.id} merged and Done.`);
+
+    if (item.sourceType === "issue") {
+      try {
+        const issue = await this.#github.issue(project, Number(item.sourceRef));
+        if (issue.state.toUpperCase() !== "CLOSED") {
+          this.#notify(`GitHub issue #${item.sourceRef} remains open after merging ${pullRequest.url}; verify its Closes directive.`, "warning");
+        }
+      } catch (error) {
+        this.#notify(`Could not verify whether GitHub issue #${item.sourceRef} closed after merging ${pullRequest.url}: ${errorText(error)}`, "warning");
+      }
+    }
+
+    if (runtime.clonePath && this.#git.deleteClone) {
+      try {
+        await this.#git.deleteClone(this.#workRoot, runtime.clonePath);
+      } catch (error) {
+        this.#notify(`Could not clean up terminal WorkItem clone ${runtime.clonePath}: ${errorText(error)}`, "warning");
+      }
+    }
+  }
+
   #savePullRequest(store: MerroStore, runtime: WorkItemRuntimeRecord, pr: GitHubPullRequest): void {
     runtime.pullRequestNumber = pr.number;
     runtime.pullRequestUrl = pr.url;
@@ -1234,7 +1363,7 @@ export class MainOrchestrator {
     return true;
   }
 
-  #deriveReady(store: MerroStore): void {
+  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>): void {
     const items = store.listWorkItems();
     const byId = new Map(items.map((item) => [item.id, item]));
     const relations = store.listRelations();
@@ -1242,7 +1371,8 @@ export class MainOrchestrator {
     const cycle = findRequiresCycle(relations);
     if (cycle) this.#blockCycle(store, cycle, active);
     for (const item of store.listWorkItems()) {
-      if ((item.state !== "Planned" && item.state !== "Ready") || active.has(item.id)) continue;
+      if (unavailableProjects.has(item.projectSlug)
+        || (item.state !== "Planned" && item.state !== "Ready") || active.has(item.id)) continue;
       if (!store.hasActiveObjectiveForWorkItem(item.id)) {
         store.transitionWorkItem(item.id, "Obsolete");
         continue;
@@ -1275,8 +1405,12 @@ export class MainOrchestrator {
   }
 
   #reviewLimit(store: MerroStore, item: WorkItem): number | "unlimited" {
-    const objective = store.listObjectives().find((candidate) => store.listWorkItems(candidate.id).some((workItem) => workItem.id === item.id));
-    return objective?.maxReviewRounds ?? this.#config.max_review_rounds;
+    const limits = store.listObjectives()
+      .filter((objective) => objective.state === "Active"
+        && store.listWorkItems(objective.id).some((workItem) => workItem.id === item.id))
+      .map((objective) => objective.maxReviewRounds ?? this.#config.max_review_rounds);
+    if (limits.length === 0 || limits.every((limit) => limit === "unlimited")) return "unlimited";
+    return Math.min(...limits.filter((limit): limit is number => limit !== "unlimited"));
   }
 
   #reviewContext(json: string): string {
