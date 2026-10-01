@@ -18,7 +18,7 @@ import {
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertWorkItemTransition } from "../domain/work-item.js";
 import type { ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -195,6 +195,18 @@ export class MerroStore {
         this.#db.prepare("UPDATE schema_meta SET version = 7").run();
         this.#db.exec("COMMIT");
         version = 7;
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    if (version < 8) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_8);
+        this.#db.prepare("UPDATE schema_meta SET version = 8").run();
+        this.#db.exec("COMMIT");
+        version = 8;
       } catch (error) {
         this.#db.exec("ROLLBACK");
         throw error;
@@ -401,6 +413,8 @@ export class MerroStore {
       pullRequestHeadSha: row.pull_request_head_sha === null ? null : String(row.pull_request_head_sha),
       pullRequestBaseSha: row.pull_request_base_sha === null ? null : String(row.pull_request_base_sha),
       mergedCommitSha: row.merged_commit_sha === null ? null : String(row.merged_commit_sha),
+      lastIssueState: row.last_issue_state === null ? null : String(row.last_issue_state),
+      reviewedDiffHash: row.reviewed_diff_hash === null ? null : String(row.reviewed_diff_hash),
       reviewRound: Number(row.review_round),
       infrastructureRetries: Number(row.infrastructure_retries),
       implementationAttempt: Number(row.implementation_attempt),
@@ -413,22 +427,24 @@ export class MerroStore {
     this.#db.prepare(`
       INSERT INTO work_item_runtime(
         work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
-        pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, review_round,
-        infrastructure_retries, implementation_attempt, last_reconciled_at, last_rework_trigger
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, last_issue_state,
+        reviewed_diff_hash, review_round, infrastructure_retries, implementation_attempt, last_reconciled_at,
+        last_rework_trigger
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(work_item_id) DO UPDATE SET
         branch_name = excluded.branch_name, clone_path = excluded.clone_path, base_commit = excluded.base_commit,
         pull_request_number = excluded.pull_request_number, pull_request_url = excluded.pull_request_url,
         pull_request_state = excluded.pull_request_state, pull_request_head_sha = excluded.pull_request_head_sha,
         pull_request_base_sha = excluded.pull_request_base_sha, merged_commit_sha = excluded.merged_commit_sha,
+        last_issue_state = excluded.last_issue_state, reviewed_diff_hash = excluded.reviewed_diff_hash,
         review_round = excluded.review_round, infrastructure_retries = excluded.infrastructure_retries,
         implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at,
         last_rework_trigger = excluded.last_rework_trigger
     `).run(
       record.workItemId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
       record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
-      record.mergedCommitSha, record.reviewRound, record.infrastructureRetries, record.implementationAttempt,
-      record.lastReconciledAt, record.lastReworkTrigger,
+      record.mergedCommitSha, record.lastIssueState, record.reviewedDiffHash, record.reviewRound,
+      record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt, record.lastReworkTrigger,
     );
   }
 
@@ -628,6 +644,26 @@ export class MerroStore {
     });
   }
 
+  completeWorkItemAfterExternalIssueClosure(id: string): void {
+    const item = this.getWorkItem(id);
+    if (!item) throw new Error(`unknown WorkItem: ${id}`);
+    if (item.state === "Done") return;
+    if (item.state === "Obsolete" || item.state === "Cancelled") return;
+    if (this.activeTask(id)) throw new Error(`WorkItem ${id} still has an active Task`);
+    this.#db.prepare(`
+      UPDATE work_items
+      SET state = 'Done', blocked_reason = NULL, blocked_resume_state = NULL, updated_at = ?
+      WHERE id = ?
+    `).run(now(), id);
+    this.appendEvent("WorkItem", id, "state_changed", {
+      from: item.state,
+      to: "Done",
+      reason: "issue_closed_externally",
+      blockedReason: null,
+      blockedResumeState: null,
+    });
+  }
+
   transitionWorkItem(id: string, to: WorkItemState, blockedReason: BlockReason | null = null): void {
     const item = this.getWorkItem(id);
     if (!item) throw new Error(`unknown WorkItem: ${id}`);
@@ -793,7 +829,9 @@ export class MerroStore {
         if (this.activeTask(item.id)) continue;
         this.transitionWorkItem(item.id, "Obsolete");
         for (const decision of this.pendingDecisions()) {
-          if (decision.kind === "merge" && decision.subjectId === item.id) this.resolveDecision(decision.id, "resolved");
+          if ((decision.kind === "merge" || decision.kind === "merge_conflict") && decision.subjectId === item.id) {
+            this.resolveDecision(decision.id, "resolved");
+          }
         }
       }
       this.#db.exec("COMMIT");

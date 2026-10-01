@@ -73,6 +73,8 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       pullRequestHeadSha: null,
       pullRequestBaseSha: null,
       mergedCommitSha: null,
+      lastIssueState: null,
+      reviewedDiffHash: null,
       reviewRound: 1,
       infrastructureRetries: 0,
       implementationAttempt: 2,

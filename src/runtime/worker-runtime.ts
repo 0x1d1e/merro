@@ -406,6 +406,21 @@ export class WorkerRuntime {
     }
   }
 
+  async stop(record: TaskRuntimeRecord, taskId: string): Promise<void> {
+    const presence = await this.inspect(record, taskId);
+    if (!presence.alive) return;
+    if (!presence.identityMatches) {
+      throw new Error(`refusing to stop a worker whose identity does not match Task ${taskId}`);
+    }
+    const runtimeKind = record.runtimeKind ?? (record.containerId || this.#config.sandbox === "docker" ? "docker" : "host");
+    if (runtimeKind === "docker") {
+      const container = record.containerId ?? `merro-${safeName(taskId)}`;
+      await this.#commands.run("docker", ["stop", "--time", "10", container]);
+      return;
+    }
+    await this.#commands.run("tmux", ["kill-window", "-t", `${record.tmuxSession}:${record.tmuxWindow}`]);
+  }
+
   async cleanup(record: TaskRuntimeRecord): Promise<void> {
     await this.#makeWritable(dirname(record.resultPath));
     await rm(dirname(record.resultPath), { recursive: true, force: true });

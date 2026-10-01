@@ -286,6 +286,50 @@ export class GitHubClient {
     return parsePullRequest(parseJson(result.stdout, "gh pr view"));
   }
 
+  async syncPullRequestContent(
+    project: Project,
+    pullRequest: GitHubPullRequest,
+    body: string,
+    reviewNotes: string,
+  ): Promise<void> {
+    const repository = await this.repository(project.baseRemote);
+    if (pullRequest.body !== body) {
+      await this.#commands.run("gh", [
+        "pr", "edit", String(pullRequest.number), "--repo", repository.nameWithOwner, "--body", body,
+      ], { cwd: project.path });
+    }
+
+    const endpoint = `repos/${repository.nameWithOwner}/issues/${pullRequest.number}/comments`;
+    const listed = await this.#commands.run("gh", [
+      "api", endpoint, "--paginate", "--jq", ".[] | {id, body, created_at}",
+    ], { cwd: project.path });
+    const comments = listed.stdout.trim()
+      ? listed.stdout.trim().split(/\r?\n/).map((line) => object(parseJson(line, "gh api pull request comments"), "gh api pull request comment"))
+        .flatMap((row) => typeof row.body === "string" && (typeof row.id === "number" || typeof row.id === "string")
+          ? [{ id: String(row.id), body: row.body, createdAt: typeof row.created_at === "string" ? row.created_at : "" }]
+          : [])
+      : [];
+    const canonical = comments.filter((comment) => comment.body.includes("<!-- merro:review-notes -->"))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt)).at(-1);
+    if (!canonical) {
+      await this.#commands.run("gh", [
+        "pr", "comment", String(pullRequest.number), "--repo", repository.nameWithOwner, "--body", reviewNotes,
+      ], { cwd: project.path });
+      return;
+    }
+    if (canonical.body === reviewNotes) return;
+    try {
+      await this.#commands.run("gh", [
+        "api", "--method", "PATCH", `repos/${repository.nameWithOwner}/issues/comments/${canonical.id}`,
+        "--field", `body=${reviewNotes}`,
+      ], { cwd: project.path });
+    } catch {
+      await this.#commands.run("gh", [
+        "pr", "comment", String(pullRequest.number), "--repo", repository.nameWithOwner, "--body", reviewNotes,
+      ], { cwd: project.path });
+    }
+  }
+
   async createPullRequest(
     project: Project,
     branchName: string,

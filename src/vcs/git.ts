@@ -1,5 +1,5 @@
 import { chmod, lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Project } from "../domain/model.js";
 import { CommandError, systemCommandRunner, type CommandRunner } from "../runtime/commands.js";
@@ -213,6 +213,31 @@ export class GitClient {
       await rm(temporaryPath, { recursive: true, force: true });
       throw error;
     }
+  }
+
+  async effectiveDiffFingerprint(
+    project: Project,
+    path: string,
+    baseRefName: string,
+    baseCommit: string,
+    headCommit: string,
+  ): Promise<string> {
+    if (!/^[0-9a-f]{40,64}$/i.test(baseCommit) || !/^[0-9a-f]{40,64}$/i.test(headCommit)) {
+      throw new Error("effective diff requires valid base and head commit SHAs");
+    }
+    await this.#run("git", ["check-ref-format", "--branch", baseRefName]);
+    const remote = await this.#resolveRemote(project.path, project.baseRemote);
+    await this.#run("git", ["fetch", "--no-tags", remote, `refs/heads/${baseRefName}`], { cwd: path });
+    const fetchedBase = (await this.#run("git", ["rev-parse", "FETCH_HEAD"], { cwd: path })).stdout.trim();
+    if (fetchedBase !== baseCommit) {
+      throw new Error(`pull request base changed while comparing diff: expected ${baseCommit}, fetched ${fetchedBase}`);
+    }
+    const mergeBase = (await this.#run("git", ["merge-base", baseCommit, headCommit], { cwd: path })).stdout.trim();
+    if (!/^[0-9a-f]{40,64}$/i.test(mergeBase)) throw new Error("Git returned an invalid merge base");
+    const diff = await this.#run("git", [
+      "diff", "--no-ext-diff", "--no-color", "--binary", "--full-index", mergeBase, headCommit,
+    ], { cwd: path });
+    return createHash("sha256").update(diff.stdout).digest("hex");
   }
 
   async remoteBranchCommit(project: Project, branchName: string): Promise<string | null> {

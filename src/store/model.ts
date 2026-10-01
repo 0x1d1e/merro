@@ -27,6 +27,8 @@ export interface WorkItemRuntimeRecord {
   pullRequestHeadSha: string | null;
   pullRequestBaseSha: string | null;
   mergedCommitSha: string | null;
+  lastIssueState: string | null;
+  reviewedDiffHash: string | null;
   reviewRound: number;
   infrastructureRetries: number;
   implementationAttempt: number;

@@ -37,6 +37,11 @@ const workItemParameters = Type.Object({
   work_item_id: Type.String(),
 }, { additionalProperties: false });
 
+const mergeConflictParameters = Type.Object({
+  decision_id: Type.String(),
+  resolution: Type.Union([Type.Literal("resolved"), Type.Literal("abandon")]),
+}, { additionalProperties: false });
+
 const emptyParameters = Type.Object({}, { additionalProperties: false });
 
 interface MainTool {
@@ -148,6 +153,20 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
       if (!Array.isArray(relations)) throw new Error("relations must be an array");
       await main.updateRelations(relations as Parameters<MainOrchestrator["updateRelations"]>[0]);
       return result(`Updated ${relations.length} active relation(s).`, relations);
+    },
+  });
+
+  pi.registerTool({
+    name: "merro_resolve_merge_conflict",
+    label: "Resolve merge conflict Decision",
+    description: "Resolve a pending merge-conflict Decision after the user explicitly chooses to confirm conflict resolution or abandon it. 'resolved' merges and pushes the updated base when possible, then requires GitHub to report the PR conflict-free; 'abandon' leaves the PR open and blocks its WorkItem.",
+    parameters: mergeConflictParameters,
+    async execute(_id, args) {
+      const decisionId = stringArgument(args, "decision_id");
+      const resolution = args.resolution;
+      if (resolution !== "resolved" && resolution !== "abandon") throw new Error("resolution must be 'resolved' or 'abandon'");
+      await main.resolveMergeConflictDecision(decisionId, resolution);
+      return result(`Merge-conflict Decision ${decisionId} ${resolution}.`);
     },
   });
 

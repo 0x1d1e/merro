@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -256,4 +256,9 @@ WHEN OLD.state = 'Blocked'
 BEGIN
   SELECT RAISE(ABORT, 'Blocked WorkItem must resume previous flow state');
 END;
+`;
+
+export const MIGRATION_8 = `
+ALTER TABLE work_item_runtime ADD COLUMN last_issue_state TEXT;
+ALTER TABLE work_item_runtime ADD COLUMN reviewed_diff_hash TEXT;
 `;

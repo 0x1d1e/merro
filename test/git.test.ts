@@ -85,6 +85,44 @@ test("Git client creates per-WorkItem clone, validates one commit, and pushes wi
   await assert.rejects(gitClient.deleteClone(workRoot, project.path), /outside work root/);
 });
 
+test("effective diff fingerprint survives commit rewrites but detects changed content", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const projectRepo = await createProject(root);
+  const project = {
+    slug: "p",
+    path: projectRepo.path,
+    baseRemote: "origin",
+    pushRemote: "origin",
+    defaultBranch: "main",
+  };
+  const gitClient = new GitClient();
+  const clone = await gitClient.createWorkItemClone(project, join(root, "work"), "merro/issue-1-example");
+  await writeFile(join(clone.path, "change.txt"), "same patch\n");
+  await git(clone.path, "add", "change.txt");
+  await git(clone.path, "commit", "-m", "first implementation");
+  const firstHead = await gitClient.currentCommit(clone.path);
+  const firstFingerprint = await gitClient.effectiveDiffFingerprint(
+    project, clone.path, "main", clone.baseCommit, firstHead,
+  );
+
+  await git(clone.path, "commit", "--amend", "-m", "rewritten implementation");
+  const rewrittenHead = await gitClient.currentCommit(clone.path);
+  assert.notEqual(rewrittenHead, firstHead);
+  const rewrittenFingerprint = await gitClient.effectiveDiffFingerprint(
+    project, clone.path, "main", clone.baseCommit, rewrittenHead,
+  );
+  assert.equal(rewrittenFingerprint, firstFingerprint);
+
+  await writeFile(join(clone.path, "change.txt"), "different patch\n");
+  await git(clone.path, "add", "change.txt");
+  await git(clone.path, "commit", "--amend", "--no-edit");
+  const changedFingerprint = await gitClient.effectiveDiffFingerprint(
+    project, clone.path, "main", clone.baseCommit, await gitClient.currentCommit(clone.path),
+  );
+  assert.notEqual(changedFingerprint, firstFingerprint);
+});
+
 test("Git client creates an exact detached checkout for dependency review", async (t) => {
   const root = await tempDirectory();
   t.after(async () => {

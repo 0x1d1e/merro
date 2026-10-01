@@ -91,12 +91,14 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
   if (main) {
     for (const [name, approved] of [["merro-approve", true], ["merro-reject", false]] as const) {
       pi.registerCommand(name, {
-        description: approved ? "Approve a pending Merro merge Decision" : "Reject a pending Merro merge Decision",
+        description: approved
+          ? "Approve a merge Decision or confirm a merge-conflict resolution"
+          : "Reject a merge Decision or abandon a merge-conflict resolution",
         async handler(args, ctx) {
           const decisionId = args.trim();
           if (!decisionId || /\s/.test(decisionId)) throw new Error(`Usage: /${name} <Decision ID>`);
           await main.resolveMergeDecision(decisionId, approved);
-          report(ctx, `Merge Decision ${decisionId} ${approved ? "approved" : "rejected"}.`);
+          report(ctx, `Decision ${decisionId} ${approved ? "approved or resolved" : "rejected or abandoned"}.`);
         },
       });
     }
