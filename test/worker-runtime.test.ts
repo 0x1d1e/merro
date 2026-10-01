@@ -63,6 +63,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
           await writeFile(String(tokens[cidIndex + 1]), `${containerId}\n`);
           environmentFile = String(tokens[envIndex + 1]);
           assert.match(await readFile(environmentFile, "utf8"), /GH_TOKEN=ghp_test-token/);
+          assert.match(await readFile(environmentFile, "utf8"), /^MERRO_RUNTIME=worker$/m);
           containerArgs = tokens;
           return { stdout: "%1\n", stderr: "" };
         }
@@ -505,6 +506,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   assert.equal(await exists(join(stagedConfig, "settings.json")), false);
   assert.equal(await exists(join(stagedConfig, "sessions")), false);
   const script = await readFile(workerScript, "utf8");
+  assert.ok(script.includes("export MERRO_RUNTIME='worker'"));
   assert.ok(script.includes(`export HOME='${join(taskRoot, "home")}'`));
   assert.ok(script.includes(`export PI_CODING_AGENT_DIR='${join(taskRoot, "pi-config")}'`));
   assert.ok(script.includes(`'${join(taskRoot, "merro-runtime", "tools", "worker-result.js")}'`));

@@ -467,28 +467,44 @@ export class MerroStore {
     }
   }
 
+  #relationRebuild(analyzedIds: readonly string[], relations: readonly Relation[], occupiedWorkItemIds: readonly string[]) {
+    const analyzed = new Set(analyzedIds);
+    const occupied = new Set([...occupiedWorkItemIds,
+      ...this.#db.prepare("SELECT work_item_id FROM tasks WHERE status = 'active'").all().map((row) => String(row.work_item_id))]);
+    const deactivateIds: number[] = [];
+    const surviving = new Map<string, { relation: Relation; automatic: boolean }>();
+    const key = (relation: Relation) => `${relation.kind}\0${relation.from}\0${relation.to}`;
+    const rows = this.#db.prepare("SELECT * FROM relations ORDER BY id").all();
+    const order = new Map(rows.map((row, index) => [key(relationFromRow(row)), index]));
+    for (const row of rows) {
+      if (Number(row.active) !== 1) continue;
+      const relation = relationFromRow(row);
+      const automatic = Number(row.automatic) === 1;
+      // Either endpoint may supply a symmetric relation. Preserve it until both are checked and idle.
+      const remove = automatic && (relation.kind === "Requires" ? analyzed.has(relation.from)
+        : analyzed.has(relation.from) && analyzed.has(relation.to) && !occupied.has(relation.from) && !occupied.has(relation.to));
+      if (remove) deactivateIds.push(Number(row.id));
+      else surviving.set(key(relation), { relation, automatic });
+    }
+    for (const relation of relations.map(normalizeRelation)) {
+      if (surviving.get(key(relation))?.automatic === false) continue;
+      surviving.set(key(relation), { relation, automatic: true });
+    }
+    const projected = [...surviving.values()].map((entry) => entry.relation)
+      .sort((left, right) => (order.get(key(left)) ?? rows.length) - (order.get(key(right)) ?? rows.length));
+    return { deactivateIds, relations: effectiveRelations(projected) };
+  }
+
+  previewAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[]): Relation[] {
+    return this.#relationRebuild(analyzedIds, relations, []).relations;
+  }
+
   rebuildAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[], occupiedWorkItemIds: readonly string[] = []): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE automatic = 1 AND kind = 'Requires' AND from_work_item_id = ?");
-      for (const id of analyzedIds) deactivate.run(id);
-      // Either endpoint may supply a symmetric relation. Preserve it until both were checked successfully.
-      const analyzed = new Set(analyzedIds);
-      const occupied = new Set(occupiedWorkItemIds);
-      const deactivateConflict = this.#db.prepare(`
-        UPDATE relations SET active = 0
-        WHERE automatic = 1 AND kind = 'Conflicts' AND from_work_item_id = ? AND to_work_item_id = ?
-          AND NOT EXISTS (
-            SELECT 1 FROM tasks WHERE status = 'active'
-              AND work_item_id IN (relations.from_work_item_id, relations.to_work_item_id)
-          )
-      `);
-      for (const relation of this.#db.prepare("SELECT from_work_item_id, to_work_item_id FROM relations WHERE automatic = 1 AND kind = 'Conflicts' AND active = 1").all()) {
-        if (analyzed.has(String(relation.from_work_item_id)) && analyzed.has(String(relation.to_work_item_id))
-          && !occupied.has(String(relation.from_work_item_id)) && !occupied.has(String(relation.to_work_item_id))) {
-          deactivateConflict.run(String(relation.from_work_item_id), String(relation.to_work_item_id));
-        }
-      }
+      const rebuild = this.#relationRebuild(analyzedIds, relations, occupiedWorkItemIds);
+      const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE id = ?");
+      for (const id of rebuild.deactivateIds) deactivate.run(id);
       const upsert = this.#db.prepare(`
         INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, active, automatic, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)

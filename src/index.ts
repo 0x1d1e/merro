@@ -10,6 +10,7 @@ interface MerroExtensionAPI extends PiExtensionLike, MainToolAPI {
 
 /** Pi package entrypoint. Main state is reconciled on startup and while work remains active. */
 export default async function merro(pi: MerroExtensionAPI): Promise<void> {
+  if (process.env.MERRO_RUNTIME === "worker") return;
   const workspacePath = process.cwd();
   const config = await loadConfig(join(workspacePath, ".merro", "config.json"));
   const main = new MainOrchestrator({ workspacePath, config });

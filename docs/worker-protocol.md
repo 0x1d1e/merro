@@ -13,6 +13,14 @@ Read before changing Task files, the result tool, container/tmux launch, process
 - Network on by default. `sandbox: none` runs the same Task on the host in the clone.
 - Image: Merro generic (Node, git, common build tools), overridable per Project by image name or Dockerfile.
 
+## Pi runtime boundary
+
+Main Pi loads Merro's orchestration extension. Every Docker and host Worker Pi runs with `MERRO_RUNTIME=worker`; Merro's normal package entrypoint is intentionally inert in that runtime. It creates no Main state, lock, commands, tools, timers, or nested workers. The dedicated `merro_submit_result` extension remains active.
+
+`pi_config: copy` preserves installed packages, unrelated extensions, settings, auth, and model/provider configuration in Task scratch without changing the host config. Package filtering is not required: the explicit runtime marker protects Merro even when it is loaded from another configuration location. The marker belongs to the worker launch environment only, never Main's environment or persisted Pi settings. Docker workers mount only the clone and Task scratch, not Main's store; `sandbox: none` is not an OS security boundary.
+
+`/status` and `/merro-export` use the live Main's serialized state access when available, waiting for an active reconciliation operation to release ownership. Export is a coherent detached snapshot, not mutable store access. Standalone commands still acquire the workspace lock; `/unlock` never bypasses live ownership.
+
 ## tmux
 
 - Session `merro-<project>` created when a Project's first Task starts, detached, no Main window. Never auto-attached.
@@ -34,7 +42,7 @@ Written fresh by Main per Task into the clone (excluded via `.git/info/exclude`,
 
 ## Task output: `merro_submit_result`
 
-Worker ends by calling the `merro_submit_result` tool, which validates the schema, writes `.merro-result.json` atomically, and exits Pi. Main validates: `task_id` equals the active Task, schema matches role, commit state matches, result is not stale. Then copies to Task history and deletes the file.
+Worker ends by calling the `merro_submit_result` tool, which validates the schema and local commit, writes `.merro-result.json` atomically in Task scratch, and terminates Pi's automatic follow-up. The result path must be beside the scratch `pi-config` directory, outside the checkout. Implementer success and all review results require a full Git commit ID that resolves locally to HEAD. Invalid submissions throw an actionable error without writing a result or terminating; the worker must explicitly correct and resubmit, never receive an automatically substituted SHA. Failed implementers retain the ability to report an unusable checkout without an exact-HEAD check. Main independently validates every artifact; worker prevalidation is not a trust boundary. Controlled `.merro-task.md` remains excluded, not globally ignored. Main validates: `task_id` equals the active Task, schema matches role, commit state matches, result is not stale. Then copies to Task history and deletes the file.
 Wrong `task_id`: don't consume, don't delete, WorkItem Blocked, report expected vs found.
 
 Main retries pending finalized Task artifact cleanup every reconciliation pass, including after restart and when a Project is unavailable. Successful cleanup records `cleanup_completed_at` in mutable Task runtime metadata, not immutable Task history; completed cleanups leave the retry queue. Older runtimes without this marker enter the queue once. Result submission and Task finalization do not prove process exit. Refresh worker inventory after finalization before scheduling successors or cleaning artifacts, including on exceptional reconciliation exits. Defer cleanup while a Project has unowned live workers or an incomplete worker inventory. Remove Task scratch and launch credentials; preserve mismatched results and shared input owned by an active successor Task.
