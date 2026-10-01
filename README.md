@@ -18,12 +18,16 @@ Objective: ship kinetix 1.0, all open issues labeled 1.0.
 
 Main proposes WorkItems and relations, you approve, then it schedules implement and review Tasks,
 opens PRs, asks per-PR merge approval, squash-merges, and replans until the Objective is done.
+Approve fixed issue numbers or a query matching all specified labels and an optional milestone title.
+Query scopes include future matching issues automatically; completion requires a fresh GitHub check.
+`merro_start_objective` records each Project's scope as `numbers: [7, 8]` or
+`query: { labels: ["1.0"], milestone: "1.0" }`; `query: {}` covers all open issues.
 
 Escape hatches (commands): `status`, `stop`, `unlock`, `export` (SQLite to JSON).
 
 ## Requirements
 
-`git`, `gh` (authenticated), `docker`, `tmux`, Node with `node:sqlite` (verify against Pi's runtime).
+`git`, `gh` (authenticated), `docker`, `tmux`, Node.js >=22.13.0 for unflagged `node:sqlite` (verify against Pi's runtime).
 
 ## Config
 
@@ -41,6 +45,13 @@ Escape hatches (commands): `status`, `stop`, `unlock`, `export` (SQLite to JSON)
 | `work_root` | `<checkout>-work/`, outside the Merro checkout |
 | `notify_command` | unset; runs on Blocked, merge-ready, Objective Done |
 | model / thinking effort | Pi defaults unless set |
+
+`notify_command` runs via `bash -lc` in the workspace after releasing Main's lock. It receives
+`MERRO_EVENT` (`blocked`, `merge_ready`, `objective_done`), `MERRO_SUBJECT_ID`, and `MERRO_MESSAGE`.
+Command failures warn without aborting reconciliation.
+
+To adopt a moved repository, register its new path with the existing Project slug. Both remotes
+must still identify the same repositories.
 
 ## Where to read next
 
