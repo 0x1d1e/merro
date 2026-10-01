@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { MerroConfig } from "../config.js";
 import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type WorkItem } from "../domain/model.js";
@@ -424,6 +424,11 @@ export class MainOrchestrator {
         throw new Error(`merge Decision ${decisionId} no longer matches an AwaitingMerge WorkItem`);
       }
 
+      const { unsafeProjects } = await this.#workerSafetyPreflight(store);
+      if (approved && unsafeProjects.has(project.slug)) {
+        throw new Error(`Worker safety prevents merge approval in Project ${project.slug}; retry after live workers exit and inventory succeeds. Decision remains pending.`);
+      }
+
       let mergeAttempted = false;
       let mergeCommandSucceeded = false;
       try {
@@ -435,9 +440,9 @@ export class MainOrchestrator {
             this.#block(store, item, "github_unavailable", "Merged pull request has no valid merge commit SHA");
             return;
           }
-          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
+          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
           store.resolveDecision(decisionId, "resolved");
-          await this.#finishObjectives(store);
+          await this.#finishObjectives(store, new Set(), unsafeProjects);
           return;
         }
         if (pullRequest.state !== "OPEN") {
@@ -495,7 +500,7 @@ export class MainOrchestrator {
         pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
         if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
         if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("GitHub did not report a valid merged commit SHA");
-        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
+        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
         store.resolveDecision(decisionId, "approved");
       } catch (error) {
         store.resolveDecision(decisionId, "resolved");
@@ -504,7 +509,7 @@ export class MainOrchestrator {
         const reason = unavailable ? "github_unavailable" : "merge_failed";
         this.#block(store, item, reason, `Merge ${unavailable ? "reconciliation failed" : "was rejected"}: ${errorText(error)}`);
       }
-      await this.#finishObjectives(store);
+      await this.#finishObjectives(store, new Set(), unsafeProjects);
     });
     await this.runPass();
   }
@@ -522,6 +527,10 @@ export class MainOrchestrator {
         || !runtime.pullRequestNumber || !project) {
         throw new Error(`merge_conflict Decision ${decisionId} no longer matches an AwaitingMerge WorkItem`);
       }
+      const { unsafeProjects } = await this.#workerSafetyPreflight(store);
+      if (resolution === "resolved" && unsafeProjects.has(project.slug)) {
+        throw new Error(`Worker safety prevents conflict approval in Project ${project.slug}; retry after live workers exit and inventory succeeds. Decision remains pending.`);
+      }
       if (resolution === "abandon") {
         store.resolveDecision(decisionId, "rejected");
         this.#block(store, item, "merge_rejected", "Conflict resolution abandoned; the PR remains open");
@@ -532,7 +541,7 @@ export class MainOrchestrator {
       this.#savePullRequest(store, runtime, pullRequest);
       if (pullRequest.mergedAt) {
         if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("merged pull request has no valid merge commit SHA");
-        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest);
+        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
         store.resolveDecision(decisionId, "resolved");
         return;
       }
@@ -556,9 +565,12 @@ export class MainOrchestrator {
   async runPass(): Promise<void> {
     await this.#withStore(async (store) => {
       const unsafeProjects = new Set<string>();
+      const finalizedTaskCount = () => store.listTasks().filter((task) => task.status === "finalized").length;
+      let inventoriedFinalizedTaskCount = -1;
       try {
         const unavailableProjects = await this.#reconcileProjects(store);
-        const orphans = await this.#reconcileWorkers(store, unsafeProjects);
+        let orphans = await this.#workerSafetyPreflight(store, unsafeProjects);
+        inventoriedFinalizedTaskCount = finalizedTaskCount();
         const scopeGates = new Set<string>();
         for (const objective of store.listObjectives()) {
           if (objective.state === "Active" && objective.issueScopes?.some((scope) => "query" in scope)) {
@@ -566,7 +578,12 @@ export class MainOrchestrator {
           }
         }
         await this.#reconcileIssues(store, unavailableProjects, orphans.workItemIds);
-        await this.#reconcileTasks(store, unavailableProjects, unsafeProjects);
+        await this.#reconcileTasks(store, unavailableProjects, unsafeProjects, orphans.liveTaskIds);
+        // Result submission does not prove exit. Newly finalized live workers still occupy their slots.
+        if (finalizedTaskCount() !== inventoriedFinalizedTaskCount) {
+          orphans = await this.#workerSafetyPreflight(store, unsafeProjects);
+          inventoriedFinalizedTaskCount = finalizedTaskCount();
+        }
         store.settleScopeDetachments();
         for (const item of store.listWorkItems()) {
           if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
@@ -593,6 +610,10 @@ export class MainOrchestrator {
         }
         await this.#finishObjectives(store, unavailableProjects, unsafeProjects);
       } finally {
+        // Cover exceptional exits and Tasks finalized by failed launches after scheduling.
+        if (finalizedTaskCount() !== inventoriedFinalizedTaskCount) {
+          await this.#workerSafetyPreflight(store, unsafeProjects);
+        }
         await this.#reconcileFinalizedTasks(store, unsafeProjects);
       }
     });
@@ -895,11 +916,12 @@ export class MainOrchestrator {
     this.#notify(`Reopened issue #${issue.number} created WorkItem generation ${generation}.`);
   }
 
-  async #reconcileWorkers(store: MerroStore, unsafeProjects: Set<string>): Promise<{ count: number; workItemIds: Set<string> }> {
+  async #workerSafetyPreflight(store: MerroStore, unsafeProjects = new Set<string>()): Promise<{ unsafeProjects: Set<string>; count: number; workItemIds: Set<string>; liveTaskIds: Set<string> }> {
     // Finalized runtime identity still links legacy panes and containers, without adopting their workers.
     const runtimes = store.listTasks().map((task) => store.getTaskRuntime(task.id)).filter((runtime) => runtime !== null);
     const orphanIds = new Set<string>();
     const workItemIds = new Set<string>();
+    const liveTaskIds = new Set<string>();
     const projects = store.listProjects();
     for (const project of projects) {
       try {
@@ -913,7 +935,10 @@ export class MainOrchestrator {
               && runtime.tmuxWindow === worker.tmuxWindow && runtime.tmuxSession === worker.tmuxSession)) : undefined;
           const taskId = worker.taskId ?? matchedRuntime?.taskId ?? null;
           const recordedTask = taskId !== null ? store.getTask(taskId) : null;
-          if (recordedTask?.status === "active") continue;
+          if (recordedTask?.status === "active") {
+            liveTaskIds.add(recordedTask.id);
+            continue;
+          }
           orphanIds.add(taskId !== null ? `task:${taskId}` : worker.containerId !== null
             ? `container:${worker.containerId}` : `pane:${worker.tmuxSession}:${worker.paneId}`);
           const item = worker.workItemId ? store.getWorkItem(worker.workItemId)
@@ -933,10 +958,10 @@ export class MainOrchestrator {
         this.#notify(`Could not enumerate owned workers for Project ${project.slug}; scheduling gated: ${errorText(error)}`, "warning");
       }
     }
-    return { count: orphanIds.size, workItemIds };
+    return { unsafeProjects, count: orphanIds.size, workItemIds, liveTaskIds };
   }
 
-  async #reconcileTasks(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<void> {
+  async #reconcileTasks(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: Set<string>, liveTaskIds: ReadonlySet<string>): Promise<void> {
     for (const task of store.listTasks().filter((candidate) => candidate.status === "active")) {
       const item = store.getWorkItem(task.workItemId);
       if (item && unavailableProjects.has(item.projectSlug)) continue;
@@ -959,6 +984,7 @@ export class MainOrchestrator {
         text = await readFile(runtime.resultPath, "utf8");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (liveTaskIds.has(task.id)) unsafeProjects.add(item.projectSlug);
           store.finalizeTask({ id: task.id, outcome: "failed", summary: "Invalid result file", resultJson: JSON.stringify({ error: errorText(error) }) });
           if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) {
             this.#block(store, item, "task_failed", `Cannot read Task result: ${errorText(error)}`);
@@ -976,6 +1002,7 @@ export class MainOrchestrator {
         }
         if (presence.alive && presence.identityMatches) continue;
         const reason = presence.reason ?? "worker exited without a result";
+        if (presence.alive || liveTaskIds.has(task.id)) unsafeProjects.add(item.projectSlug);
         store.finalizeTask({ id: task.id, outcome: "failed", summary: reason, resultJson: JSON.stringify({ taskId: task.id, reason }) });
         if (this.#obsoleteIfUnowned(store, item, unsafeProjects)) continue;
         if (presence.alive && !presence.identityMatches) {
@@ -991,6 +1018,8 @@ export class MainOrchestrator {
         }
         continue;
       }
+      // Protect ownerless work as soon as its recorded live Task becomes finalized.
+      if (liveTaskIds.has(task.id)) unsafeProjects.add(item.projectSlug);
       let result: WorkerResult;
       try {
         const raw: unknown = JSON.parse(text);
@@ -1021,7 +1050,7 @@ export class MainOrchestrator {
     }
   }
 
-  async #reconcileFinalizedTasks(store: MerroStore, unsafeProjects: ReadonlySet<string> = new Set()): Promise<void> {
+  async #reconcileFinalizedTasks(store: MerroStore, unsafeProjects: ReadonlySet<string>): Promise<void> {
     // Finalized Tasks remain the durable cleanup queue, including across Main restarts.
     const tasks = store.listTasks();
     const activeInputs = new Set(tasks.filter((task) => task.status === "active")
@@ -1371,7 +1400,7 @@ export class MainOrchestrator {
     runtime: WorkItemRuntimeRecord,
     project: Project,
     pullRequest: GitHubPullRequest,
-    unsafeProjects: ReadonlySet<string> = new Set(),
+    unsafeProjects: ReadonlySet<string>,
   ): Promise<void> {
     if (!pullRequest.mergedAt || !isCommitSha(pullRequest.mergeCommitSha)) {
       throw new Error("cannot finalize a pull request without confirmed merge metadata");

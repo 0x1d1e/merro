@@ -844,6 +844,211 @@ test("legacy pane matching does not confuse a current Task with a finalized Task
   assert.equal(harness.launches.length, 2);
 });
 
+for (const kind of ["merge", "merge_conflict"] as const) {
+  for (const hazard of ["orphan", "finalized_live", "unknown_orphan", "inventory_failure"] as const) {
+    test(`${kind} approval inventories ${hazard} before clone or merge mutations`, async (t) => {
+      let unsafe = false;
+      let latest: WorkerLaunchInput;
+      const harness = await createHarness(t, {
+        localCloneMissing: true,
+        ownedWorkers: async (project) => {
+          if (!unsafe) return [];
+          if (hazard === "inventory_failure") throw new Error("worker inventory unavailable");
+          return [{ taskId: hazard === "finalized_live" ? latest.taskId : hazard === "unknown_orphan" ? null : "orphan",
+            projectSlug: project.slug, workItemId: hazard === "unknown_orphan" ? null : latest.workItemId,
+            clonePath: hazard === "unknown_orphan" ? null : latest.clonePath,
+            tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) }];
+        },
+      });
+      await startDefaultObjective(harness.main);
+      await harness.main.runPass();
+      await harness.main.runPass();
+      await harness.main.runPass();
+      latest = harness.launches[1]!;
+      if (kind === "merge_conflict") {
+        harness.setPullRequest(13, { baseRefOid: "d".repeat(40), mergeable: "CONFLICTING" });
+        await harness.main.runPass();
+      }
+      const decision = (await harness.main.statusSnapshot()).decisions.find((candidate) => candidate.kind === kind)!;
+      assert.ok(decision);
+      const restores = harness.restoredClones.length;
+      unsafe = true; // No runPass between the worker appearing and explicit approval.
+      const approve = () => kind === "merge"
+        ? harness.main.resolveMergeDecision(decision.id, true)
+        : harness.main.resolveMergeConflictDecision(decision.id, "resolved");
+      await assert.rejects(approve(), /worker safety|unsafe|live worker|inventory/i);
+      assert.equal(harness.restoredClones.length, restores);
+      assert.equal(harness.deletedClones.length, 0);
+      assert.equal(harness.pullRequests.get(13)!.mergedAt, null);
+      assert.equal(harness.launches.length, 2);
+      const snapshot = await harness.main.statusSnapshot();
+      assert.equal(snapshot.workItems[0]!.state, "AwaitingMerge");
+      assert.ok(snapshot.decisions.some((candidate) => candidate.id === decision.id && candidate.state === "pending"));
+      const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+      assert.equal(store.getWorkItemRuntime(latest.workItemId)!.baseUpdate ?? null, null);
+      store.close();
+      unsafe = false;
+      await approve();
+      assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, kind === "merge" ? "Done" : "Implementing");
+    });
+  }
+}
+
+for (const role of ["implement", "review"] as const) {
+  test(`same-pass ${role} finalization keeps a live worker occupying its slot and protects artifacts`, async (t) => {
+    const workers: OwnedWorker[] = [];
+    const harness = await createHarness(t, { maxConcurrentTasks: 1, taskArtifacts: true,
+      projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+      ownedWorkers: async (project) => project.slug === "example" ? workers : [],
+    });
+    await startDefaultObjective(harness.main);
+    await harness.main.runPass();
+    if (role === "review") await harness.main.runPass();
+    const input = harness.launches.at(-1)!;
+    const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+    const runtime = store.getTaskRuntime(input.taskId)!;
+    store.close();
+    await harness.main.startObjective({ goal: "Other", projectSlugs: ["other"],
+      issues: [{ projectSlug: "other", numbers: [8] }] });
+    workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: input.workItemId,
+      clonePath: input.clonePath, tmuxSession: runtime.tmuxSession, tmuxWindow: runtime.tmuxWindow, paneId: runtime.paneId, containerId: null });
+    const launches = harness.launches.length;
+    await harness.main.runPass();
+    const snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.tasks.find((task) => task.id === input.taskId)!.status, "finalized");
+    assert.equal(harness.launches.length, launches);
+    assert.equal(harness.cleanupCalls.includes(input.taskId), false);
+    assert.match(await readFile(join(dirname(runtime.resultPath), "pi-config", "auth.json"), "utf8"), /auth/);
+    assert.equal(await readFile(runtime.taskFilePath, "utf8"), input.taskFile);
+    workers.length = 0;
+    await harness.restartMain().runPass();
+    assert.equal(harness.launches.length, launches + 1);
+    assert.ok(harness.cleanupCalls.includes(input.taskId));
+  });
+}
+
+test("same-pass finalization preserves cross-Project conflict occupancy", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, { maxConcurrentTasks: 3,
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+    ownedWorkers: async (project) => project.slug === "example" ? workers : [],
+  });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const input = harness.launches[0];
+  assert.ok(input);
+  harness.issues.get("example:7")!.body = "Conflicts with other#8";
+  await harness.main.startObjective({ goal: "Other", projectSlugs: ["other"], issues: [{ projectSlug: "other", numbers: [8] }] });
+  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+    tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+  workers.length = 0;
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 2);
+});
+
+test("same-pass finalization defers ownerless obsoletion until the live worker exits", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, { ownedWorkers: async () => workers });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const input = harness.launches[0];
+  const objective = (await harness.main.statusSnapshot()).objectives[0];
+  assert.ok(input && objective);
+  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+    tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
+  await harness.main.stopObjectives(objective.id);
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Implementing");
+  assert.equal(harness.launches.length, 1);
+  workers.length = 0;
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Obsolete");
+});
+
+test("an inventory failure after Task finalization defers cleanup and successor launch", async (t) => {
+  let fail = false;
+  let scans = 0;
+  const harness = await createHarness(t, { taskArtifacts: true,
+    ownedWorkers: async () => {
+      if (fail && ++scans > 1) throw new Error("worker inventory unavailable");
+      return [];
+    },
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const input = harness.launches[0];
+  assert.ok(input);
+  fail = true;
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+  assert.equal(harness.cleanupCalls.includes(input.taskId), false);
+  assert.match(await readFile(join(harness.workspacePath, "worker-results", input.taskId, "pi-config", "auth.json"), "utf8"), /auth/);
+  fail = false;
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 2);
+  assert.ok(harness.cleanupCalls.includes(input.taskId));
+});
+
+test("exceptional result consumption refreshes worker safety before finalized cleanup", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, { taskArtifacts: true, ownedWorkers: async () => workers });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const input = harness.launches[0];
+  assert.ok(input);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  store.transitionWorkItem(id, "Blocked", "clone_lost");
+  store.close();
+  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+    tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
+  await assert.rejects(harness.main.runPass(), /transition/i);
+  assert.equal((await harness.main.statusSnapshot()).tasks[0]!.status, "finalized");
+  assert.equal(harness.cleanupCalls.includes(input.taskId), false);
+  assert.match(await readFile(join(harness.workspacePath, "worker-results", input.taskId, "pi-config", "auth.json"), "utf8"), /auth/);
+});
+
+test("merge approval remains available when only an unrelated Project has an orphan", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+    ownedWorkers: async (project) => project.slug === "other" ? workers : [],
+  });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const decision = (await harness.main.statusSnapshot()).decisions[0];
+  assert.ok(decision);
+  const other = await harness.main.startObjective({ goal: "Other", projectSlugs: ["other"], issues: [{ projectSlug: "other", numbers: [8] }] });
+  const otherItem = other.workItems[0];
+  assert.ok(otherItem);
+  workers.push({ taskId: "unrelated-orphan", projectSlug: "other", workItemId: otherItem.id, clonePath: null,
+    tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
+  await harness.main.resolveMergeDecision(decision.id, true);
+  assert.equal((await harness.main.statusSnapshot()).workItems.find((item) => item.id === id)!.state, "Done");
+  assert.equal(harness.deletedClones.length, 1);
+});
+
+test("rejecting an externally merged Decision reconciles without deleting a live worker clone", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, { ownedWorkers: async () => workers });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const decision = (await harness.main.statusSnapshot()).decisions[0];
+  assert.ok(decision);
+  const input = harness.launches[1];
+  assert.ok(input);
+  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+    tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
+  harness.setPullRequest(13, { state: "CLOSED", mergedAt: "2026-01-02T00:00:00Z", mergeCommitSha: "e".repeat(40) });
+  await harness.main.resolveMergeDecision(decision.id, false);
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Done");
+  assert.equal(harness.deletedClones.length, 0);
+});
+
 test("live workers attached to finalized Tasks gate successors and retain their artifacts", async (t) => {
   const workers: OwnedWorker[] = [];
   const harness = await createHarness(t, { taskArtifacts: true, ownedWorkers: async () => workers });
@@ -1375,6 +1580,11 @@ for (const failure of ["success", "cancelled", "unreadable", "missing", "identit
     await harness.main.runPass();
     const finalized = (await harness.main.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id)!;
     assert.equal(finalized.status, "finalized");
+    if (failure === "identity") {
+      // A live identity mismatch is unsafe even if inventory missed it. Retry only after a fresh pass.
+      assert.equal(harness.cleanupCalls.includes(task.id), false);
+      await harness.main.runPass();
+    }
     assert.ok(harness.cleanupCalls.includes(task.id));
     assert.match(await readFile(join(dir, "pi-config", "auth.json"), "utf8"), /auth/);
     failCleanup = false;
@@ -2362,7 +2572,7 @@ test("new Main consumes a healthy worker result after a crash without restarting
   let alive = true;
   const harness = await createHarness(t, {
     inspect: async () => ({ alive, identityMatches: true, reason: null }),
-    result: (_input, _launchNumber, result) => null,
+    result: () => null,
   });
   const workItemId = await startDefaultObjective(harness.main);
   await harness.main.runPass();
