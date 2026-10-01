@@ -21,7 +21,7 @@ User goal with an explicit Project set and priority (high/normal/low). States: A
 
 ### WorkItem
 Unit of work in exactly one Project. Backed by one GitHub issue, or `local` (no issue).
-- **Identity:** `<project>:issue-<n>` or `<project>:local:<slug>`, plus a generation counter.
+- **Identity:** `<project>:issue-<n>` or `<project>:local:<slug>`, plus a generation counter. Authoritative IDs are never rewritten; filesystem namespace names are deterministic derived identities.
 - **Invariant:** at most one non-terminal generation per source; terminal generations are immutable and never reactivated.
 - **Avoid:** ticket, job, "task" for WorkItem
 

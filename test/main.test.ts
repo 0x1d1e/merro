@@ -434,6 +434,47 @@ async function startDefaultObjective(main: MainOrchestrator): Promise<string> {
   return workItemId;
 }
 
+test("Main derives a safe clone path without rewriting the acceptance WorkItem identity", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "merro-acceptance", issueNumbers: [1] }] });
+  const started = await harness.main.startObjective({
+    goal: "Launch the acceptance worker", projectSlugs: ["merro-acceptance"],
+    issues: [{ projectSlug: "merro-acceptance", numbers: [1] }],
+  });
+  const id = "merro-acceptance:issue-1:g1";
+  assert.equal(started.workItems[0]?.id, id);
+  await harness.main.runPass();
+  const input = harness.launches[0];
+  assert.ok(input);
+  assert.equal(input.workItemId, id);
+  const component = relative(join(harness.workspacePath, "workers", "merro-acceptance"), input.clonePath);
+  assert.match(component, /^[a-z0-9-]+-[a-f0-9]{16}$/);
+  assert.ok(component.length <= 65);
+  assert.match(input.taskFile, /merro-acceptance:issue-1:g1/);
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.workItems[0]?.id, id);
+  assert.equal(snapshot.tasks[0]?.workItemId, id);
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches[1]?.clonePath, input.clonePath);
+  assert.equal(harness.launches[1]?.workItemId, id);
+});
+
+test("Main honors a persisted legacy clone path containing colons after restart", async (t) => {
+  const harness = await createHarness(t);
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const legacyPath = join(harness.workspacePath, "workers", "example", id);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    const record = store.getWorkItemRuntime(id);
+    assert.ok(record);
+    store.saveWorkItemRuntime({ ...record, clonePath: legacyPath });
+  } finally { store.close(); }
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches[1]?.clonePath, legacyPath);
+  assert.equal(harness.launches[1]?.workItemId, id);
+  assert.equal(harness.cloneBaseBranches.length, 1);
+});
+
 test("Main runs one issue through implement, review, PR approval, merge, and Objective completion", async (t) => {
   const harness = await createHarness(t);
   const { main } = harness;
@@ -1619,15 +1660,27 @@ test("adopt a moved Project path only for the same repository identity", async (
   await assert.rejects(harness.main.addProject(moved, "example"), /different repository identity/);
 });
 
-test("partial launch stops the worker before finalizing the failed Task", async (t) => {
-  let stopped = false;
-  const harness = await createHarness(t, { launchFailure: true, stop: async () => { stopped = true; } });
-  await startDefaultObjective(harness.main);
+test("partial launch stops the worker and finalizes/blocks once, including after restart", async (t) => {
+  let stops = 0;
+  const harness = await createHarness(t, { launchFailure: true, taskArtifacts: true, stop: async () => { stops++; } });
+  const id = await startDefaultObjective(harness.main);
   await harness.main.runPass();
-  assert.equal(stopped, true);
+  assert.equal(stops, 1);
   const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.tasks.length, 1);
   assert.equal(snapshot.tasks[0]?.status, "finalized");
+  assert.equal(snapshot.tasks[0]?.outcome, "failed");
+  assert.equal(snapshot.tasks[0]?.workItemId, id);
   assert.equal(snapshot.workItems[0]?.blockedReason, "task_failed");
+  const failureReports = harness.notifications.filter((message) => message.includes("Could not start"));
+  assert.equal(failureReports.length, 1);
+  await harness.restartMain().runPass();
+  const restarted = await harness.main.statusSnapshot();
+  assert.deepEqual(restarted.tasks, snapshot.tasks);
+  assert.equal(restarted.workItems[0]?.state, "Blocked");
+  assert.equal(stops, 1);
+  assert.equal(harness.launches.length, 1);
+  assert.deepEqual(harness.notifications.filter((message) => message.includes("Could not start")), failureReports);
 });
 
 test("failed launch remains active if stopping the worker fails", async (t) => {
