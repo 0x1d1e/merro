@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { MerroStore } from "../src/store/store.js";
@@ -12,7 +12,7 @@ import { MainOrchestrator } from "../src/runtime/main.js";
 import { registerCommands, type PiExtensionLike } from "../src/tools/commands.js";
 import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import { GitBaseMergeConflictError } from "../src/vcs/git.js";
-import type { WorkerLaunchInput, WorkerPresence } from "../src/runtime/worker-runtime.js";
+import { WorkerRuntime, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
 interface FixtureProject {
@@ -39,6 +39,11 @@ interface HarnessOptions {
   pullRequestFailure?: (number: number) => boolean;
   pullRequestContentFailure?: () => boolean;
   deleteCloneFailure?: boolean;
+  cleanupFailure?: boolean;
+  launchFailure?: boolean;
+  realWorkerPlan?: boolean;
+  notifyCommand?: string;
+  commands?: import("../src/runtime/commands.js").CommandRunner;
   result?: (input: WorkerLaunchInput, launchNumber: number, defaultResult: Record<string, unknown>) => Record<string, unknown> | null;
 }
 
@@ -221,6 +226,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     async discoverProject(path: string, slug: string) {
       const project = projects.get(slug);
       if (!project) throw new Error(`unknown project ${slug}`);
+      if (project.path !== path) throw new Error(`Project moved from ${path}`);
       return { ...project, path };
     },
     async createWorkItemClone(project: Project, path: string, branchName: string) {
@@ -280,10 +286,20 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     },
   };
 
+  const runtimePlanner = new WorkerRuntime({ workspacePath: join(workspacePath, ".merro", "runtime"), config: DEFAULT_CONFIG });
   const workers = {
+    ...(options.realWorkerPlan ? { plan: (input: WorkerLaunchInput) => runtimePlanner.plan(input) } : {}),
     async prepareClone() {},
     async launch(input: WorkerLaunchInput): Promise<TaskRuntimeRecord> {
       launches.push(input);
+      if (options.realWorkerPlan) {
+        const scratch = dirname(runtimePlanner.plan(input).resultPath);
+        for (const dependency of input.dependencies ?? []) {
+          const path = relative(scratch, dependency.checkoutPath);
+          if (path === ".." || path.startsWith(`..${sep}`)) throw new Error("dependency checkout outside worker scratch");
+        }
+      }
+      if (options.launchFailure) throw new Error("launch failed after process creation");
       const taskDir = join(workspacePath, "worker-results", input.taskId);
       await mkdir(taskDir, { recursive: true });
       const resultPath = join(taskDir, "result.json");
@@ -328,12 +344,15 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     async stop() {
       await options.stop?.();
     },
-    async cleanup() {},
+    async cleanup() {
+      if (options.cleanupFailure) throw new Error("Task cleanup failed");
+    },
   };
 
   const main = new MainOrchestrator({
     workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: "none", max_concurrent_tasks: options.maxConcurrentTasks ?? 3, work_root: join(workspacePath, "workers") },
+    config: { ...DEFAULT_CONFIG, sandbox: options.realWorkerPlan ? "docker" : "none", max_concurrent_tasks: options.maxConcurrentTasks ?? 3, work_root: join(workspacePath, "workers"), notify_command: options.notifyCommand ?? null },
+    ...(options.commands ? { commands: options.commands } : {}),
     notify: (message) => { notifications.push(message); },
     git,
     github,
@@ -440,6 +459,123 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
   } finally {
     store.close();
   }
+});
+
+test("blocked reason follows external PR closure without losing resume state", async (t) => {
+  const harness = await createHarness(t);
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { store.transitionWorkItem(id, "Blocked", "task_failed"); } finally { store.close(); }
+  harness.setPullRequest(13, { state: "CLOSED" });
+  await harness.main.runPass();
+  const item = (await harness.main.statusSnapshot()).workItems[0]!;
+  assert.equal(item.blockedReason, "pr_closed");
+  assert.equal(item.blockedResumeState, "AwaitingMerge");
+});
+
+test("notify_command runs for merge-ready, Objective Done, and Blocked, with failures isolated", async (t) => {
+  const events: string[] = [];
+  const harness = await createHarness(t, { notifyCommand: "notify-test", commands: {
+    async run(file, args, options) {
+      assert.equal(file, "bash");
+      assert.deepEqual(args, ["-lc", "notify-test"]);
+      events.push(options?.env?.MERRO_EVENT ?? "missing");
+      await harness.main.statusSnapshot();
+      throw new Error("notification unavailable");
+    },
+  } });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.deepEqual(events, ["merge_ready"]);
+  const decision = (await harness.main.statusSnapshot()).decisions[0]!;
+  await harness.main.resolveMergeDecision(decision.id, true);
+  assert.deepEqual(events, ["merge_ready", "objective_done"]);
+  assert.ok(harness.notifications.some((message) => message.includes("notification unavailable")));
+  const blocked = await createHarness(t, { notifyCommand: "notify-test", launchFailure: true, commands: {
+    async run(_file, _args, options) { events.push(options?.env?.MERRO_EVENT ?? "missing"); return { stdout: "", stderr: "" }; },
+  } });
+  await startDefaultObjective(blocked.main);
+  await blocked.main.runPass();
+  assert.equal(events.at(-1), "blocked");
+});
+
+test("reject unsafe Project slugs before repository discovery", async (t) => {
+  const harness = await createHarness(t);
+  for (const slug of ["../escape", "..", ".", "/tmp/escape", "nested/path", "back\\\\slash"]) {
+    await assert.rejects(harness.main.addProject(harness.workspacePath, slug), /invalid Project slug/);
+  }
+});
+
+test("adopt a moved Project path only for the same repository identity", async (t) => {
+  const harness = await createHarness(t);
+  await startDefaultObjective(harness.main);
+  const moved = join(harness.workspacePath, "moved");
+  harness.setProjectState("example", { path: moved, baseRemote: "git@github.com:example/example.git" });
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.blockedReason, "project_unavailable");
+  const adopted = await harness.main.addProject(moved, "example");
+  assert.equal(adopted.path, moved);
+  assert.equal((await harness.main.listProjects())[0]?.path, moved);
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+  assert.equal(harness.launches[0]?.project.path, moved);
+  harness.setProjectState("example", { baseRemote: "https://github.com/other/repo.git" });
+  await assert.rejects(harness.main.addProject(moved, "example"), /different repository identity/);
+});
+
+test("partial launch stops the worker before finalizing the failed Task", async (t) => {
+  let stopped = false;
+  const harness = await createHarness(t, { launchFailure: true, stop: async () => { stopped = true; } });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  assert.equal(stopped, true);
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.tasks[0]?.status, "finalized");
+  assert.equal(snapshot.workItems[0]?.blockedReason, "task_failed");
+});
+
+test("failed launch remains active if stopping the worker fails", async (t) => {
+  const harness = await createHarness(t, { launchFailure: true, stop: async () => { throw new Error("cannot stop worker"); } });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.tasks[0]?.status, "active");
+  assert.equal(snapshot.workItems[0]?.blockedReason, "task_failed");
+});
+
+test("Task cleanup failure does not prevent review scheduling or reset of infrastructure retries", async (t) => {
+  const harness = await createHarness(t, { cleanupFailure: true });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { store.saveWorkItemRuntime({ ...store.getWorkItemRuntime(id)!, infrastructureRetries: 1 }); } finally { store.close(); }
+  await harness.main.runPass();
+  const reopened = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.equal(reopened.getWorkItemRuntime(id)?.infrastructureRetries, 0); } finally { reopened.close(); }
+  assert.deepEqual(harness.launches.map((input) => input.role), ["implement", "review"]);
+  assert.ok(harness.notifications.some((message) => message.includes("Task cleanup failed")));
+});
+
+test("local WorkItem launches without querying an issue", async (t) => {
+  const harness = await createHarness(t);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    store.createObjective({ id: "local-goal", goal: "Add local feature", projectSlugs: ["example"], priority: "normal", state: "Active" });
+    store.createWorkItem({ id: "example:local:feature:g1", projectSlug: "example", sourceType: "local", sourceRef: "feature", generation: 1, state: "Ready", priority: "normal", readySince: new Date().toISOString(), blockedReason: null, blockedResumeState: null, guidance: "Implement local feature" });
+    store.attachWorkItem("local-goal", "example:local:feature:g1");
+  } finally { store.close(); }
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+  assert.match(harness.launches[0]!.taskFile, /Implement local feature/);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.equal(harness.pullRequests.size, 1);
+  assert.ok(![...harness.pullRequests.values()][0]!.body.includes("Closes"));
 });
 
 test("merge finalization remains complete when terminal clone cleanup fails", async (t) => {
@@ -1725,6 +1861,7 @@ test("review cap ignores stopped Objective owners and uses the strictest active 
 test("cross-Project Objective reconciles dependencies, rework, external checks, approvals, and merges", async (t) => {
   let apiReviewCount = 0;
   const { main, launches, pullRequests, setPullRequest } = await createHarness(t, {
+    realWorkerPlan: true,
     projects: [
       { slug: "api", issueNumbers: [1] },
       { slug: "web", issueNumbers: [2] },
@@ -1807,7 +1944,7 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
   const apiCheckout = webReview.dependencies?.[0]?.checkoutPath;
   assert.ok(apiCheckout);
   assert.equal((await readFile(join(apiCheckout, "MERRO_COMMIT"), "utf8")).trim(), "e".repeat(40));
-  assert.ok(webReview.taskFile.includes(`Read-only checkout: ${apiCheckout}`));
+  assert.ok(webReview.taskFile.includes("Read-only checkout: /merro-dependencies/1"));
 
   const webPullRequest = [...pullRequests.entries()].find(([, pr]) => pr.headRefName.includes("2"));
   assert.ok(webPullRequest);

@@ -3,6 +3,7 @@ import { mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { MerroConfig } from "../config.js";
 import { priorityRank, type Objective, type Priority, type Project, type Relation, type Task, type TaskRole, type WorkItem } from "../domain/model.js";
+import { assertProjectSlug } from "../domain/project.js";
 import { findRequiresCycle } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
 import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
@@ -269,6 +270,8 @@ export class MainOrchestrator {
   readonly #git: GitAdapter;
   readonly #github: GitHubAdapter;
   readonly #workers: WorkerAdapter;
+  readonly #commands: CommandRunner;
+  readonly #pendingNotifications: Array<{ event: string; subjectId: string; message: string }> = [];
 
   constructor(options: MainOptions) {
     this.#workspacePath = resolve(options.workspacePath);
@@ -277,6 +280,7 @@ export class MainOrchestrator {
     this.#config = options.config;
     this.#notify = options.notify ?? ((message) => console.log(message));
     const commands = options.commands ?? systemCommandRunner;
+    this.#commands = commands;
     this.#git = options.git ?? new GitClient(commands);
     this.#github = options.github ?? new GitHubClient(commands);
     this.#workers = options.workers ?? new WorkerRuntime({ workspacePath: join(this.#stateDirectory, "runtime"), config: options.config, commands });
@@ -317,6 +321,7 @@ export class MainOrchestrator {
   }
 
   async addProject(path: string, slug: string): Promise<Project> {
+    assertProjectSlug(slug);
     const projectPath = resolve(path);
     const gitProject = await this.#git.discoverProject(projectPath, slug);
     const repository = await this.#github.repositoryInDirectory(projectPath);
@@ -324,10 +329,11 @@ export class MainOrchestrator {
     return this.#withStore((store) => {
       const existing = store.getProject(slug);
       if (existing) {
-        if (existing.path !== project.path || existing.baseRemote !== project.baseRemote || existing.pushRemote !== project.pushRemote) {
+        if (!sameRemoteRepository(existing.baseRemote, project.baseRemote) || !sameRemoteRepository(existing.pushRemote, project.pushRemote)) {
           throw new Error(`Project '${slug}' is already registered with different repository identity`);
         }
-        return existing;
+        store.updateProject(project);
+        return project;
       }
       store.createProject(project);
       return project;
@@ -614,6 +620,17 @@ export class MainOrchestrator {
         store?.close();
       } finally {
         await lock.release();
+        const notifications = this.#pendingNotifications.splice(0);
+        for (const notification of notifications) {
+          try {
+            await this.#commands.run("bash", ["-lc", this.#config.notify_command!], {
+              cwd: this.#workspacePath,
+              env: { MERRO_EVENT: notification.event, MERRO_SUBJECT_ID: notification.subjectId, MERRO_MESSAGE: notification.message },
+            });
+          } catch (error) {
+            this.#notify(`notify_command failed: ${errorText(error)}`, "warning");
+          }
+        }
       }
     }
   }
@@ -628,9 +645,12 @@ export class MainOrchestrator {
     let runtimeIntent: TaskRuntimeRecord | null = null;
     let workerLaunchStarted = false;
     try {
+      assertProjectSlug(project.slug);
+      if (item.id === "." || item.id === ".." || /[/\\\\]/.test(item.id)) throw new Error(`invalid WorkItem path identity: ${item.id}`);
+      const issue = item.sourceType === "issue" ? await this.#github.issue(project, Number(item.sourceRef)) : null;
       if (!runtime.clonePath || !runtime.branchName) {
-        const issue = await this.#github.issue(project, Number(item.sourceRef));
-        const branch = branchName(issue, item.generation);
+        const localSlug = item.sourceRef.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 44) || "work";
+        const branch = issue ? branchName(issue, item.generation) : `chore/local-${localSlug}-g${item.generation}`;
         const clonePath = join(this.#workRoot, project.slug, item.id);
         const clone = await this.#git.createWorkItemClone(project, clonePath, branch);
         runtime = { ...runtime, branchName: clone.branchName, clonePath: clone.path, baseCommit: clone.baseCommit };
@@ -642,7 +662,6 @@ export class MainOrchestrator {
       expectedCommit = await this.#git.currentCommit(clonePath);
       const objective = store.listObjectives().find((candidate) => store.listWorkItems(candidate.id).some((workItem) => workItem.id === item.id));
       if (!objective) throw new Error(`WorkItem ${item.id} is not attached to an Objective`);
-      const issue = await this.#github.issue(project, Number(item.sourceRef));
       const previousReview = store.listTasks(item.id).reverse().find((task) => task.role === "review" && task.resultJson);
       const latestReview = previousReview?.resultJson ? this.#reviewContext(previousReview.resultJson) : null;
       const instructions = await this.#repositoryInstructions(clonePath);
@@ -692,7 +711,7 @@ export class MainOrchestrator {
       const taskFile = renderTaskFile({
         role, taskId, workItemId: item.id, projectSlug: item.projectSlug,
         sourceType: item.sourceType, sourceRef: item.sourceRef,
-        title: issue.title, scope: issue.body,
+        title: issue?.title ?? item.sourceRef, scope: issue?.body ?? item.guidance ?? objective.goal,
         objective: { id: objective.id, goal: objective.goal },
         userGuidance: item.guidance ?? "",
         projectGuidance: projectSettings?.guidance ?? "",
@@ -731,15 +750,29 @@ export class MainOrchestrator {
       }
       workerLaunchStarted = true;
       const record = await this.#workers.launch(launchInput, runtimeIntent);
+      runtimeIntent = record;
       store.saveTaskRuntime(record);
     } catch (error) {
-      if (!workerLaunchStarted && runtimeIntent) await this.#workers.cleanup(runtimeIntent).catch(() => {});
+      if (runtimeIntent) {
+        try {
+          if (workerLaunchStarted) {
+            if (!this.#workers.stop) throw new Error("worker stop is unavailable");
+            await this.#workers.stop(runtimeIntent, taskId);
+          }
+        } catch (stopError) {
+          this.#block(store, store.getWorkItem(item.id) ?? item, "task_failed", `Worker launch failed; Task remains active until it can be stopped safely: ${errorText(stopError)}`);
+          return;
+        }
+        await this.#workers.cleanup(runtimeIntent).catch((cleanupError: unknown) => {
+          this.#notify(`Could not clean up failed Task ${taskId}: ${errorText(cleanupError)}`, "warning");
+        });
+      }
       const task = store.getTask(taskId);
       if (task?.status === "active") store.finalizeTask({
         id: taskId, outcome: "failed", summary: "Worker launch failed", resultJson: JSON.stringify({ error: errorText(error) }),
       });
       const current = store.getWorkItem(item.id);
-      if (current && current.state !== "Blocked") this.#block(store, current, "task_failed", `Could not start ${role} Task: ${errorText(error)}`);
+      if (current) this.#block(store, current, "task_failed", `Could not start ${role} Task: ${errorText(error)}`);
     }
   }
 
@@ -952,7 +985,9 @@ export class MainOrchestrator {
         continue;
       }
       await this.#consumeResult(store, item, task, result, runtime, workRuntime);
-      await this.#workers.cleanup(runtime);
+      await this.#workers.cleanup(runtime).catch((error: unknown) => {
+        this.#notify(`Could not clean up finalized Task ${task.id}: ${errorText(error)}`, "warning");
+      });
       workRuntime.infrastructureRetries = 0;
       store.saveWorkItemRuntime(workRuntime);
     }
@@ -1266,7 +1301,9 @@ export class MainOrchestrator {
             summary: store.listTasks(item.id).filter((task) => task.role === "implement" || task.role === "review").map((task) => task.summary).filter(Boolean),
           },
         });
-        this.#notify(`Merge approval required for ${pullRequest.url} (Decision ${decision.id}).`);
+        const message = `Merge approval required for ${pullRequest.url} (Decision ${decision.id}).`;
+        this.#notify(message);
+        this.#queueNotification("merge_ready", item.id, message);
       } catch (error) {
         this.#blockForGitHubUnavailable(store, item, `GitHub reconciliation failed: ${errorText(error)}`);
       }
@@ -1393,7 +1430,9 @@ export class MainOrchestrator {
   }
 
   #block(store: MerroStore, item: WorkItem, reason: WorkItem["blockedReason"] & string, detail: string): void {
-    if (item.state !== "Blocked") store.transitionWorkItem(item.id, "Blocked", reason);
+    const current = store.getWorkItem(item.id) ?? item;
+    const changed = current.state !== "Blocked" || current.blockedReason !== reason;
+    if (changed) store.transitionWorkItem(item.id, "Blocked", reason);
     store.appendEvent("WorkItem", item.id, "blocked", { reason, detail });
     const dependents = store.listRelations()
       .filter((relation) => relation.kind === "Requires" && relation.to === item.id)
@@ -1401,7 +1440,9 @@ export class MainOrchestrator {
       .filter((dependent): dependent is WorkItem => dependent !== null)
       .map((dependent) => `${dependent.id} (${dependent.state})`);
     const dependentsNote = dependents.length > 0 ? ` Direct dependents: ${dependents.join(", ")}.` : "";
-    this.#notify(`WorkItem ${item.id} blocked (${reason}): ${detail}.${dependentsNote}`, "warning");
+    const message = `WorkItem ${item.id} blocked (${reason}): ${detail}.${dependentsNote}`;
+    this.#notify(message, "warning");
+    if (changed) this.#queueNotification("blocked", item.id, message);
   }
 
   #reviewLimit(store: MerroStore, item: WorkItem): number | "unlimited" {
@@ -1434,13 +1475,19 @@ export class MainOrchestrator {
     return [];
   }
 
+  #queueNotification(event: string, subjectId: string, message: string): void {
+    if (this.#config.notify_command?.trim()) this.#pendingNotifications.push({ event, subjectId, message });
+  }
+
   #finishObjectives(store: MerroStore): void {
     for (const objective of store.listObjectives()) {
       if (objective.state !== "Active") continue;
       const items = store.listWorkItems(objective.id);
       if (items.length > 0 && items.every(terminal)) {
         store.setObjectiveState(objective.id, "Done");
-        this.#notify(`Objective ${objective.id} is Done.`);
+        const message = `Objective ${objective.id} is Done.`;
+        this.#notify(message);
+        this.#queueNotification("objective_done", objective.id, message);
       }
     }
   }

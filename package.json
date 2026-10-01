@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "description": "Pi package that coordinates multiple coding workers from one Main Pi session.",
   "type": "module",
+  "files": [
+    "src/",
+    "dist/src/",
+    "docker/",
+    "CONTEXT.md",
+    "docs/"
+  ],
   "keywords": [
     "pi-package",
     "pi-coding-agent",

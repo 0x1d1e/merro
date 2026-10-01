@@ -42,6 +42,13 @@ Escape hatches (commands): `status`, `stop`, `unlock`, `export` (SQLite to JSON)
 | `notify_command` | unset; runs on Blocked, merge-ready, Objective Done |
 | model / thinking effort | Pi defaults unless set |
 
+`notify_command` runs via `bash -lc` in the workspace after releasing Main's lock. It receives
+`MERRO_EVENT` (`blocked`, `merge_ready`, `objective_done`), `MERRO_SUBJECT_ID`, and `MERRO_MESSAGE`.
+Command failures warn without aborting reconciliation.
+
+To adopt a moved repository, register its new path with the existing Project slug. Both remotes
+must still identify the same repositories.
+
 ## Where to read next
 
 - Terms and invariants: `CONTEXT.md`

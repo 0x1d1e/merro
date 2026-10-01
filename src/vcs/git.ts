@@ -2,6 +2,7 @@ import { chmod, lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Project } from "../domain/model.js";
+import { assertProjectSlug } from "../domain/project.js";
 import { CommandError, systemCommandRunner, type CommandRunner } from "../runtime/commands.js";
 
 export interface WorkItemClone {
@@ -25,6 +26,7 @@ export class GitClient {
   }
 
   async discoverProject(path: string, slug: string): Promise<Project> {
+    assertProjectSlug(slug);
     const root = (await this.#run("git", ["rev-parse", "--show-toplevel"], { cwd: path })).stdout.trim();
     const remotes = (await this.#run("git", ["remote"], { cwd: root })).stdout.trim().split(/\r?\n/).filter(Boolean);
     if (remotes.length === 0) throw new Error(`Project ${path} has no Git remotes`);
@@ -63,11 +65,13 @@ export class GitClient {
 
     await mkdir(dirname(path), { recursive: true });
     await this.#run("git", [
-      "clone", "--no-hardlinks", "--single-branch", "--branch", project.defaultBranch,
-      "--", resolvedProject.baseRemote, path,
+      "clone", "--local", "--no-checkout", "--", project.path, path,
     ]);
     await this.#run("git", ["config", "--local", "user.name", userName], { cwd: path });
     await this.#run("git", ["config", "--local", "user.email", userEmail], { cwd: path });
+    await this.#run("git", ["remote", "set-url", "origin", resolvedProject.baseRemote], { cwd: path });
+    await this.#run("git", ["remote", "add", "push", resolvedProject.pushRemote], { cwd: path });
+    await this.#run("git", ["fetch", "--no-tags", "origin", `+refs/heads/${project.defaultBranch}:refs/remotes/origin/${project.defaultBranch}`], { cwd: path });
     await this.#run("git", ["switch", "--create", branchName, `origin/${project.defaultBranch}`], { cwd: path });
     const baseCommit = (await this.#run("git", ["rev-parse", "HEAD"], { cwd: path })).stdout.trim();
     return { path, branchName, baseCommit };

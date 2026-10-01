@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { GitClient } from "../src/vcs/git.js";
-import { systemCommandRunner } from "../src/runtime/commands.js";
+import { systemCommandRunner, type CommandRunner } from "../src/runtime/commands.js";
 
 async function tempDirectory(): Promise<string> {
   return mkdtemp(join(tmpdir(), "merro-git-"));
@@ -83,6 +83,26 @@ test("Git client creates per-WorkItem clone, validates one commit, and pushes wi
 
   await gitClient.deleteClone(workRoot, clonePath);
   await assert.rejects(gitClient.deleteClone(workRoot, project.path), /outside work root/);
+});
+
+test("WorkItem creation clones the registered local repository and fetches only the authoritative base", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = await createProject(root);
+  const calls: Array<readonly string[]> = [];
+  const commands: CommandRunner = { async run(file, args, options) {
+    calls.push(args);
+    return systemCommandRunner.run(file, args, options);
+  } };
+  const project = { slug: "p", path: source.path, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" };
+  await git(source.path, "switch", "--create", "unrelated-current-branch");
+  const clone = await new GitClient(commands).createWorkItemClone(project, join(root, "clone"), "feat/local");
+  const cloneArgs = calls.find((args) => args[0] === "clone")!;
+  assert.ok(cloneArgs.includes("--local"));
+  assert.equal(cloneArgs.at(-2), source.path);
+  assert.ok(calls.some((args) => args[0] === "fetch"));
+  assert.equal(await git(clone.path, "remote", "get-url", "origin"), source.bare);
+  assert.equal(clone.baseCommit, await git(source.path, "rev-parse", "origin/main"));
 });
 
 test("effective diff fingerprint survives commit rewrites but detects changed content", async (t) => {

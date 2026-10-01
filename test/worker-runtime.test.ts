@@ -20,7 +20,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   const projectPath = join(root, "source-project");
   const clonePath = join(root, "worker-clone");
   const piConfigPath = join(root, "pi-config");
-  const dependencyPath = join(root, "runtime", ".merro", "tasks", "task-1", "dependencies", "1");
+  const dependencyPath = join(root, "runtime", "tasks", "task-1", "dependencies", "1");
   await Promise.all([mkdir(projectPath), mkdir(clonePath), mkdir(piConfigPath), mkdir(dependencyPath, { recursive: true })]);
   await writeFile(join(piConfigPath, "settings.json"), '{"theme":"host-theme"}\n');
   await writeFile(join(piConfigPath, "auth.json"), '{"apiKey":"test-secret"}\n');
@@ -121,7 +121,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
 
   assert.equal(record.containerId, containerId);
   assert.equal(record.processPid, 1);
-  const stagedConfig = join(root, "runtime", ".merro", "tasks", "task-1", "pi-config");
+  const stagedConfig = join(root, "runtime", "tasks", "task-1", "pi-config");
   assert.equal(await readFile(join(stagedConfig, "settings.json"), "utf8"), '{"theme":"host-theme"}\n');
   assert.equal(await readFile(join(stagedConfig, "auth.json"), "utf8"), '{"apiKey":"test-secret"}\n');
   assert.deepEqual((await readdir(stagedConfig)).sort(), ["auth.json", "settings.json"]);
@@ -135,10 +135,10 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(containerArgs.includes("--cap-drop"));
   assert.ok(calls.some((call) => call.file === "tmux" && call.args[0] === "set-option" && call.args.includes("@merro_owner")));
   assert.ok(calls.some((call) => call.file === "docker" && call.args[0] === "build"));
-  assert.equal(await exists(join(root, "runtime", ".merro", "container-ids", "task-1.cid")), true);
+  assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), true);
 
   await runtime.cleanup(record);
-  assert.equal(await exists(join(root, "runtime", ".merro", "container-ids", "task-1.cid")), false);
+  assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), false);
   assert.equal(await exists(record.resultPath), false);
 });
 
@@ -196,9 +196,62 @@ for (const sandbox of ["docker", "none"] as const) {
       },
     }), /tmux startup failed/);
 
-    assert.deepEqual(await readdir(join(workspacePath, ".merro", "launch-secrets")), []);
+    assert.deepEqual(await readdir(join(workspacePath, "launch-secrets")), []);
   });
 }
+
+test("partial host launch rolls back the owned tmux window before removing Task files", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-partial-launch-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let windowExists = false;
+  let stopped = false;
+  const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
+    async run(file, args) {
+      assert.equal(file, "tmux");
+      if (args[0] === "has-session") throw new Error("missing session");
+      if (args[0] === "new-window") { windowExists = true; return { stdout: "%5", stderr: "" }; }
+      if (args[0] === "display-message") throw new Error(windowExists ? "process identity lookup failed" : "missing window");
+      if (args[0] === "kill-window") { assert.equal(args.at(-1), "%5"); stopped = true; windowExists = false; }
+      return { stdout: "", stderr: "" };
+    },
+  } });
+  const input = { taskId: "partial", workItemId: "work", role: "implement" as const, project: { slug: "partial", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, clonePath: root, taskFile: "implement", expectedCommit: "a".repeat(40), projectSettings: null };
+  await assert.rejects(runtime.launch(input), /process identity lookup failed/);
+  assert.equal(stopped, true);
+  assert.equal(await exists(runtime.plan(input).resultPath), false);
+  assert.equal(await exists(join(root, ".merro-task.md")), false);
+});
+
+test("host network isolation is rejected before any setup command runs", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-setup-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const marker = join(root, "setup-ran");
+  const runtime = new WorkerRuntime({ workspacePath: root, config: { ...DEFAULT_CONFIG, sandbox: "none", network: "off" } });
+  const project: Project = { slug: "setup", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" };
+  await assert.rejects(runtime.prepareClone(project, root, {
+    guidance: "", image: null, setupCommand: `touch '${marker}'`, sandbox: "none", network: "off", workerGithub: false,
+  }), /requires Docker/);
+  assert.equal(await exists(marker), false);
+});
+
+test("Docker setup uses the worker UID and GID", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-setup-user-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let setupArgs: readonly string[] = [];
+  const runtime = new WorkerRuntime({ workspacePath: root, config: DEFAULT_CONFIG, commands: {
+    async run(file, args) {
+      assert.equal(file, "docker");
+      if (args[0] === "run") setupArgs = args;
+      return { stdout: "", stderr: "" };
+    },
+  } });
+  await runtime.prepareClone({ slug: "setup", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, root, {
+    guidance: "", image: "test-image", setupCommand: "npm install", sandbox: "docker", network: "on", workerGithub: false,
+  });
+  const userIndex = setupArgs.indexOf("--user");
+  assert.ok(userIndex >= 0);
+  assert.equal(setupArgs[userIndex + 1], `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`);
+});
 
 test("sandbox none launches Pi with host paths and no Docker dependency", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-worker-host-"));
@@ -276,7 +329,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
 
   assert.equal(record.runtimeKind, "host");
   assert.ok(workerScript);
-  const taskRoot = join(workspacePath, ".merro", "tasks", "host-task");
+  const taskRoot = join(workspacePath, "tasks", "host-task");
   const stagedConfig = join(taskRoot, "pi-config");
   assert.deepEqual(await readdir(stagedConfig), ["auth.json"]);
   assert.equal(await readFile(join(stagedConfig, "auth.json"), "utf8"), '{"apiKey":"test-secret"}\n');
@@ -294,12 +347,14 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   const fakePi = join(binPath, "pi");
   const capturePath = join(root, "pi-invocation.txt");
   await mkdir(binPath);
-  await writeFile(fakePi, "#!/bin/sh\nprintf '%s\\n' \"$HOME\" \"$PI_CODING_AGENT_DIR\" \"$MERRO_RESULT_PATH\" \"$@\" > \"$MERRO_TEST_CAPTURE\"\n", { mode: 0o700 });
+  await writeFile(fakePi, "#!/bin/sh\n[ -z \"${GH_TOKEN+x}\" ] && [ -z \"${GITHUB_TOKEN+x}\" ] || exit 91\nprintf '%s\\n' \"$HOME\" \"$PI_CODING_AGENT_DIR\" \"$MERRO_RESULT_PATH\" \"$@\" > \"$MERRO_TEST_CAPTURE\"\n", { mode: 0o700 });
   await execFileAsync("bash", [workerScript], {
     env: {
       ...process.env,
       PATH: `${binPath}:${process.env.PATH ?? ""}`,
       MERRO_TEST_CAPTURE: capturePath,
+      GH_TOKEN: "inherited-gh-token",
+      GITHUB_TOKEN: "inherited-github-token",
     },
   });
   const invocation = (await readFile(capturePath, "utf8")).trimEnd().split("\n");

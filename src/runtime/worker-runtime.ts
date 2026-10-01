@@ -100,7 +100,7 @@ function parseDockerInspect(text: string): Record<string, unknown> {
 
 function shellScript(environment: Record<string, string>, command: string): string {
   const exports = Object.entries(environment).map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n");
-  return `#!/bin/sh\nset -eu\nrm -- "$0"\n${exports}\nexec ${command}\n`;
+  return `#!/bin/sh\nset -eu\nrm -- "$0"\nunset GH_TOKEN GITHUB_TOKEN\n${exports}\nexec ${command}\n`;
 }
 
 async function copyTree(source: string, target: string, omitted = new Set<string>()): Promise<void> {
@@ -155,15 +155,17 @@ export class WorkerRuntime {
   }
 
   async prepareClone(project: Project, clonePath: string, settings: ProjectSettingsRecord | null): Promise<void> {
+    const sandbox = settings?.sandbox ?? this.#config.sandbox;
+    const network = settings?.network ?? this.#config.network;
+    if (sandbox === "none" && network === "off") throw new Error("network=off requires Docker sandboxing");
     if (!settings?.setupCommand?.trim()) return;
-    const sandbox = settings.sandbox ?? this.#config.sandbox;
-    const network = settings.network ?? this.#config.network;
     if (sandbox === "none") {
       await this.#commands.run("bash", ["-lc", settings.setupCommand], { cwd: clonePath });
       return;
     }
     const image = await this.#resolveImage(project, settings);
-    const args = ["run", "--rm", "--workdir", CLONE_MOUNT, "--volume", `${resolve(clonePath)}:${CLONE_MOUNT}`];
+    const args = ["run", "--rm", "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
+      "--env", "HOME=/tmp", "--workdir", CLONE_MOUNT, "--volume", `${resolve(clonePath)}:${CLONE_MOUNT}`];
     if (network === "off") args.push("--network", "none");
     args.push(image, "sh", "-lc", settings.setupCommand);
     await this.#commands.run("docker", args);
@@ -175,7 +177,7 @@ export class WorkerRuntime {
     if (sandbox === "none" && network === "off") {
       throw new Error("network=off requires Docker sandboxing");
     }
-    const scratchPath = join(this.#workspacePath, ".merro", "tasks", safeName(input.taskId));
+    const scratchPath = join(this.#workspacePath, "tasks", safeName(input.taskId));
     return {
       taskId: input.taskId,
       runtimeKind: sandbox === "docker" ? "docker" : "host",
@@ -198,7 +200,7 @@ export class WorkerRuntime {
     const network = input.projectSettings?.network ?? this.#config.network;
     const startedAt = plan.startedAt;
     const scratchPath = dirname(plan.resultPath);
-    const secretRoot = join(this.#workspacePath, ".merro", "launch-secrets");
+    const secretRoot = join(this.#workspacePath, "launch-secrets");
     const scratchConfigPath = join(scratchPath, "pi-config");
     const extensionRoot = join(scratchPath, "merro-runtime");
     const homePath = join(scratchPath, "home");
@@ -234,13 +236,15 @@ export class WorkerRuntime {
       join(TASK_MOUNT, "merro-runtime", "tools", "worker-result.js"),
       "--", `@${CLONE_MOUNT}/.merro-task.md`,
     ];
-    const cidPath = join(this.#workspacePath, ".merro", "container-ids", `${safeName(input.taskId)}.cid`);
+    const cidPath = join(this.#workspacePath, "container-ids", `${safeName(input.taskId)}.cid`);
+    let paneId: string | null = null;
     let containerId: string | null = null;
     let processPid: number | null = null;
     let processStartedAt: string | null = null;
     let launchCommand: string;
     let launchSecretPath: string | null = null;
     let launchSucceeded = false;
+    let windowLaunchAttempted = false;
 
     try {
       if (sandbox === "docker") {
@@ -300,12 +304,13 @@ export class WorkerRuntime {
         launchCommand = shellQuote(scriptPath);
       }
 
+      windowLaunchAttempted = true;
       const paneResult = await this.#commands.run("tmux", [
         "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session,
         "-n", window, "-c", sandbox === "none" ? resolve(input.clonePath) : input.project.path,
         launchCommand,
       ]);
-      const paneId = paneResult.stdout.trim();
+      paneId = paneResult.stdout.trim() || null;
       if (!paneId) throw new Error(`tmux did not return a pane ID for Task ${input.taskId}`);
 
       if (sandbox === "docker") {
@@ -344,6 +349,23 @@ export class WorkerRuntime {
         expectedCommit: input.expectedCommit,
         startedAt,
       };
+    } catch (error) {
+      const partial = { ...plan, paneId, containerId, processPid, processStartedAt };
+      try {
+        if (windowLaunchAttempted) {
+          const target = paneId ?? `${session}:${window}`;
+          await this.#commands.run("tmux", ["kill-window", "-t", target]).catch(async (killError: unknown) => {
+            const exists = await this.#commands.run("tmux", ["display-message", "-p", "-t", target, "#{pane_id}"])
+              .then(() => true, () => false);
+            if (exists) throw killError;
+          });
+        }
+        await this.stop(partial, input.taskId);
+        await this.cleanup(partial);
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], `Worker launch failed and rollback failed: ${String(error)}; ${String(rollbackError)}`);
+      }
+      throw error;
     } finally {
       if (launchSecretPath !== null && (!launchSucceeded || sandbox === "docker")) {
         await rm(launchSecretPath, { force: true });
@@ -425,9 +447,7 @@ export class WorkerRuntime {
     await this.#makeWritable(dirname(record.resultPath));
     await rm(dirname(record.resultPath), { recursive: true, force: true });
     await rm(record.taskFilePath, { force: true });
-    if (record.containerId) {
-      await rm(join(this.#workspacePath, ".merro", "container-ids", `${safeName(record.taskId)}.cid`), { force: true });
-    }
+    await rm(join(this.#workspacePath, "container-ids", `${safeName(record.taskId)}.cid`), { force: true });
   }
 
   async #makeWritable(path: string): Promise<void> {
