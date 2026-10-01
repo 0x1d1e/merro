@@ -17,13 +17,14 @@ Read before changing Task files, the result tool, container/tmux launch, process
 
 - Session `merro-<project>` created when a Project's first Task starts, detached, no Main window. Never auto-attached.
 - Window per Task (`impl-188`, `rev-188`), one pane, workers may not open more.
-- Session env `MERRO_PROJECT`, `MERRO_OWNER=<root-path-hash>`. Existing session without markers → do not adopt; block that Project and report.
+- Session env `MERRO_PROJECT`, `MERRO_OWNER=<root-path-hash>`, mirrored by `@merro_project` and `@merro_owner` session options. Existing session without matching markers → do not adopt; block that Project and report.
+- Task window options `@merro_task_id`, `@merro_work_item_id`, `@merro_clone_path`, `@merro_runtime_kind` identify owned live panes for reconciliation. Docker labels `merro.task_id`, `merro.project`, `merro.owner`, `merro.work_item_id`, `merro.clone_path` identify containers even if tmux is gone. Legacy containers require an exact Task scratch mount under this workspace as ownership proof.
 - Last window exits, session may vanish. No supervisor hook.
 
 ## Process identity
 
 Runtime record per active Task: Task ID, WorkItem, role, Project, tmux session/window, container ID, Pi PID inside container, start time, clone path.
-Window existence alone is not proof. Gone process + no valid result → failed. Identity mismatch → failed. No rediscovery or adoption.
+Host identity uses the pane ID, PID, and OS process start time (`ps`), not the unsupported tmux `pane_start_time` format. Window existence alone is not proof. Gone process + no valid result → failed. Identity mismatch → failed. No rediscovery or adoption.
 Pi exited but valid matching result exists → consume it.
 
 ## Task input: `.merro-task.md`
@@ -35,7 +36,7 @@ Written fresh by Main per Task into the clone (excluded via `.git/info/exclude`,
 Worker ends by calling the `merro_submit_result` tool, which validates the schema, writes `.merro-result.json` atomically, and exits Pi. Main validates: `task_id` equals the active Task, schema matches role, commit state matches, result is not stale. Then copies to Task history and deletes the file.
 Wrong `task_id`: don't consume, don't delete, WorkItem Blocked, report expected vs found.
 
-Main retries finalized Task artifact cleanup every reconciliation pass, including after restart and when a Project is unavailable. Remove Task scratch and launch credentials; preserve mismatched results and shared input owned by an active successor Task.
+Main retries finalized Task artifact cleanup every reconciliation pass, including after restart and when a Project is unavailable. Defer cleanup while a Project has unowned live workers or an incomplete worker inventory. Remove Task scratch and launch credentials; preserve mismatched results and shared input owned by an active successor Task.
 
 Implement result: `task_id`, `status: success|failed`, `summary`, `commit`, `verification[]`, optional `pr{title,body}`; failed adds `reason`, optional `diagnostics`.
 Review result: `task_id`, `status: pass|reject|failed`, `summary`, `reviewed_commit`, `findings[]`, `verification[]`; failed adds `reason`.

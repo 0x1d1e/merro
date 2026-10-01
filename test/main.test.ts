@@ -11,7 +11,7 @@ import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../s
 import { MainOrchestrator } from "../src/runtime/main.js";
 import { registerCommands, type PiExtensionLike } from "../src/tools/commands.js";
 import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
-import { WorkerRuntime, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
+import { WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
 interface FixtureProject {
@@ -36,6 +36,7 @@ interface HarnessOptions {
   stop?: () => Promise<void>;
   issueFailure?: (projectSlug: string, number: number) => boolean;
   scopeFailure?: (projectSlug: string) => boolean;
+  ownedWorkers?: (project: Project) => Promise<OwnedWorker[]>;
   pullRequestFailure?: (number: number) => boolean;
   pullRequestContentFailure?: () => boolean;
   deleteCloneFailure?: boolean;
@@ -304,6 +305,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   const workers = {
     ...(options.realWorkerPlan ? { plan: (input: WorkerLaunchInput) => runtimePlanner.plan(input) } : {}),
     async prepareClone() {},
+    async listOwnedWorkers(project: Project) { return options.ownedWorkers?.(project) ?? []; },
     async launch(input: WorkerLaunchInput): Promise<TaskRuntimeRecord> {
       launches.push(input);
       if (options.realWorkerPlan) {
@@ -755,6 +757,156 @@ test("startup inference catches cycles and serializes high-confidence conflicts"
       assert.ok(snapshot.workItems.every((item) => item.blockedReason === "cycle"));
     } else assert.equal(harness.launches.length, 1);
   }
+});
+
+test("scope-detached live worker retains its conflict until its current Task finalizes", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7, 8] }], result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+  });
+  harness.issues.get("example:7")!.body = "Conflicts with #8";
+  await harness.main.startObjective({
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+  });
+  await harness.main.runPass();
+  assert.equal(harness.launches[0]?.workItemId, "example:issue-7:g1");
+  harness.issues.get("example:7")!.labels = ["bug"];
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches.length, 1);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  const task = store.activeTask("example:issue-7:g1")!;
+  const resultPath = store.getTaskRuntime(task.id)!.resultPath;
+  assert.equal(store.listRelations()[0]?.kind, "Conflicts");
+  store.close();
+  await writeFile(resultPath, JSON.stringify({
+    task_id: task.id, status: "success", summary: "Finished", commit: "a".repeat(40),
+    verification: [{ kind: "manual", project: "example", summary: "Verified" }],
+  }));
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 2);
+  assert.equal(harness.launches[1]?.workItemId, "example:issue-8:g1");
+});
+
+test("orphan worker is reported and its Project is gated without adoption or stopping", async (t) => {
+  let orphan = true;
+  let stops = 0;
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+    stop: async () => { stops += 1; },
+    ownedWorkers: async (project) => project.slug === "example" && orphan ? [{
+      taskId: "missing-task", projectSlug: project.slug, workItemId: "example:issue-7:g1",
+      clonePath: "/orphan/clone", tmuxSession: "merro-example", tmuxWindow: "impl-missing-task", paneId: "%9", containerId: null,
+    }] : [],
+  });
+  await harness.main.startObjective({ goal: "Both", projectSlugs: ["example", "other"],
+    issues: [{ projectSlug: "example", numbers: [7] }, { projectSlug: "other", numbers: [8] }] });
+  await harness.main.runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.project.slug), ["other"]);
+  assert.ok(harness.notifications.some((message) => /orphan/i.test(message) && message.includes("missing-task")));
+  assert.equal((await harness.main.statusSnapshot()).tasks.some((task) => task.id === "missing-task"), false);
+  assert.equal(stops, 0);
+  orphan = false;
+  await harness.restartMain().runPass();
+  assert.ok(harness.launches.some((launch) => launch.project.slug === "example"));
+});
+
+for (const labeled of [true, false]) {
+  test(`recorded workers are recognized without orphan reports (${labeled})`, async (t) => {
+    const workers: OwnedWorker[] = [];
+    const harness = await createHarness(t, { ownedWorkers: async () => workers, result: () => null,
+      inspect: async () => ({ alive: true, identityMatches: true, reason: null }) });
+    await harness.main.startObjective({ goal: "Ship", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+    await harness.main.runPass();
+    const input = harness.launches[0]!;
+    workers.push({ taskId: labeled ? input.taskId : null, projectSlug: "example", workItemId: input.workItemId,
+      clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: `implement-${input.taskId}`, paneId: "%1", containerId: null });
+    await harness.restartMain().runPass();
+    assert.equal(harness.launches.length, 1);
+    assert.equal(harness.notifications.some((message) => /orphan/i.test(message)), false);
+  });
+}
+
+test("live workers attached to finalized Tasks gate successors and retain their artifacts", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, { taskArtifacts: true, ownedWorkers: async () => workers });
+  await harness.main.startObjective({ goal: "Ship", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+  await harness.main.runPass();
+  const input = harness.launches[0]!;
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  const runtime = store.getTaskRuntime(input.taskId)!;
+  store.finalizeTask({ id: input.taskId, outcome: "failed", summary: "Stopped record", resultJson: "{}" });
+  store.close();
+  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: input.workItemId,
+    clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: `implement-${input.taskId}`, paneId: "%1", containerId: null });
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches.length, 1);
+  assert.ok(harness.notifications.some((message) => message.includes("Worker for finalized Task")));
+  assert.match(await readFile(join(dirname(runtime.resultPath), "pi-config", "auth.json"), "utf8"), /auth/);
+  assert.equal(await readFile(runtime.taskFilePath, "utf8"), input.taskFile);
+});
+
+test("unidentified orphan worker gates the workspace until its ownership can be established", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+    ownedWorkers: async (project) => project.slug === "example" ? [{
+      taskId: null, projectSlug: project.slug, workItemId: null, clonePath: null,
+      tmuxSession: "merro-example", tmuxWindow: "unidentified", paneId: "%9", containerId: null,
+    }] : [],
+  });
+  await harness.main.startObjective({ goal: "Both", projectSlugs: ["example", "other"],
+    issues: [{ projectSlug: "example", numbers: [7] }, { projectSlug: "other", numbers: [8] }] });
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+});
+
+test("orphan WorkItems remain active conflict endpoints across Projects", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+    ownedWorkers: async (project) => project.slug === "example" ? [{
+      taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+      tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64),
+    }] : [],
+  });
+  await harness.main.startObjective({ goal: "Both", projectSlugs: ["example", "other"],
+    issues: [{ projectSlug: "example", numbers: [7] }, { projectSlug: "other", numbers: [8] }] });
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  store.rebuildAutomaticRelations(["example:issue-7:g1", "other:issue-8:g1"], [{
+    kind: "Conflicts", from: "example:issue-7:g1", to: "other:issue-8:g1", confidence: "high", rationale: "Shared file", evidence: "Conflict",
+  }]);
+  store.close();
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+});
+
+for (const cap of [1, 2]) {
+  test(`orphan Docker worker and its pane consume one concurrency slot (cap ${cap})`, async (t) => {
+    const harness = await createHarness(t, {
+      maxConcurrentTasks: cap, projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+      ownedWorkers: async (project) => project.slug === "example" ? [
+        { taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+          tmuxSession: "merro-example", tmuxWindow: "impl-missing", paneId: "%9", containerId: null },
+        { taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+          tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) },
+      ] : [],
+    });
+    await harness.main.startObjective({ goal: "Both", projectSlugs: ["example", "other"],
+      issues: [{ projectSlug: "example", numbers: [7] }, { projectSlug: "other", numbers: [8] }] });
+    await harness.main.runPass();
+    assert.equal(harness.launches.length, cap - 1);
+    assert.ok(harness.launches.every((launch) => launch.project.slug === "other"));
+  });
+}
+
+test("worker enumeration failure gates only that Project", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
+    ownedWorkers: async (project) => { if (project.slug === "example") throw new Error("scan unavailable"); return []; },
+  });
+  await harness.main.startObjective({ goal: "Both", projectSlugs: ["example", "other"],
+    issues: [{ projectSlug: "example", numbers: [7] }, { projectSlug: "other", numbers: [8] }] });
+  await harness.main.runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.project.slug), ["other"]);
+  assert.ok(harness.notifications.some((message) => message.includes("scan unavailable")));
 });
 
 test("failed inference preserves a conflict with a live worker while healthy analysis continues", async (t) => {
@@ -2110,6 +2262,7 @@ test("new Main consumes a healthy worker result after a crash without restarting
       async mergeSquash() {},
     },
     workers: {
+      async listOwnedWorkers() { return []; },
       async prepareClone() {},
       async launch(input) {
         harness.launches.push(input);

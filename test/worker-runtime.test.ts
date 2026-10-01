@@ -49,15 +49,12 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
           if (!sessionExists) throw new Error("no such session");
           return { stdout: "", stderr: "" };
         }
-        if (args[0] === "new-session") {
-          sessionExists = true;
-          return { stdout: "", stderr: "" };
-        }
         if (args[0] === "show-option") {
           return { stdout: args.at(-1) === "@merro_project" ? "example\n" : `${createHash("sha256").update(projectPath).digest("hex")}\n`, stderr: "" };
         }
-        if (args[0] === "new-window") {
-          const launchCommand = String(args.at(-1));
+        if (args[0] === "new-window" || args[0] === "new-session") {
+          sessionExists = true;
+          const launchCommand = String(args[args.indexOf("-c") + 2]);
           const tokens = [...launchCommand.matchAll(/'([^']*)'/g)].map((match) => match[1] ?? "");
           const cidIndex = tokens.indexOf("--cidfile");
           const envIndex = tokens.indexOf("--env-file");
@@ -133,7 +130,12 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(!volumeArgs.some((value) => value.startsWith(`${projectPath}:`)));
   assert.ok(containerArgs.includes("--read-only"));
   assert.ok(containerArgs.includes("--cap-drop"));
-  assert.ok(calls.some((call) => call.file === "tmux" && call.args[0] === "set-option" && call.args.includes("@merro_owner")));
+  const start = calls.find((call) => call.file === "tmux" && call.args[0] === "new-session")!;
+  assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-task-1");
+  assert.ok(start.args.includes("@merro_owner"));
+  assert.ok(start.args.includes("@merro_task_id"));
+  assert.ok(containerArgs.includes(`merro.owner=${createHash("sha256").update(projectPath).digest("hex")}`));
+  assert.ok(containerArgs.includes("merro.work_item_id=work-1"));
   assert.ok(calls.some((call) => call.file === "docker" && call.args[0] === "build"));
   assert.equal(await exists(join(root, "runtime", "container-ids", "task-1.cid")), true);
 
@@ -204,7 +206,7 @@ for (const sandbox of ["docker", "none"] as const) {
         if (file === "docker" && args[0] === "build") return { stdout: "", stderr: "" };
         if (file === "tmux") {
           if (args[0] === "has-session") throw new Error("no such session");
-          if (args[0] === "new-window") throw new Error("tmux startup failed");
+          if (args[0] === "new-window" || args[0] === "new-session") throw new Error("tmux startup failed");
           return { stdout: "", stderr: "" };
         }
         throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
@@ -248,7 +250,7 @@ test("partial host launch rolls back the owned tmux window before removing Task 
     async run(file, args) {
       assert.equal(file, "tmux");
       if (args[0] === "has-session") throw new Error("missing session");
-      if (args[0] === "new-window") { windowExists = true; return { stdout: "%5", stderr: "" }; }
+      if (args[0] === "new-window" || args[0] === "new-session") { windowExists = true; return { stdout: "%5", stderr: "" }; }
       if (args[0] === "display-message") throw new Error(windowExists ? "process identity lookup failed" : "missing window");
       if (args[0] === "kill-window") { assert.equal(args.at(-1), "%5"); stopped = true; windowExists = false; }
       return { stdout: "", stderr: "" };
@@ -316,6 +318,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   const calls: Array<{ file: string; args: readonly string[] }> = [];
   let sessionExists = false;
   let workerScript = "";
+  let processStart = "Thu Jan 1 00:00:00 2026";
   const commands: CommandRunner = {
     async run(file, args) {
       calls.push({ file, args: [...args] });
@@ -324,21 +327,19 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
           if (!sessionExists) throw new Error("no such session");
           return { stdout: "", stderr: "" };
         }
-        if (args[0] === "new-session") {
-          sessionExists = true;
-          return { stdout: "", stderr: "" };
-        }
         if (args[0] === "show-option") {
           return { stdout: args.at(-1) === "@merro_project" ? "sandbox-none\n" : `${owner}\n`, stderr: "" };
         }
-        if (args[0] === "new-window") {
-          const command = String(args.at(-1));
+        if (args[0] === "new-window" || args[0] === "new-session") {
+          sessionExists = true;
+          const command = String(args[args.indexOf("-c") + 2]);
           workerScript = command.slice(1, -1);
           return { stdout: "%7\n", stderr: "" };
         }
-        if (args[0] === "display-message") return { stdout: "123 456 1700000000\n", stderr: "" };
+        if (args[0] === "display-message") return { stdout: args.at(-1) === "#{pane_pid}" ? "123\n" : "%7 123 0 node\n", stderr: "" };
         return { stdout: "", stderr: "" };
       }
+      if (file === "ps") return { stdout: `${processStart}\n`, stderr: "" };
       throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
     },
   };
@@ -367,6 +368,11 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   });
 
   assert.equal(record.runtimeKind, "host");
+  assert.equal(record.processStartedAt, "2026-01-01T00:00:00.000Z");
+  assert.equal((await runtime.inspect(record, "host-task")).identityMatches, true);
+  processStart = "Thu Jan 1 00:00:01 2026";
+  assert.equal((await runtime.inspect(record, "host-task")).identityMatches, false);
+  await assert.rejects(runtime.stop(record, "host-task"), /identity does not match/);
   assert.ok(workerScript);
   const taskRoot = join(workspacePath, "tasks", "host-task");
   const stagedConfig = join(taskRoot, "pi-config");

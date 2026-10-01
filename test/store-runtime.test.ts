@@ -70,6 +70,24 @@ test("automatic relation rebuild preserves manual evidence and effective Require
   } finally { store.close(); }
 });
 
+for (const activeEndpoint of ["a", "b"]) {
+  test(`automatic conflicts touching active ${activeEndpoint} survive successful analysis until finalization`, () => {
+    const store = makeStore();
+    try {
+      store.createWorkItem(item("a"));
+      store.createWorkItem(item("b"));
+      const conflict = { kind: "Conflicts" as const, from: "a", to: "b", confidence: "high" as const, rationale: "Scoped conflict", evidence: "Conflicts with #8" };
+      store.rebuildAutomaticRelations(["a", "b"], [conflict]);
+      store.createTask({ id: "running", workItemId: activeEndpoint, role: "implement", attempt: 1 });
+      store.rebuildAutomaticRelations(["a", "b"], []);
+      assert.deepEqual(store.listRelations(), [conflict]);
+      store.finalizeTask({ id: "running", outcome: "failed", summary: "Finished", resultJson: "{}" });
+      store.rebuildAutomaticRelations(["a", "b"], []);
+      assert.equal(store.listRelations().length, 0);
+    } finally { store.close(); }
+  });
+}
+
 test("runtime metadata, relation history, and Decisions survive store round trips", () => {
   const store = makeStore();
   try {

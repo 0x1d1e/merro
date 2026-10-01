@@ -8,7 +8,7 @@ import { chmod, copyFile, lstat, mkdir, readFile, readdir, rm, stat, writeFile }
 import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import type { MerroConfig } from "../config.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
-import { systemCommandRunner, type CommandRunner } from "./commands.js";
+import { CommandError, systemCommandRunner, type CommandRunner } from "./commands.js";
 
 const GENERIC_IMAGE = "merro-worker:0.1.0";
 const TASK_MOUNT = "/merro-task";
@@ -50,6 +50,17 @@ export interface WorkerLaunchInput {
   dependencies?: readonly WorkerDependencyMount[];
 }
 
+export interface OwnedWorker {
+  taskId: string | null;
+  projectSlug: string;
+  workItemId: string | null;
+  clonePath: string | null;
+  tmuxSession: string | null;
+  tmuxWindow: string | null;
+  paneId: string | null;
+  containerId: string | null;
+}
+
 export interface WorkerPresence {
   alive: boolean;
   identityMatches: boolean;
@@ -81,9 +92,9 @@ function taskWindow(input: WorkerLaunchInput): string {
   return `${input.role === "implement" ? "impl" : "rev"}-${safeName(input.taskId)}`;
 }
 
-function timestampFromEpoch(value: string): string | null {
-  const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : null;
+function missingTmuxTarget(error: unknown): boolean {
+  const detail = error instanceof CommandError ? error.stderr : String(error);
+  return /no such (?:session|window|pane)|missing (?:session|window|pane)|can't find (?:session|window|pane)|no server running|error connecting.*(?:No such file|Connection refused)/i.test(detail);
 }
 
 function parseDockerInspect(text: string): Record<string, unknown> {
@@ -217,7 +228,6 @@ export class WorkerRuntime {
     await writeFile(taskFilePath, input.taskFile, { encoding: "utf8", mode: 0o600 });
     await this.#copyPiConfig(scratchConfigPath);
     await this.#copyWorkerExtension(extensionRoot);
-    await this.#ensureSession(session, input.project);
 
     const environment: Record<string, string> = {
       HOME: join(TASK_MOUNT, "home"),
@@ -272,6 +282,10 @@ export class WorkerRuntime {
           "run", "--rm", "--cidfile", cidPath,
           "--name", `merro-${safeName(input.taskId)}`,
           "--label", `merro.task_id=${input.taskId}`,
+          "--label", `merro.project=${input.project.slug}`,
+          "--label", `merro.owner=${projectOwner(input.project.path)}`,
+          "--label", `merro.work_item_id=${input.workItemId}`,
+          "--label", `merro.clone_path=${resolve(input.clonePath)}`,
           "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
           "--workdir", CLONE_MOUNT,
           "--volume", `${resolve(input.clonePath)}:${CLONE_MOUNT}${input.role === "review" ? ":ro" : ""}`,
@@ -306,11 +320,25 @@ export class WorkerRuntime {
         launchCommand = shellQuote(scriptPath);
       }
 
+      const existingSession = await this.#sessionExists(session, input.project);
+      const sessionMarkers = existingSession ? [] : [
+        ";", "set-option", "-t", session, "@merro_project", input.project.slug,
+        ";", "set-option", "-t", session, "@merro_owner", projectOwner(input.project.path),
+        ";", "set-environment", "-t", session, "MERRO_PROJECT", input.project.slug,
+        ";", "set-environment", "-t", session, "MERRO_OWNER", projectOwner(input.project.path),
+      ];
       windowLaunchAttempted = true;
+      // The first Task is the session's first window. Mark ownership in the same server command queue.
       const paneResult = await this.#commands.run("tmux", [
-        "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session,
+        existingSession ? "new-window" : "new-session", "-d", "-P", "-F", "#{pane_id}",
+        existingSession ? "-t" : "-s", session,
         "-n", window, "-c", sandbox === "none" ? resolve(input.clonePath) : input.project.path,
         launchCommand,
+        ...sessionMarkers,
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_task_id", input.taskId,
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_work_item_id", input.workItemId,
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_clone_path", resolve(input.clonePath),
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_runtime_kind", sandbox === "docker" ? "docker" : "host",
       ]);
       paneId = paneResult.stdout.trim() || null;
       if (!paneId) throw new Error(`tmux did not return a pane ID for Task ${input.taskId}`);
@@ -329,10 +357,10 @@ export class WorkerRuntime {
           processStartedAt = startedAt;
         }
       } else {
-        const pane = (await this.#commands.run("tmux", ["display-message", "-p", "-t", paneId, "#{pane_pid} #{pane_start_time}"])).stdout.trim().split(/\s+/);
-        processPid = Number(pane[0]);
-        processStartedAt = timestampFromEpoch(pane[1] ?? "") ?? startedAt;
-        if (!Number.isSafeInteger(processPid) || processPid < 1) processPid = null;
+        const pane = (await this.#commands.run("tmux", ["display-message", "-p", "-t", paneId, "#{pane_pid}"])).stdout.trim();
+        processPid = Number(pane);
+        if (!Number.isSafeInteger(processPid) || processPid < 1) throw new Error(`invalid pane PID for Task ${input.taskId}`);
+        processStartedAt = await this.#hostProcessStartedAt(processPid);
       }
 
       launchSucceeded = true;
@@ -362,8 +390,8 @@ export class WorkerRuntime {
               .then(() => true, () => false);
             if (exists) throw killError;
           });
+          await this.stop(partial, input.taskId);
         }
-        await this.stop(partial, input.taskId);
         await this.cleanup(partial);
       } catch (rollbackError) {
         throw new AggregateError([error, rollbackError], `Worker launch failed and rollback failed: ${String(error)}; ${String(rollbackError)}`);
@@ -374,6 +402,67 @@ export class WorkerRuntime {
         await rm(launchSecretPath, { force: true });
       }
     }
+  }
+
+  async listOwnedWorkers(project: Project, settings: ProjectSettingsRecord | null = null): Promise<OwnedWorker[]> {
+    const session = projectSession(project);
+    const workers: OwnedWorker[] = [];
+    let dockerPane = false;
+    if (await this.#sessionExists(session, project)) {
+      const panes = (await this.#commands.run("tmux", ["list-panes", "-s", "-t", session, "-F", "#{pane_id} #{pane_dead}"])).stdout.trim();
+      for (const row of panes ? panes.split("\n") : []) {
+        const [paneId, dead] = row.split(" ");
+        if (!paneId || !/^%\d+$/.test(paneId) || !/^[01]$/.test(dead ?? "")) throw new Error("tmux returned invalid pane inventory");
+        if (dead === "1") continue;
+        const option = async (name: string): Promise<string | null> =>
+          (await this.#commands.run("tmux", ["show-option", "-wqv", "-t", paneId, name])).stdout.replace(/\r?\n$/, "") || null;
+        const [taskId, workItemId, clonePath, kind, window] = await Promise.all([
+          option("@merro_task_id"), option("@merro_work_item_id"), option("@merro_clone_path"), option("@merro_runtime_kind"),
+          this.#commands.run("tmux", ["display-message", "-p", "-t", paneId, "#{window_name}"]),
+        ]);
+        dockerPane ||= kind === "docker";
+        workers.push({ taskId, projectSlug: project.slug, workItemId, clonePath,
+          tmuxSession: session, tmuxWindow: window.stdout.replace(/\r?\n$/, ""), paneId, containerId: null });
+      }
+    }
+    // Host-only installations do not require Docker. Prior launch artifacts still require an inventory.
+    const cids = await readdir(join(this.#workspacePath, "container-ids")).catch((error: unknown) => {
+      if (typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    });
+    const requireDocker = (settings?.sandbox ?? this.#config.sandbox) === "docker" || dockerPane || cids.some((name) => name.endsWith(".cid"));
+    let containers: string;
+    try {
+      containers = (await this.#commands.run("docker", ["ps", "--quiet", "--no-trunc", "--filter", "label=merro.task_id"])).stdout.trim();
+    } catch (error) {
+      if (!requireDocker && error instanceof CommandError && (error.causeCode === "ENOENT" || /cannot connect|is the docker daemon running|failed to connect/i.test(error.stderr))) return workers;
+      throw error;
+    }
+    for (const containerId of containers ? containers.split("\n") : []) {
+      if (!/^[0-9a-f]{12,64}$/i.test(containerId)) throw new Error("Docker returned invalid container inventory");
+      let inspect: Record<string, unknown>;
+      try {
+        inspect = parseDockerInspect((await this.#commands.run("docker", ["inspect", containerId])).stdout);
+      } catch (error) {
+        // A worker can exit between enumeration and inspection, but a failed live scan is not an empty inventory.
+        if ((await this.#commands.run("docker", ["ps", "--quiet", "--filter", `id=${containerId}`])).stdout.trim()) throw error;
+        continue;
+      }
+      const state = inspect.State as { Running?: boolean } | undefined;
+      if (state?.Running !== true) continue;
+      const labels = (inspect.Config as { Labels?: Record<string, string> } | undefined)?.Labels ?? {};
+      const taskId = labels["merro.task_id"];
+      if (!taskId) continue;
+      const mounts = Array.isArray(inspect.Mounts) ? inspect.Mounts as Array<{ Source?: string; Destination?: string }> : [];
+      const legacyOwned = !labels["merro.owner"] && mounts.some((mount) => mount.Destination === TASK_MOUNT
+        && mount.Source === join(this.#workspacePath, "tasks", safeName(taskId)));
+      if (!legacyOwned && (labels["merro.owner"] !== projectOwner(project.path) || labels["merro.project"] !== project.slug)) continue;
+      if (legacyOwned && labels["merro.project"] && labels["merro.project"] !== project.slug) continue;
+      workers.push({ taskId, projectSlug: project.slug, workItemId: labels["merro.work_item_id"] ?? null,
+        clonePath: labels["merro.clone_path"] ?? mounts.find((mount) => mount.Destination === CLONE_MOUNT)?.Source ?? null,
+        tmuxSession: null, tmuxWindow: null, paneId: null, containerId });
+    }
+    return workers;
   }
 
   async inspect(record: TaskRuntimeRecord, taskId: string): Promise<WorkerPresence> {
@@ -410,12 +499,16 @@ export class WorkerRuntime {
       return { alive: true, identityMatches: true, reason: null };
     }
 
+    let paneFound = false;
     try {
       const result = (await this.#commands.run("tmux", [
         "display-message", "-p", "-t", `${record.tmuxSession}:${record.tmuxWindow}`,
-        "#{pane_id} #{pane_pid} #{pane_start_time} #{pane_current_command}",
+        "#{pane_id} #{pane_pid} #{pane_dead} #{pane_current_command}",
       ])).stdout.trim().split(/\s+/);
-      const startedAt = timestampFromEpoch(result[2] ?? "");
+      paneFound = true;
+      if (result[2] === "1") return { alive: false, identityMatches: false, reason: "tmux pane process exited" };
+      const pid = Number(result[1]);
+      const startedAt = record.processStartedAt === null ? null : await this.#hostProcessStartedAt(pid);
       const hasProcessIdentity = record.paneId !== null || record.processPid !== null;
       const taskWindowMatches = hasProcessIdentity || record.tmuxWindow.endsWith(safeName(taskId));
       const identityMatches = taskWindowMatches
@@ -427,6 +520,7 @@ export class WorkerRuntime {
         ? { alive: true, identityMatches: true, reason: null }
         : { alive: true, identityMatches: false, reason: `tmux pane identity changed for Task ${taskId}` };
     } catch (error) {
+      if (paneFound || !missingTmuxTarget(error)) throw error;
       return { alive: false, identityMatches: false, reason: `tmux pane is gone: ${String(error)}` };
     }
   }
@@ -516,17 +610,22 @@ export class WorkerRuntime {
     await copyTree(typeboxRoot, join(target, "node_modules", "typebox"));
   }
 
-  async #ensureSession(session: string, project: Project): Promise<void> {
+  async #hostProcessStartedAt(pid: number): Promise<string> {
+    if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("invalid host worker PID");
+    // tmux has no pane_start_time format. ps works on both Linux and macOS.
+    const output = await this.#commands.run("ps", ["-p", String(pid), "-o", "lstart="], { env: { LC_ALL: "C", TZ: "UTC" } });
+    const time = Date.parse(`${output.stdout.trim()} UTC`);
+    if (!Number.isFinite(time)) throw new Error(`cannot read start time for host worker PID ${pid}`);
+    return new Date(time).toISOString();
+  }
+
+  async #sessionExists(session: string, project: Project): Promise<boolean> {
     const owner = projectOwner(project.path);
     try {
       await this.#commands.run("tmux", ["has-session", "-t", session]);
-    } catch {
-      await this.#commands.run("tmux", ["new-session", "-d", "-s", session, "-n", "main", "-c", project.path]);
-      await this.#commands.run("tmux", ["set-option", "-t", session, "@merro_project", project.slug]);
-      await this.#commands.run("tmux", ["set-option", "-t", session, "@merro_owner", owner]);
-      await this.#commands.run("tmux", ["set-environment", "-t", session, "MERRO_PROJECT", project.slug]);
-      await this.#commands.run("tmux", ["set-environment", "-t", session, "MERRO_OWNER", owner]);
-      return;
+    } catch (error) {
+      if (missingTmuxTarget(error)) return false;
+      throw error;
     }
 
     const [storedProject, storedOwner] = await Promise.all([
@@ -536,6 +635,7 @@ export class WorkerRuntime {
     if (storedProject.stdout.trim() !== project.slug || storedOwner.stdout.trim() !== owner) {
       throw new Error(`refusing to adopt unowned tmux session ${session}`);
     }
+    return true;
   }
 
   async #waitForContainerId(path: string): Promise<string> {

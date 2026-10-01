@@ -421,7 +421,14 @@ export class MerroStore {
       for (const id of analyzedIds) deactivate.run(id);
       // Either endpoint may supply a symmetric relation. Preserve it until both were checked successfully.
       const analyzed = new Set(analyzedIds);
-      const deactivateConflict = this.#db.prepare("UPDATE relations SET active = 0 WHERE automatic = 1 AND kind = 'Conflicts' AND from_work_item_id = ? AND to_work_item_id = ?");
+      const deactivateConflict = this.#db.prepare(`
+        UPDATE relations SET active = 0
+        WHERE automatic = 1 AND kind = 'Conflicts' AND from_work_item_id = ? AND to_work_item_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM tasks WHERE status = 'active'
+              AND work_item_id IN (relations.from_work_item_id, relations.to_work_item_id)
+          )
+      `);
       for (const relation of this.#db.prepare("SELECT from_work_item_id, to_work_item_id FROM relations WHERE automatic = 1 AND kind = 'Conflicts' AND active = 1").all()) {
         if (analyzed.has(String(relation.from_work_item_id)) && analyzed.has(String(relation.to_work_item_id))) {
           deactivateConflict.run(String(relation.from_work_item_id), String(relation.to_work_item_id));

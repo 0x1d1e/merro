@@ -21,7 +21,7 @@ type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "c
   & Partial<Pick<GitClient, "remoteBranchCommit" | "ensureWorkItemClone" | "createReadOnlyCheckout" | "deleteClone">>;
 type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest">>;
-type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup">
+type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup" | "listOwnedWorkers">
   & Partial<Pick<WorkerRuntime, "plan" | "stop">>;
 
 export interface MainOptions {
@@ -555,8 +555,11 @@ export class MainOrchestrator {
 
   async runPass(): Promise<void> {
     await this.#withStore(async (store) => {
+      const unsafeProjects = new Set<string>();
       try {
         const unavailableProjects = await this.#reconcileProjects(store);
+        const orphans = await this.#reconcileWorkers(store, unsafeProjects);
+        for (const slug of unsafeProjects) unavailableProjects.add(slug);
         const scopeGates = new Set<string>();
         for (const objective of store.listObjectives()) {
           if (objective.state === "Active" && objective.issueScopes?.some((scope) => "query" in scope)) {
@@ -566,7 +569,9 @@ export class MainOrchestrator {
         await this.#reconcileIssues(store, unavailableProjects);
         await this.#reconcileTasks(store, unavailableProjects);
         store.settleScopeDetachments();
-        for (const item of store.listWorkItems()) this.#obsoleteIfUnowned(store, item);
+        for (const item of store.listWorkItems()) {
+          if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
+        }
         await this.#reconcilePullRequests(store, unavailableProjects);
         const relationGates = await this.#rebuildRelations(store, unavailableProjects);
         for (const id of scopeGates) relationGates.add(id);
@@ -578,18 +583,18 @@ export class MainOrchestrator {
           workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id)
             && !unavailableProjects.has(item.projectSlug) && !relationGates.has(item.id)),
           relations: store.listRelations(),
-          activeTaskCount: active.length,
-          activeWorkItemIds: active.map((task) => task.workItemId),
+          activeTaskCount: active.length + orphans.count,
+          activeWorkItemIds: [...active.map((task) => task.workItemId), ...orphans.workItemIds],
           maxConcurrentTasks: this.#config.max_concurrent_tasks,
         });
-        if (result.cycle) this.#blockCycle(store, result.cycle, new Set(active.map((task) => task.workItemId)));
+        if (result.cycle) this.#blockCycle(store, result.cycle, new Set([...active.map((task) => task.workItemId), ...orphans.workItemIds]));
         for (const item of result.selected) {
           if (item.state === "Ready") store.transitionWorkItem(item.id, "Implementing");
           await this.#launchTask(store, store.getWorkItem(item.id) ?? item);
         }
         await this.#finishObjectives(store, unavailableProjects);
       } finally {
-        await this.#reconcileFinalizedTasks(store);
+        await this.#reconcileFinalizedTasks(store, unsafeProjects);
       }
     });
   }
@@ -891,6 +896,41 @@ export class MainOrchestrator {
     this.#notify(`Reopened issue #${issue.number} created WorkItem generation ${generation}.`);
   }
 
+  async #reconcileWorkers(store: MerroStore, unsafeProjects: Set<string>): Promise<{ count: number; workItemIds: Set<string> }> {
+    const tasks = store.listTasks().filter((task) => task.status === "active");
+    const runtimes = tasks.map((task) => store.getTaskRuntime(task.id)).filter((runtime) => runtime !== null);
+    const orphanIds = new Set<string>();
+    const workItemIds = new Set<string>();
+    const projects = store.listProjects();
+    for (const project of projects) {
+      try {
+        const workers = await this.#workers.listOwnedWorkers(project, store.getProjectSettings(project.slug));
+        for (const worker of workers) {
+          const recordedTask = worker.taskId !== null ? store.getTask(worker.taskId) : null;
+          const recorded = worker.taskId !== null ? recordedTask?.status === "active" : runtimes.some((runtime) =>
+            (worker.paneId !== null && runtime.paneId === worker.paneId && runtime.tmuxSession === worker.tmuxSession)
+            || (worker.containerId !== null && runtime.containerId === worker.containerId)
+            || (runtime.paneId === null && runtime.containerId === null && worker.tmuxWindow !== null
+              && runtime.tmuxWindow === worker.tmuxWindow && runtime.tmuxSession === worker.tmuxSession));
+          if (recorded) continue;
+          orphanIds.add(worker.taskId ?? worker.containerId ?? `${worker.tmuxSession}:${worker.paneId}`);
+          unsafeProjects.add(project.slug);
+          const item = worker.workItemId ? store.getWorkItem(worker.workItemId) : store.listWorkItems().find((candidate) =>
+            worker.clonePath !== null && store.getWorkItemRuntime(candidate.id)?.clonePath === worker.clonePath);
+          if (item?.projectSlug === project.slug) workItemIds.add(item.id);
+          else for (const registered of projects) unsafeProjects.add(registered.slug);
+          this.#notify(`${recordedTask ? "Worker for finalized Task" : "Orphan worker"} in Project ${project.slug}: Task ${worker.taskId ?? "unknown"}, tmux ${worker.tmuxSession ?? "none"}:${worker.tmuxWindow ?? "none"}, pane ${worker.paneId ?? "none"}, container ${worker.containerId ?? "none"}, clone ${worker.clonePath ?? "unknown"}. Scheduling gated; worker not adopted or stopped.`, "warning");
+        }
+      } catch (error) {
+        // An incomplete inventory cannot prove that a clone is unowned.
+        unsafeProjects.add(project.slug);
+        for (const item of store.listWorkItems().filter((candidate) => candidate.projectSlug === project.slug)) workItemIds.add(item.id);
+        this.#notify(`Could not enumerate owned workers for Project ${project.slug}; scheduling gated: ${errorText(error)}`, "warning");
+      }
+    }
+    return { count: orphanIds.size, workItemIds };
+  }
+
   async #reconcileTasks(store: MerroStore, unavailableProjects: ReadonlySet<string>): Promise<void> {
     for (const task of store.listTasks().filter((candidate) => candidate.status === "active")) {
       const item = store.getWorkItem(task.workItemId);
@@ -976,14 +1016,14 @@ export class MainOrchestrator {
     }
   }
 
-  async #reconcileFinalizedTasks(store: MerroStore): Promise<void> {
+  async #reconcileFinalizedTasks(store: MerroStore, unsafeProjects: ReadonlySet<string> = new Set()): Promise<void> {
     // Finalized Tasks remain the durable cleanup queue, including across Main restarts.
     const tasks = store.listTasks();
     const activeInputs = new Set(tasks.filter((task) => task.status === "active")
       .map((task) => store.getTaskRuntime(task.id)?.taskFilePath));
     for (const task of tasks.filter((candidate) => candidate.status === "finalized")) {
       const runtime = store.getTaskRuntime(task.id);
-      if (!runtime) continue;
+      if (!runtime || unsafeProjects.has(store.getWorkItem(task.workItemId)!.projectSlug)) continue;
       let preserveResult = false;
       try {
         const raw: unknown = JSON.parse(task.resultJson ?? "null");
@@ -1386,8 +1426,11 @@ export class MainOrchestrator {
     const relations: Relation[] = [];
     const objectives = store.listObjectives().filter((objective) => objective.state === "Active");
     for (const item of store.listWorkItems()) {
-      if (terminal(item) || !store.hasActiveObjectiveForWorkItem(item.id)) { analyzed.push(item.id); continue; }
       if (unavailableProjects.has(item.projectSlug)) { gated.add(item.id); continue; }
+      if (terminal(item) || !store.hasActiveObjectiveForWorkItem(item.id)) {
+        if (!store.activeTask(item.id)) analyzed.push(item.id);
+        continue;
+      }
       if (item.sourceType !== "issue") { analyzed.push(item.id); continue; }
       try {
         const project = store.getProject(item.projectSlug)!;
@@ -1418,7 +1461,10 @@ export class MainOrchestrator {
     const items = store.listWorkItems();
     const byId = new Map(items.map((item) => [item.id, item]));
     const relations = store.listRelations();
-    const active = new Set(store.listTasks().filter((task) => task.status === "active").map((task) => task.workItemId));
+    const active = new Set([
+      ...store.listTasks().filter((task) => task.status === "active").map((task) => task.workItemId),
+      ...items.filter((item) => unavailableProjects.has(item.projectSlug)).map((item) => item.id),
+    ]);
     const cycle = findRequiresCycle(relations);
     if (cycle) this.#blockCycle(store, cycle, active);
     for (const item of store.listWorkItems()) {
