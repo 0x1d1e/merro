@@ -1704,7 +1704,7 @@ export class MainOrchestrator {
     for (const objective of store.listObjectives()) {
       if (objective.state !== "Active") continue;
       const items = store.listWorkItems(objective.id);
-      if (!items.every(terminal) || (items.length === 0 && !objective.issueScopes?.some((scope) => "query" in scope))) continue;
+      if (!items.every(terminal)) continue;
       if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects, new Set(), unsafeProjects)) continue;
       if (!store.listWorkItems(objective.id).every(terminal)) continue;
       store.setObjectiveState(objective.id, "Done");

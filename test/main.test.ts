@@ -1426,6 +1426,29 @@ test("legacy Objectives retain fixed selections rather than inferring a query fr
   assert.deepEqual(snapshot.workItems.map((item) => item.sourceRef), ["7"]);
 });
 
+test("zero-work legacy Objectives recover empty fixed selections and complete after restart", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "api", issueNumbers: [7] }] });
+  const databasePath = join(harness.workspacePath, ".merro", "state.db");
+  const store = new MerroStore(databasePath);
+  try {
+    store.createObjective({ id: "legacy", goal: "Ship all features", priority: "normal", state: "Active", projectSlugs: ["api"] });
+    assert.equal(store.getObjective("legacy")?.issueScopes, undefined);
+    assert.deepEqual(store.listWorkItems("legacy"), []);
+  } finally { store.close(); }
+  const database = new DatabaseSync(databasePath);
+  try {
+    assert.equal(database.prepare("SELECT issue_scopes_json FROM objectives WHERE id = ?").get("legacy")?.issue_scopes_json, null);
+  } finally { database.close(); }
+
+  const restarted = harness.restartMain();
+  await restarted.runPass();
+  const snapshot = await restarted.statusSnapshot();
+  assert.deepEqual(snapshot.objectives[0]?.issueScopes, [{ projectSlug: "api", numbers: [] }]);
+  assert.equal(snapshot.objectives[0]?.state, "Done");
+  assert.deepEqual(snapshot.workItems, []);
+  assert.equal(harness.launches.length, 0);
+});
+
 test("empty query scopes complete only after a successful fresh check", async (t) => {
   let fail = false;
   const harness = await createHarness(t, { scopeFailure: () => fail });
