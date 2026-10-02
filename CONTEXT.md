@@ -43,6 +43,9 @@ Pending user approval, selected publicly by change name, never by a database key
 ### Blocked
 Exceptional ChangeSet state carrying a typed reason and its prior flow state. Externally fixable causes may auto-resume after fresh reconciliation; user-owned causes need explicit continuation.
 
+### PublishBlocked
+Reviewed ChangeSet whose branch or PR publication failed. Resumes Publishing, retaining completed Tasks and any PR identity. It does not require another Worker unless the reviewed changes themselves need updating.
+
 ### Generation
 Private counter preserving history when a terminal source needs new work. Never reused for the same source selection.
 

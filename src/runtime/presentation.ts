@@ -38,10 +38,21 @@ export function presentWorkspace(store: MerroStore) {
       const runtime = store.getChangeSetRuntime(item.id);
       const tasks = store.listTasks(item.id);
       const active = store.activeTask(item.id);
+      const phase = item.blockedResumeState ?? item.state;
+      const latestReview = tasks.filter((task) => task.role === "review").at(-1);
+      const review = phase === "Reviewing" ? "running" : phase === "Implementing" ? "pending"
+        : latestReview?.outcome ?? "not run";
+      const publication = item.state === "PublishBlocked" ? "blocked" : phase === "Publishing" ? "publishing"
+        : phase === "Reviewed" ? "pending" : phase === "AwaitingMerge" || runtime?.mergedCommitSha ? "published" : "not started";
+      const merge = runtime?.mergedCommitSha ? "merged" : item.blockedReason ? `blocked (${item.blockedReason})`
+        : store.pendingDecisions().some((decision) => decision.subjectId === item.id && decision.kind === "merge") ? "approval required"
+        : phase === "AwaitingMerge" ? "waiting for checks/reviews/reconciliation" : "not ready";
       return {
         name: changeName(item), project: item.projectSlug, issues: issueNumbers(item), state: item.state,
         branch: runtime?.branchName ? publicText(runtime.branchName, names) : null, pr: runtime?.pullRequestNumber ?? null,
         worker: active ? workerName(item, active) : null, workerState: null as string | null,
+        review, publication, merge, prState: runtime?.pullRequestState ?? "not created", githubCI: runtime?.githubChecks ?? "not observed",
+        publicationDetail: item.state === "PublishBlocked" ? publicText(store.latestBlock(item.id)?.detail ?? "", names) : null,
         ci: localCI(tasks), lastActivity: publicText(tasks.at(-1)?.summary ?? (active ? "Working" : "Waiting"), names),
         blocked: item.blockedReason,
       };
@@ -58,6 +69,6 @@ export function presentWorkspace(store: MerroStore) {
 }
 export function formatStatus(snapshot: ReturnType<typeof presentWorkspace>): string {
   const status = snapshot.projects.map((project) => [project.slug, ...snapshot.changes.filter((change) => change.project === project.slug).map((change) =>
-    `\n${change.name}\nIssues: ${change.issues.map((number) => `#${number}`).join(" ")}\nState: ${change.state}${change.worker ? `\nWorker: ${change.worker}${change.workerState ? ` (${change.workerState})` : ""}` : ""}\nCI: ${change.ci}\nLast activity: ${change.lastActivity}${change.pr ? `\nPR: #${change.pr}` : ""}`)].join("\n")).join("\n\n") || "Merro: no work planned.";
+    `\n${change.name}\nIssues: ${change.issues.map((number) => `#${number}`).join(" ")}\nState: ${change.state}${change.worker ? `\nWorker: ${change.worker}${change.workerState ? ` (${change.workerState})` : ""}` : ""}\nReview: ${change.review}\nCI (local reported): ${change.ci}\nCI (GitHub observed): ${change.githubCI}\nPublication: ${change.publication}${change.publicationDetail ? ` (${change.publicationDetail})` : ""}\nPR: ${change.pr ? `#${change.pr} (${change.prState})` : change.prState}\nMerge: ${change.merge}\nLast activity: ${change.lastActivity}`)].join("\n")).join("\n\n") || "Merro: no work planned.";
   return `${status}${snapshot.decisions.length ? `\n\nPending decisions:\n${snapshot.decisions.map((decision) => `${decision.change}: ${decision.summary}\n/merro-approve ${decision.change}`).join("\n")}` : ""}`;
 }

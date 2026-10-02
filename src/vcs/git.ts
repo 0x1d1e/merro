@@ -155,11 +155,47 @@ export class GitClient {
     if (resolved !== baseCommit) throw new Error(`approved base ${baseCommit} resolved to ${resolved}`);
   }
 
-  async pushBranch(project: Project, clonePath: string, branchName: string): Promise<void> {
+  async pushBranch(project: Project, clonePath: string, branchName: string, reviewedCommit?: string): Promise<void> {
+    await this.#run("git", ["check-ref-format", "--branch", branchName]);
     const current = (await this.#run("git", ["branch", "--show-current"], { cwd: clonePath })).stdout.trim();
     if (current !== branchName) throw new Error(`Refusing to push unexpected branch ${current}; expected ${branchName}`);
+    const status = await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: clonePath });
+    if (status.stdout.length) throw new Error("Cannot publish: clone has uncommitted or untracked changes. Restore the reviewed checkout before retrying.");
+    const head = await this.currentCommit(clonePath);
+    if (reviewedCommit && head !== reviewedCommit) throw new Error("Cannot publish: clone HEAD no longer matches the reviewed commit. Request a fresh review.");
     const pushRemote = await this.#resolveRemote(project.path, project.pushRemote);
-    await this.#run("git", ["push", pushRemote, `HEAD:refs/heads/${branchName}`], { cwd: clonePath });
+    let remoteHead: string | null = null;
+    try {
+      await this.#run("git", ["fetch", "--no-tags", pushRemote, `refs/heads/${branchName}`], { cwd: clonePath });
+      remoteHead = (await this.#run("git", ["rev-parse", "FETCH_HEAD"], { cwd: clonePath })).stdout.trim();
+    } catch (error) {
+      // Do not mistake authentication/connectivity failures for an absent branch.
+      let absent = false;
+      try {
+        await this.#run("git", ["ls-remote", "--exit-code", "--heads", pushRemote, `refs/heads/${branchName}`], { cwd: clonePath });
+      } catch (probeError) {
+        if (!(probeError instanceof CommandError) || probeError.exitCode !== 2) throw probeError;
+        absent = true;
+      }
+      if (!absent) throw error;
+    }
+    if (remoteHead && remoteHead !== head) {
+      try {
+        await this.#run("git", ["merge-base", "--is-ancestor", remoteHead, head], { cwd: clonePath });
+      } catch (error) {
+        if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
+        let behind = false;
+        try {
+          await this.#run("git", ["merge-base", "--is-ancestor", head, remoteHead], { cwd: clonePath });
+          behind = true;
+        } catch (ancestorError) {
+          if (!(ancestorError instanceof CommandError) || ancestorError.exitCode !== 1) throw ancestorError;
+        }
+        throw new Error(`Remote branch ${branchName} ${behind ? "is ahead of the reviewed local branch" : "has diverged"}. Reconcile the branch and request a fresh review through Main before retrying; do not force-push.`);
+      }
+    }
+    // An ordinary push also rejects a concurrent remote rewrite. Publish the exact reviewed SHA.
+    await this.#run("git", ["push", pushRemote, `${head}:refs/heads/${branchName}`], { cwd: clonePath });
   }
 
   async syncBranchHead(project: Project, clonePath: string, branchName: string, expectedCommit: string): Promise<void> {

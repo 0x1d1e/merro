@@ -24,6 +24,8 @@ import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
 import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, SCHEMA_VERSION } from "./schema.js";
 
+import { migratePublicationStates } from "./publication-migration.js";
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -335,6 +337,10 @@ export class MerroStore {
         version = 14;
       } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
     }
+    if (version < 15) {
+      migratePublicationStates(this.#db);
+      version = 15;
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -617,6 +623,7 @@ export class MerroStore {
       pullRequestNumber: row.pull_request_number === null ? null : Number(row.pull_request_number),
       pullRequestUrl: row.pull_request_url === null ? null : String(row.pull_request_url),
       pullRequestState: row.pull_request_state === null ? null : String(row.pull_request_state),
+      githubChecks: row.github_checks as Exclude<ChangeSetRuntimeRecord["githubChecks"], undefined>,
       pullRequestHeadSha: row.pull_request_head_sha === null ? null : String(row.pull_request_head_sha),
       pullRequestBaseSha: row.pull_request_base_sha === null ? null : String(row.pull_request_base_sha),
       mergedCommitSha: row.merged_commit_sha === null ? null : String(row.merged_commit_sha),
@@ -636,8 +643,8 @@ export class MerroStore {
         work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
         pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, last_issue_state,
         reviewed_diff_hash, review_round, infrastructure_retries, implementation_attempt, last_reconciled_at,
-        last_rework_trigger, base_update_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_rework_trigger, base_update_json, github_checks
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(work_item_id) DO UPDATE SET
         branch_name = excluded.branch_name, clone_path = excluded.clone_path, base_commit = excluded.base_commit,
         pull_request_number = excluded.pull_request_number, pull_request_url = excluded.pull_request_url,
@@ -646,13 +653,13 @@ export class MerroStore {
         last_issue_state = excluded.last_issue_state, reviewed_diff_hash = excluded.reviewed_diff_hash,
         review_round = excluded.review_round, infrastructure_retries = excluded.infrastructure_retries,
         implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at,
-        last_rework_trigger = excluded.last_rework_trigger, base_update_json = excluded.base_update_json
+        last_rework_trigger = excluded.last_rework_trigger, base_update_json = excluded.base_update_json, github_checks = excluded.github_checks
     `).run(
       record.changeSetId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
       record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
       record.mergedCommitSha, record.lastIssueState, record.reviewedDiffHash, record.reviewRound,
       record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt, record.lastReworkTrigger,
-      record.baseUpdate ? JSON.stringify(record.baseUpdate) : null,
+      record.baseUpdate ? JSON.stringify(record.baseUpdate) : null, record.githubChecks ?? null,
     );
   }
 
@@ -730,7 +737,7 @@ export class MerroStore {
     if (item.issues.some((issue) => issue.projectSlug !== item.projectSlug || !Number.isSafeInteger(issue.number) || issue.number < 1)
       || new Set(issueNumbers(item)).size !== item.issues.length) throw new Error("ChangeSet sources must be distinct positive issue numbers in its Project.");
     const hasBlockedMetadata = item.blockedReason !== null || item.blockedResumeState !== null;
-    if (item.state === "Blocked") {
+    if (item.state === "Blocked" || item.state === "PublishBlocked") {
       if (item.blockedReason === null || item.blockedResumeState === null) {
         throw new Error("Blocked ChangeSet requires BlockReason and resume state");
       }
@@ -907,7 +914,7 @@ export class MerroStore {
         this.#db.exec("COMMIT");
         return false;
       }
-      if (item.state !== "AwaitingMerge" && item.state !== "Blocked" && item.state !== "Done") {
+      if (item.state !== "AwaitingMerge" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing" && item.state !== "Done") {
         throw new Error(`ChangeSet ${id} is not awaiting a pull request merge`);
       }
       if (this.activeTask(id)) throw new Error(`ChangeSet ${id} still has an active Task`);
@@ -940,7 +947,7 @@ export class MerroStore {
   completeChangeSetAfterExternalMerge(id: string): void {
     const item = this.getChangeSet(id);
     if (!item) throw new Error(`unknown ChangeSet: ${id}`);
-    if (item.state !== "AwaitingMerge" && item.state !== "Blocked") {
+    if (item.state !== "AwaitingMerge" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing") {
       throw new Error(`ChangeSet ${id} is not awaiting an external pull request merge`);
     }
     if (this.activeTask(id)) throw new Error(`ChangeSet ${id} still has an active Task`);
@@ -982,10 +989,11 @@ export class MerroStore {
     const item = this.getChangeSet(id);
     if (!item) throw new Error(`unknown ChangeSet: ${id}`);
 
-    if (to === "Blocked" && blockedReason === null) {
+    const blocking = to === "Blocked" || to === "PublishBlocked";
+    if (blocking && blockedReason === null) {
       throw new Error("Blocked ChangeSet requires a BlockReason");
     }
-    if (to !== "Blocked" && blockedReason !== null) {
+    if (!blocking && blockedReason !== null) {
       throw new Error("BlockReason is only valid when entering or updating Blocked");
     }
 
@@ -996,9 +1004,9 @@ export class MerroStore {
 
     let nextBlockedReason: BlockReason | null = null;
     let nextBlockedResumeState: FlowChangeSetState | null = null;
-    if (to === "Blocked") {
+    if (blocking) {
       nextBlockedReason = blockedReason;
-      nextBlockedResumeState = item.state === "Blocked"
+      nextBlockedResumeState = item.state === "Blocked" || item.state === "PublishBlocked"
         ? item.blockedResumeState
         : item.state as FlowChangeSetState;
       if (nextBlockedResumeState === null) {
@@ -1074,6 +1082,20 @@ export class MerroStore {
     this.appendEvent("Task", input.id, "finalized", input);
   }
 
+  finalizePassingReview(input: { id: string; summary: string; resultJson: string; reviewedCommit: string }): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.getTask(input.id);
+      if (!task || task.role !== "review") throw new Error("Passing review requires a review Task");
+      this.finalizeTask({ ...input, outcome: "pass" });
+      this.transitionChangeSet(task.changeSetId, "Reviewed");
+      this.#db.exec("COMMIT");
+    } catch (error) {
+      this.#db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getTask(id: string): Task | null {
     const row = this.#db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
     return row ? taskFromRow(row) : null;
@@ -1129,7 +1151,7 @@ export class MerroStore {
       objectives: count("objectives", "WHERE state = 'Active'"),
       changeSets: count("work_items", "WHERE state NOT IN ('Done','Obsolete','Cancelled')"),
       activeTasks: count("tasks", "WHERE status = 'active'"),
-      blockedChangeSets: count("work_items", "WHERE state = 'Blocked'"),
+      blockedChangeSets: count("work_items", "WHERE state IN ('Blocked', 'PublishBlocked')"),
     };
   }
 
@@ -1182,6 +1204,10 @@ export class MerroStore {
       this.#db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  hasEvent(entityType: string, entityId: string, eventType: string): boolean {
+    return Boolean(this.#db.prepare("SELECT 1 FROM event_log WHERE entity_type = ? AND entity_id = ? AND event_type = ? LIMIT 1").get(entityType, entityId, eventType));
   }
 
   latestBlock(entityId: string): { reason: string; detail: string; retryable: boolean | null } | null {

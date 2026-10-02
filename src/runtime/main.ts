@@ -13,6 +13,7 @@ import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
 import { loadMarkdownGuidance } from "./guidance.js";
+import { normalizedVerification, renderPullRequestContent } from "./pr-content.js";
 import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { requireWorkspace } from "./workspace.js";
@@ -90,11 +91,6 @@ function verificationText(entries: readonly Verification[]): string {
   return [...commands, ...manuals].join("\n") || "- No verification recorded.";
 }
 
-function issueBody(item: ChangeSet, summary: string, verification: string): string {
-  const closes = issueNumbers(item).length ? `\n\n## Issues\n\n${issueNumbers(item).map((number) => `Closes #${number}`).join("\n")}` : "";
-  return publicText(`## Summary\n\n${summary}\n\n## Verification\n\n${verification}${closes}`);
-}
-
 function ensureMarkdownSection(body: string, title: string, content: string): string {
   const heading = `## ${title}`;
   if (body.split(/\r?\n/).some((line) => line.trim() === heading)) return body.trim();
@@ -131,8 +127,7 @@ function finalVerification(store: MerroStore, item: ChangeSet, review: ReviewRes
       implementationVerification = [];
     }
   }
-  if (implementationVerification.length === 0) return verificationText(review.verification);
-  return `### Implementer\n${verificationText(implementationVerification)}\n\n### Reviewer\n${verificationText(review.verification)}`;
+  return normalizedVerification([...implementationVerification, ...review.verification]);
 }
 
 function finalMergeSummary(
@@ -296,6 +291,7 @@ export class MainOrchestrator {
   #storeQueue: Promise<unknown> = Promise.resolve();
   readonly #proposals = new Map<string, { input: string; graph: string }>();
   readonly #pendingNotifications: Array<{ event: string; subjectId: string; message: string }> = [];
+  readonly #reviewNotificationsInFlight = new Set<string>();
   readonly #names = new Map<string, string>();
 
   constructor(options: MainOptions) {
@@ -554,11 +550,11 @@ export class MainOrchestrator {
       }
       store.saveChangeSetGuidance(item.id, `${item.guidance ?? ""}\n\nChanged requirements:\n${requirements}`.trim());
       this.#resolvePullRequestDecisions(store, item.id);
-      if (item.state === "Blocked") {
+      if (item.state === "Blocked" || item.state === "PublishBlocked") {
         store.transitionChangeSet(item.id, item.blockedResumeState!);
         item = store.getChangeSet(item.id)!;
       }
-      if (item.state === "Reviewing" || item.state === "AwaitingMerge") store.transitionChangeSet(item.id, "Implementing");
+      if (["Reviewing", "Reviewed", "Publishing", "AwaitingMerge"].includes(item.state)) store.transitionChangeSet(item.id, "Implementing");
       const workRuntime = store.getChangeSetRuntime(item.id);
       if (workRuntime) { workRuntime.infrastructureRetries = 0; store.saveChangeSetRuntime(workRuntime); }
       this.#notify(`Stopped the previous attempt for ${item.slug}. Starting a fresh implementation with the changed requirements.`);
@@ -598,7 +594,7 @@ export class MainOrchestrator {
   async continueChangeSet(changeSetId: string): Promise<void> {
     await this.#withStore((store) => {
       const item = store.getChangeSet(changeSetId) ?? store.listChangeSets().find((item) => changeName(item) === semanticSlug(changeSetId));
-      if (!item || item.state !== "Blocked" || !item.blockedResumeState) throw new Error(`ChangeSet ${changeSetId} is not Blocked`);
+      if (!item || (item.state !== "Blocked" && item.state !== "PublishBlocked") || !item.blockedResumeState) throw new Error(`ChangeSet ${changeSetId} is not Blocked`);
       if (item.blockedReason === "policy_unknown" && store.latestBlock(item.id)?.retryable === false) {
         throw new Error(`${changeName(item)} is blocked by deterministic GitHub branch policy. Fix the rules or API response; /merro-continue cannot help and Main will retry during reconciliation.`);
       }
@@ -774,6 +770,13 @@ export class MainOrchestrator {
   }
 
   async runPass(): Promise<void> {
+    // Completion hooks may query Main, so release ownership before delivering them.
+    // A fresh pass rechecks worker and GitHub truth before deferred publication.
+    if (await this.#runPassOnce()) await this.#runPassOnce();
+  }
+
+  async #runPassOnce(): Promise<boolean> {
+    let publicationDeferred = false;
     await this.#withStore(async (store) => {
       const unsafeProjects = new Set<string>();
       const finalizedTaskCount = () => store.listTasks().filter((task) => task.status === "finalized").length;
@@ -801,6 +804,7 @@ export class MainOrchestrator {
         for (const item of store.listChangeSets()) {
           if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
         }
+        publicationDeferred = await this.#reconcilePublication(store, unavailableProjects, unsafeProjects);
         await this.#reconcilePullRequests(store, unavailableProjects, unsafeProjects);
         const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds, issueCache);
         for (const id of scopeGates) relationGates.add(id);
@@ -830,6 +834,7 @@ export class MainOrchestrator {
         await this.#reconcileFinalizedTasks(store, unsafeProjects);
       }
     });
+    return publicationDeferred;
   }
 
   async #withStore<T>(action: (store: MerroStore) => T | Promise<T>): Promise<T> {
@@ -854,6 +859,8 @@ export class MainOrchestrator {
           });
         } catch (error) {
           this.#notify(`notify_command failed: ${errorText(error)}`, "warning");
+        } finally {
+          if (notification.event === "review_complete") this.#reviewNotificationsInFlight.delete(notification.subjectId);
         }
       }
     }
@@ -1060,7 +1067,7 @@ export class MainOrchestrator {
           ? `GitHub API temporarily unavailable. Check your internet connection or https://githubstatus.com.\n${errorText(error)}`
           : errorText(error);
         for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === current.slug)) {
-          if (!terminal(item) && item.state !== "Blocked") {
+          if (!terminal(item) && item.state !== "Blocked" && item.state !== "PublishBlocked") {
             this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${cause}`);
           }
         }
@@ -1412,6 +1419,9 @@ export class MainOrchestrator {
         workRuntime.baseUpdate = null;
         store.saveChangeSetRuntime(workRuntime);
       }
+      const message = `${changeName(item)} implementation complete; local verification passed. Review is next.`;
+      this.#notify(message);
+      this.#queueNotification("implementation_complete", item.id, message);
       if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) store.transitionChangeSet(item.id, "Reviewing");
       return;
     }
@@ -1423,8 +1433,15 @@ export class MainOrchestrator {
       return;
     }
     const review = reviewResult;
-    store.finalizeTask({ id: task.id, outcome: review.status, summary: review.summary, resultJson: JSON.stringify(review), reviewedCommit: review.reviewed_commit });
-    if (this.#obsoleteIfUnowned(store, item, unsafeProjects)) return;
+    if (review.status === "pass") {
+      store.finalizePassingReview({ id: task.id, summary: review.summary, resultJson: JSON.stringify(review), reviewedCommit: review.reviewed_commit });
+    } else {
+      store.finalizeTask({ id: task.id, outcome: "reject", summary: review.summary, resultJson: JSON.stringify(review), reviewedCommit: review.reviewed_commit });
+      const message = `${changeName(item)} review complete; changes requested. Fresh implementation and review are next.`;
+      this.#notify(message);
+      this.#queueNotification("review_complete", item.id, message);
+    }
+    if (this.#obsoleteIfUnowned(store, store.getChangeSet(item.id) ?? item, unsafeProjects)) return;
     if (review.status === "reject") {
       workRuntime.reviewRound += 1;
       store.saveChangeSetRuntime(workRuntime);
@@ -1436,36 +1453,97 @@ export class MainOrchestrator {
       return;
     }
 
-    store.transitionChangeSet(item.id, "AwaitingMerge");
-    try {
+    workRuntime.reviewedDiffHash = null;
+    this.#notifyReviewComplete(store, item, task);
+  }
+
+  #notifyReviewComplete(store: MerroStore, item: ChangeSet, task: Task): void {
+    if (store.hasEvent("Task", task.id, "review_complete_notified")) return;
+    const message = `${changeName(item)} review complete; publication pending.`;
+    this.#notify(message);
+    this.#queueNotification("review_complete", item.id, message);
+    store.appendEvent("Task", task.id, "review_complete_notified", {});
+  }
+
+  async #reconcilePublication(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<boolean> {
+    let deferred = false;
+    for (let item of store.listChangeSets()) {
+      if (unavailableProjects.has(item.projectSlug) || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
+      const retrying = item.state === "PublishBlocked" && item.blockedReason === "github_unavailable";
+      if (item.state !== "Reviewed" && item.state !== "Publishing" && !retrying) continue;
+      const workRuntime = store.getChangeSetRuntime(item.id);
       const project = store.getProject(item.projectSlug);
-      if (!project || !workRuntime.clonePath || !workRuntime.branchName) throw new Error("Project branch runtime is incomplete");
-      await this.#git.pushBranch(project, workRuntime.clonePath, workRuntime.branchName);
-      const implementation = store.listTasks(item.id).reverse().find((candidate) => candidate.role === "implement" && candidate.resultJson);
-      const parsedImplementation = implementation?.resultJson ? parseImplementResult(JSON.parse(implementation.resultJson)) : null;
-      const title = parsedImplementation && "pr" in parsedImplementation ? parsedImplementation.pr?.title : undefined;
-      const body = publicText(issueBody(item, parsedImplementation?.summary ?? review.summary, finalVerification(store, item, review)), this.#names);
-      const pullRequest = await this.#github.createPullRequest(project, workRuntime.branchName,
-        publicText(title ?? parsedImplementation?.summary.split(/\r?\n/)[0] ?? changeName(item).replace(/-/g, " "), this.#names), body);
-      await this.#github.syncPullRequestContent(
-        project,
-        pullRequest,
-        reconcilePullRequestBody(pullRequest.body, item, finalVerification(store, item, review)),
-        publicText(reviewNotes(review), this.#names),
-      );
-      workRuntime.reviewedDiffHash = await this.#git.effectiveDiffFingerprint(
-        project, workRuntime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid,
-      );
-      workRuntime.pullRequestNumber = pullRequest.number;
-      workRuntime.pullRequestUrl = pullRequest.url;
-      workRuntime.pullRequestState = pullRequest.state;
-      workRuntime.pullRequestHeadSha = pullRequest.headRefOid;
-      workRuntime.pullRequestBaseSha = pullRequest.baseRefOid;
-      workRuntime.mergedCommitSha = null;
-      store.saveChangeSetRuntime(workRuntime);
-    } catch (error) {
-      this.#block(store, store.getChangeSet(item.id) ?? item, "github_unavailable", `Could not publish reviewed branch: ${errorText(error)}`);
+      const reviewTask = store.listTasks(item.id).reverse().find((task) => task.role === "review" && task.outcome === "pass");
+      if (reviewTask) this.#notifyReviewComplete(store, item, reviewTask);
+      if (this.#reviewNotificationsInFlight.has(item.id)) {
+        deferred = true;
+        continue;
+      }
+      if (item.state === "Reviewed" || retrying) {
+        store.transitionChangeSet(item.id, "Publishing");
+        item = store.getChangeSet(item.id)!;
+      }
+      try {
+        if (!project || !workRuntime?.clonePath || !workRuntime.branchName || !reviewTask?.resultJson) throw new Error("Project branch or passing review is missing. Restore reviewed state before retrying.");
+        const review = parseReviewResult(JSON.parse(reviewTask.resultJson));
+        if (review.status !== "pass") throw new Error("Publication requires a passing review.");
+        this.#notifyReviewComplete(store, item, reviewTask);
+        // Recover a lost PR-create response without another create or blind push.
+        const existing = workRuntime.pullRequestNumber
+          ? await this.#github.pullRequest(project, workRuntime.pullRequestNumber)
+          : await this.#github.findPullRequest?.(project, workRuntime.branchName) ?? null;
+        if (existing) {
+          this.#savePullRequest(store, workRuntime, existing);
+          if (existing.mergedAt) {
+            await this.#completeMergedChangeSet(store, item, workRuntime, project, existing, unsafeProjects);
+            continue;
+          }
+          if (existing.state !== "OPEN") throw new Error("Pull request is closed without merging. Reopen it before retrying publication.");
+        }
+        if (await this.#git.currentCommit(workRuntime.clonePath) !== review.reviewed_commit) throw new Error("Clone HEAD changed after review. Request fresh review through Main before publication.");
+        await this.#git.pushBranch(project, workRuntime.clonePath, workRuntime.branchName, review.reviewed_commit);
+        const implementationTask = store.listTasks(item.id).reverse().find((task) => task.role === "implement" && task.outcome === "success" && task.resultJson);
+        const result = implementationTask?.resultJson ? parseImplementResult(JSON.parse(implementationTask.resultJson)) : null;
+        const objective = store.listObjectives().find((objective) => store.listChangeSets(objective.id).some((change) => change.id === item.id));
+        const content = renderPullRequestContent({ change: item, intent: objective?.goal ?? item.slug.replace(/-/g, " "), branch: workRuntime.branchName,
+          implementation: result?.status === "success" ? result : null, review });
+        let pullRequest: GitHubPullRequest;
+        if (existing) {
+          pullRequest = await this.#github.pullRequest(project, existing.number);
+        } else {
+          try {
+            pullRequest = await this.#github.createPullRequest(project, workRuntime.branchName, publicText(content.title, this.#names), publicText(content.body, this.#names));
+          } catch (error) {
+            const recovered = await this.#github.findPullRequest?.(project, workRuntime.branchName);
+            if (!recovered) throw error;
+            pullRequest = recovered;
+          }
+        }
+        this.#savePullRequest(store, workRuntime, pullRequest);
+        if (pullRequest.headRefOid !== review.reviewed_commit) throw new Error("Published PR head differs from the reviewed commit. Reconcile the branch and request fresh review through Main.");
+        await this.#github.syncPullRequestContent(project, pullRequest,
+          publicText(reconcilePullRequestBody(pullRequest.body, item, content.verification), this.#names), publicText(reviewNotes(review), this.#names));
+        workRuntime.reviewedDiffHash = await this.#git.effectiveDiffFingerprint(project, workRuntime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid);
+        store.saveChangeSetRuntime(workRuntime);
+        store.transitionChangeSet(item.id, "AwaitingMerge");
+        this.#notify(`${changeName(item)} publication complete: ${pullRequest.url}. Awaiting checks and merge approval.`);
+      } catch (error) {
+        this.#blockPublication(store, item, error, retrying);
+      }
     }
+    return deferred;
+  }
+
+  #blockPublication(store: MerroStore, item: ChangeSet, error: unknown, automaticRetry: boolean): void {
+    const reason = isTransientGitHubFailure(error) ? "github_unavailable" : "publication_failed";
+    const detail = errorText(error);
+    const previous = store.latestBlock(item.id);
+    store.transitionChangeSet(item.id, "PublishBlocked", reason);
+    if (automaticRetry && previous?.reason === reason && previous.detail === detail) return;
+    store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable: true });
+    const message = `${changeName(item)} review complete, publication blocked: ${detail}\n${reason === "github_unavailable" ? "Main will retry publication automatically after GitHub recovers. " : ""}Fix the cause, then /merro-continue ${changeName(item)}. Completed implementation and review will not rerun.`;
+    this.#notify(message, "warning");
+    this.#queueNotification("publication_blocked", item.id, message);
   }
 
   async #reconcilePullRequests(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<void> {
@@ -1497,7 +1575,7 @@ export class MainOrchestrator {
           continue;
         }
         const hasPullRequestIdentity = runtime.pullRequestNumber !== null || runtime.branchName !== null;
-        const terminalOnly = item.state === "Blocked" && !recovering && hasPullRequestIdentity;
+        const terminalOnly = (item.state === "Blocked" || item.state === "PublishBlocked") && !recovering && hasPullRequestIdentity;
         if (item.state !== "AwaitingMerge" && !recovering && !terminalOnly) continue;
         let pullRequest: GitHubPullRequest | null = null;
         if (runtime.pullRequestNumber) {
@@ -1520,6 +1598,10 @@ export class MainOrchestrator {
           }
           await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
           this.#resolvePullRequestDecisions(store, item.id);
+          continue;
+        }
+        if (item.state === "PublishBlocked") {
+          // Only terminal external truth may bypass an unfinished publication.
           continue;
         }
         if (pullRequest.state === "CLOSED") {
@@ -1753,7 +1835,12 @@ export class MainOrchestrator {
   #savePullRequest(store: MerroStore, runtime: ChangeSetRuntimeRecord, pr: GitHubPullRequest): void {
     runtime.pullRequestNumber = pr.number;
     runtime.pullRequestUrl = pr.url;
-    runtime.pullRequestState = pr.state;
+    runtime.pullRequestState = pr.mergedAt ? "MERGED" : pr.state;
+    const successful = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
+    const failed = new Set(["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "CANCELLED", "ACTION_REQUIRED"]);
+    const states = pr.checks.map((check) => (check.conclusion ?? check.state).toUpperCase());
+    runtime.githubChecks = !states.length ? "none" : states.some((state) => failed.has(state)) ? "failed"
+      : states.every((state) => successful.has(state)) ? "green" : "pending";
     runtime.pullRequestHeadSha = pr.headRefOid;
     runtime.pullRequestBaseSha = pr.baseRefOid;
     if (pr.mergedAt && isCommitSha(pr.mergeCommitSha)) runtime.mergedCommitSha = pr.mergeCommitSha;
@@ -1850,7 +1937,7 @@ export class MainOrchestrator {
   #blockCycle(store: MerroStore, cycle: readonly string[], active: ReadonlySet<string>): void {
     for (const id of new Set(cycle)) {
       const item = store.getChangeSet(id);
-      if (!item || active.has(id) || item.state === "Blocked" || terminal(item)) continue;
+      if (!item || active.has(id) || item.state === "Blocked" || item.state === "PublishBlocked" || terminal(item)) continue;
       this.#block(store, item, "cycle", `Requires cycle: ${cycle.join(" -> ")}`);
     }
   }
@@ -1910,7 +1997,10 @@ export class MainOrchestrator {
   }
 
   #queueNotification(event: string, subjectId: string, message: string): void {
-    if (this.#config.notify_command?.trim()) this.#pendingNotifications.push({ event, subjectId, message });
+    if (this.#config.notify_command?.trim()) {
+      this.#pendingNotifications.push({ event, subjectId, message });
+      if (event === "review_complete") this.#reviewNotificationsInFlight.add(subjectId);
+    }
   }
 
   #queueBaseUpdate(store: MerroStore, item: ChangeSet, runtime: ChangeSetRuntimeRecord, pullRequest: GitHubPullRequest): void {

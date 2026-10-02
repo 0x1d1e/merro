@@ -21,6 +21,7 @@ const parameters = Type.Object({
   diagnostics: Type.Optional(Type.String()),
   verification: verificationSchema,
   findings: Type.Optional(Type.Array(Type.Any())),
+  changes: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 20 })),
   pr: Type.Optional(Type.Any()),
 }, { additionalProperties: false });
 

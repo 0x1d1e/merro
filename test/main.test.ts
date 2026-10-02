@@ -362,6 +362,8 @@ interface HarnessOptions {
   branchPolicyAvailable?: boolean;
   unsupportedPolicyReason?: string;
   failAfterPullRequestCreate?: boolean;
+  publicationFailure?: () => Error | null;
+  onPublish?: (notifications: string[]) => void;
   remoteBranchExists?: boolean;
   baseMergeConflict?: boolean;
   mergeError?: Error;
@@ -607,6 +609,9 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       return reported;
     },
     async pushBranch(_project: Project, path: string, branchName: string) {
+      options.onPublish?.(notifications);
+      const failure = options.publicationFailure?.();
+      if (failure) throw failure;
       const existing = [...pullRequests.values()].find((candidate) => candidate.headRefName === branchName);
       if (existing) {
         pullRequests.set(existing.number, {
@@ -1060,7 +1065,7 @@ test("incomplete v11 Objective scopes remain readable and reconcile after upgrad
   try {
     database.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?")
       .run(JSON.stringify([{ projectSlug: "api", query: { labels: ["feature"] } }]), objective.id);
-    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; ALTER TABLE task_runtime DROP COLUMN window_id; UPDATE schema_meta SET version = 11;");
+    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE work_item_runtime DROP COLUMN github_checks; UPDATE schema_meta SET version = 11;");
   } finally { database.close(); }
   const restarted = harness.restartMain();
   assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, [
@@ -2047,10 +2052,10 @@ test("notify_command runs for merge-ready, Objective Done, and Blocked, with fai
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
-  assert.deepEqual(events, ["merge_ready"]);
+  assert.deepEqual(events, ["implementation_complete", "review_complete", "merge_ready"]);
   const decision = (await harness.main.statusSnapshot()).decisions[0]!;
   await harness.main.resolveMergeDecision(decision.id, true);
-  assert.deepEqual(events, ["merge_ready", "objective_done"]);
+  assert.deepEqual(events, ["implementation_complete", "review_complete", "merge_ready", "objective_done"]);
   assert.ok(harness.notifications.some((message) => message.includes("notification unavailable")));
   const blocked = await createHarness(t, { notifyCommand: "notify-test", launchFailure: true, commands: {
     async run(_file, _args, options) { events.push(options?.env?.MERRO_EVENT ?? "missing"); return { stdout: "", stderr: "" }; },
@@ -2911,7 +2916,7 @@ test("title edits stop regenerating the PR verification section", async (t) => {
     requireExternalApproval: true,
     result(input, launchNumber, result) {
       if (input.role === "implement" && launchNumber === 3) {
-        return { ...result, verification: [{ kind: "manual", project: input.project.slug, summary: "New implementation verification." }] };
+        return { ...result, verification: [{ kind: "command", project: input.project.slug, cwd: input.clonePath, command: "scripts/reverify.sh", exit_code: 0 }] };
       }
       return result;
     },
@@ -2932,8 +2937,9 @@ test("title edits stop regenerating the PR verification section", async (t) => {
   const updated = harness.pullRequests.get(number);
   assert.ok(updated);
   assert.equal(updated.title, "User-maintained title");
-  assert.match(updated.body, /Checked the change/);
-  assert.doesNotMatch(updated.body, /New implementation verification/);
+  assert.match(updated.body, /scripts\/run-ci\.sh/);
+  assert.doesNotMatch(updated.body, /scripts\/reverify\.sh/);
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
 });
 
 test("one issue lookup failure blocks only its ChangeSet and does not abort other Projects", async (t) => {
@@ -3923,6 +3929,161 @@ test("merge approval cannot merge a PR head that changed after the Decision", as
   assert.equal(state.tasks.filter((task) => task.role === "review").length, 2);
   assert.equal(harness.launches.at(-1)?.role, "review");
   assert.equal(harness.pullRequests.get(pullRequestNumber)?.mergedAt, null);
+});
+
+test("completion hooks can query Main and finish before publication begins", async (t) => {
+  const events: string[] = [];
+  let harness: MainHarness;
+  harness = await createHarness(t, {
+    notifyCommand: "notify-test",
+    commands: {
+      async run(_file, _args, options) {
+        const event = options?.env?.MERRO_EVENT ?? "missing";
+        const status = await harness.main.statusSnapshot();
+        if (event === "review_complete") {
+          assert.equal(status.changeSets[0]?.state, "Reviewed");
+          assert.equal(harness.pullRequests.size, 0);
+          // A concurrent pass must not publish while this hook is still running.
+          await harness.main.runPass();
+          assert.equal(harness.pullRequests.size, 0);
+        }
+        events.push(event);
+        return { stdout: "", stderr: "" };
+      },
+    },
+    onPublish() { assert.ok(events.includes("review_complete")); },
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
+  assert.deepEqual(events, ["implementation_complete", "review_complete", "merge_ready"]);
+});
+
+test("publication failure preserves completed work and continues publishing after restart", async (t) => {
+  let failure: Error | null = new Error("Remote branch diverged; reconcile the branch without force-pushing");
+  const harness = await createHarness(t, {
+    publicationFailure: () => failure,
+    onPublish(notifications) {
+      assert.ok(notifications.some((message) => /review complete/i.test(message)), "completion must precede publication");
+    },
+  });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const blocked = await harness.main.statusSnapshot();
+  assert.equal(blocked.changeSets[0]?.state, "PublishBlocked");
+  assert.equal(blocked.changeSets[0]?.blockedResumeState, "Publishing");
+  assert.equal(blocked.tasks.length, 2);
+  assert.equal(blocked.decisions.length, 0);
+  assert.match(harness.notifications.join("\n"), /review complete, publication blocked/i);
+  assert.match(harness.notifications.join("\n"), /\/merro-continue/);
+  failure = null;
+  const restarted = harness.restartMain();
+  await restarted.continueChangeSet(id);
+  assert.equal((await restarted.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
+  assert.equal(harness.launches.length, 2);
+  assert.equal(harness.pullRequests.size, 1);
+  assert.equal(harness.notifications.filter((message) => /review complete; publication pending/i.test(message)).length, 1);
+});
+
+test("known transient publication outage retries only publication and reports completion once", async (t) => {
+  let unavailable = true;
+  const harness = await createHarness(t, { publicationFailure: () => unavailable ? new Error("error connecting to api.github.com") : null });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "PublishBlocked");
+  assert.equal(harness.notifications.filter((message) => /review complete, publication blocked/i.test(message)).length, 1);
+  unavailable = false;
+  await harness.restartMain().runPass();
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
+  assert.equal(harness.launches.length, 2);
+  assert.equal(harness.notifications.filter((message) => /review complete; publication pending/i.test(message)).length, 1);
+});
+
+test("status distinguishes passed review and green local CI from blocked publication and absent PR", async (t) => {
+  const harness = await createHarness(t, { publicationFailure: () => new Error("Remote branch has diverged") });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
+  registerCommands({ registerCommand(name, command) { commands.set(name, command); } }, harness.workspacePath, harness.main);
+  let text = "";
+  await commands.get("status")!.handler("", { ui: { notify(message) { text = message; } } });
+  assert.match(text, /Review: pass/);
+  assert.match(text, /CI \(local reported\): green/);
+  assert.match(text, /Publication: blocked/);
+  assert.match(text, /PR: not created/);
+  assert.match(text, /Merge: blocked/);
+  assert.doesNotMatch(text, /approval required|AwaitingMerge/);
+});
+
+test("PR content failure retains PR identity, blocks publication, and continuation never reruns review", async (t) => {
+  let fail = true;
+  const harness = await createHarness(t, { pullRequestContentFailure: () => fail });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "PublishBlocked");
+  assert.equal((await harness.main.statusSnapshot()).decisions.length, 0);
+  const publicStatus = await harness.main.publicSnapshot();
+  assert.equal(publicStatus.changes[0]?.prState, "OPEN");
+  assert.equal(publicStatus.changes[0]?.publication, "blocked");
+  fail = false;
+  await harness.restartMain().continueChangeSet(id);
+  assert.equal(harness.pullRequests.size, 1);
+  assert.equal(harness.launches.length, 2);
+  assert.equal((await harness.main.statusSnapshot()).decisions.length, 1);
+});
+
+test("persisted Publishing reconciles after restart without another implementation or review", async (t) => {
+  let fail = true;
+  const harness = await createHarness(t, { publicationFailure: () => fail ? new Error("Temporary publication interruption") : null });
+  const id = await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { store.transitionChangeSet(id, "Publishing"); } finally { store.close(); }
+  fail = false;
+  await harness.restartMain().runPass();
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
+  assert.equal(harness.launches.length, 2);
+});
+
+test("PR metadata comes from intent, reviewed changes and commands, never result narratives", async (t) => {
+  const contamination = "Commit 42bf123 is directly on 75f0123. Worktree /tmp/.wt/internal. No PR created per task instructions. Merro AwaitingMerge.";
+  const harness = await createHarness(t, {
+    together: true, projects: [{ slug: "kinetix", issueNumbers: [96, 97, 100] }],
+    result(input, _number, result) {
+      return input.role === "implement" ? { ...result, summary: contamination,
+        changes: ["Atomically disable bound plugins when their permission is revoked.", "Remove the affected grant while preserving existing bindings.", "Add regression coverage for bound-plugin revocation."],
+        pr: { title: contamination, body: contamination },
+        verification: [{ kind: "command", project: "kinetix", cwd: input.clonePath, command: "cargo test permission_revoke_disables_bound_plugin_without_changing_bindings -- --nocapture", exit_code: 0 }],
+      } : { ...result, summary: contamination };
+    },
+  });
+  const input = { goal: "Make bound-plugin permission revocation atomic", changeSlug: "plugin-lifecycle-safety", projectSlugs: ["kinetix"], issues: [{ projectSlug: "kinetix", numbers: [96, 97, 100] }] };
+  for (const issue of harness.issues.values()) issue.labels = ["bug"];
+  const proposal = await harness.main.proposeObjective(input);
+  await harness.main.startObjective(input, proposal.id);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const pr = [...harness.pullRequests.values()][0]!;
+  assert.equal(pr.title, "fix: make bound-plugin permission revocation atomic");
+  assert.match(pr.body, /^## Summary\n\n- Atomically disable/);
+  assert.match(pr.body, /## Verification\n\n- `cargo test/);
+  for (const number of [96, 97, 100]) assert.match(pr.body, new RegExp(`Closes #${number}\\b`));
+  assert.doesNotMatch(`${pr.title}\n${pr.body}`, /Commit 42bf|75f0123|\.wt|\/tmp|No PR created|Merro|AwaitingMerge/);
+  assert.equal((await harness.main.statusSnapshot()).tasks[0]?.summary, contamination);
 });
 
 test("reconciliation adopts a PR created before Main lost the GitHub response", async (t) => {

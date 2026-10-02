@@ -1,9 +1,10 @@
 export type Priority = "high" | "normal" | "low";
 export type ObjectiveState = "Active" | "Done" | "Stopped";
-export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "AwaitingMerge";
+export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "Reviewed" | "Publishing" | "AwaitingMerge";
 export type ChangeSetState =
   | FlowChangeSetState
   | "Blocked"
+  | "PublishBlocked"
   | "Done"
   | "Obsolete"
   | "Cancelled";
@@ -19,7 +20,8 @@ export type BlockReason =
   | "merge_failed"
   | "pr_closed"
   | "remote_branch_deleted"
-  | "project_unavailable";
+  | "project_unavailable"
+  | "publication_failed";
 export type TaskRole = "implement" | "review";
 export type TaskOutcome = "success" | "failed" | "cancelled" | "pass" | "reject";
 export type RelationKind = "Requires" | "Conflicts";
@@ -126,6 +128,8 @@ export const FLOW_CHANGE_SET_STATES = new Set<FlowChangeSetState>([
   "Ready",
   "Implementing",
   "Reviewing",
+  "Reviewed",
+  "Publishing",
   "AwaitingMerge",
 ]);
 

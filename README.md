@@ -146,7 +146,7 @@ Instructions belong in Markdown. Runtime settings remain in `.merro/config.json`
 - `sandbox`: `"none"` by default. Host Workers inherit normal HOME, Pi config, auth, models, packages and extensions. **Host mode is not a security sandbox.** Reviewer non-editing is contractual, not enforced by host filesystem permissions.
 - `sandbox: "docker"`: needs Docker and a suitable image/toolchain. Review mounts are read-only. Container providers must be reachable from Docker; `localhost` means the container. `network: "off"` requires Docker.
 - `worker_github`: `"on"` by default, passing a token from `gh auth token`; `"off"` withholds it. Worker push/PR/merge restrictions are contractual; repository permissions and branch protection remain the security boundary.
-- `notify_command`: optional notifications for `blocked`, `merge_ready` and `objective_done`, with `MERRO_EVENT`, `MERRO_CHANGE` and `MERRO_MESSAGE`. Failures warn without aborting work.
+- `notify_command`: optional notifications for `implementation_complete`, `review_complete`, `publication_blocked`, `blocked`, `merge_ready` and `objective_done`, with `MERRO_EVENT`, `MERRO_CHANGE` and `MERRO_MESSAGE`. Review completion is delivered before publication. Failures warn without aborting work.
 
 ## Develop
 

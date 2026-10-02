@@ -16,6 +16,8 @@ export interface ImplementSuccessResult {
   summary: string;
   commit: string;
   verification: Verification[];
+  changes?: string[];
+  /** Legacy worker suggestions are retained in history, never used for PR publication. */
   pr?: { title: string; body: string };
 }
 
@@ -151,6 +153,16 @@ export function parseImplementResult(value: unknown): ImplementSuccessResult | I
       commit: text(row.commit, "commit"),
       verification,
     };
+    if (row.changes !== undefined) {
+      if (!Array.isArray(row.changes) || row.changes.length < 1 || row.changes.length > 20) {
+        throw new ResultValidationError("changes must contain 1-20 product-facing bullets");
+      }
+      result.changes = row.changes.map((value, index) => {
+        const change = text(value, `changes[${index}]`).trim();
+        if (change.length > 300 || /[\r\n]/.test(change)) throw new ResultValidationError(`changes[${index}] must be a single line of at most 300 characters`);
+        return change;
+      });
+    }
     if (row.pr !== undefined) {
       const pr = object(row.pr, "pr");
       result.pr = { title: text(pr.title, "pr.title"), body: text(pr.body, "pr.body") };

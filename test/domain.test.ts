@@ -56,6 +56,19 @@ test("unfinished ChangeSets can become Obsolete when no Objective owns them", ()
   assert.doesNotThrow(() => assertChangeSetTransition("AwaitingMerge", "Implementing"));
 });
 
+test("passing review and publication have distinct resumable states", () => {
+  assert.doesNotThrow(() => assertChangeSetTransition("Reviewing", "Reviewed"));
+  assert.throws(() => assertChangeSetTransition("Reviewing", "AwaitingMerge"), /invalid/);
+  assert.doesNotThrow(() => assertChangeSetTransition("Reviewed", "Publishing"));
+  assert.throws(() => assertChangeSetTransition("Reviewed", "AwaitingMerge"), /invalid/);
+  assert.doesNotThrow(() => assertChangeSetTransition("Publishing", "AwaitingMerge"));
+  assert.doesNotThrow(() => assertChangeSetTransition("Publishing", "PublishBlocked"));
+  assert.doesNotThrow(() => assertChangeSetTransition("PublishBlocked", "Publishing", "Publishing"));
+  for (const state of ["Implementing", "Reviewing", "AwaitingMerge"] as const) {
+    assert.throws(() => assertChangeSetTransition("PublishBlocked", state, "Publishing"), /invalid/);
+  }
+});
+
 test("Blocked ChangeSets resume only to their persisted previous flow state", () => {
   assert.doesNotThrow(() => assertChangeSetTransition("Blocked", "Ready", "Ready"));
   assert.throws(() => assertChangeSetTransition("Blocked", "Reviewing", "Ready"), /invalid ChangeSet transition/);

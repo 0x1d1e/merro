@@ -163,6 +163,15 @@ test("gh connection errors retry before succeeding or exhausting the bounded att
   assert.equal(exhaustedCommands.calls.length, 3);
 });
 
+for (const stderr of ["net/http: TLS handshake timeout", "dial tcp 20.205.243.168:443: i/o timeout", "read tcp: connection reset by peer", "unexpected EOF"]) {
+  test(`known gh transport failure retries: ${stderr}`, async () => {
+    const failure = new CommandError("gh", ["repo", "view"], Object.assign(new Error("Command failed"), { code: 1 }), stderr);
+    const commands = new FakeCommands([failure, { stdout: repository("acme/widget"), stderr: "" }]);
+    assert.equal((await new GitHubClient(commands).repository(project.baseRemote)).nameWithOwner, "acme/widget");
+    assert.equal(commands.calls.length, 2);
+  });
+}
+
 test("branch protection is unknown on GitHub API failure", async () => {
   const commands = new FakeCommands([
     { stdout: repository("acme/widget"), stderr: "" },

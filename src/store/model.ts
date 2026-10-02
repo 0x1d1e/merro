@@ -26,6 +26,7 @@ export interface ChangeSetRuntimeRecord {
   pullRequestNumber: number | null;
   pullRequestUrl: string | null;
   pullRequestState: string | null;
+  githubChecks?: "pending" | "green" | "failed" | "none" | null;
   pullRequestHeadSha: string | null;
   pullRequestBaseSha: string | null;
   mergedCommitSha: string | null;

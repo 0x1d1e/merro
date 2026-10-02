@@ -17,9 +17,10 @@ An Objective completes only after fresh scope verification and terminal attached
 ## ChangeSet flow
 
 ```text
-Planned -> Ready -> Implementing -> Reviewing -> AwaitingMerge -> Done
-                         ^             | reject
-                         +-------------+  fresh implementer, then fresh reviewer
+Planned -> Ready -> Implementing -> Reviewing -> Reviewed -> Publishing -> AwaitingMerge -> Done
+                         ^             | reject                  | failure
+                         +-------------+                         v
+                                                        PublishBlocked -> Publishing
 any non-terminal state -> Blocked -> prior flow after resolution
 idle unfinished work -> Obsolete | Cancelled
 ```
@@ -46,7 +47,7 @@ Main reconciles before scheduling, on startup and periodically while open. `/mer
 
 A real failure blocks once with a semantic change name, reason and retry guidance. A missing/dead Worker with no valid result gets one infrastructure retry; the next disappearance blocks. Invalid/stale results, commit mismatch and missing verification are not infrastructure retries.
 
-`/merro-continue <change>` resumes after its cause is fixed, with a fresh Task. Externally fixable causes such as GitHub unavailability auto-resume only after fresh reconciliation. User-owned causes such as rejected merge, closed PR, explicit cycle and review cap need continuation. Idle/wall limits warn without automatically killing work.
+`/merro-continue <change>` resumes the blocked phase after its cause is fixed. Task failures receive a fresh Task; PublishBlocked resumes publication/reconciliation without repeating completed implementation or review. Known transient `gh` connection failures receive bounded backoff before blocking. Externally fixable causes such as GitHub unavailability auto-resume only after fresh reconciliation. User-owned causes such as rejected merge, closed PR, explicit cycle and review cap need continuation. Idle/wall limits warn without automatically killing work.
 
 A live unreadable or mismatched identity remains occupied and pauses scheduling. Orphans are reported, never adopted or automatically killed. Unknown ownership gates the workspace; known orphan ownership gates its Project. Inventory failures gate the affected Project. Healthy independent Projects continue.
 
@@ -58,7 +59,9 @@ Each change uses `.wt/<slug>` and an intent-prefixed branch (`feat/`, `fix/`, `c
 
 Create from the canonical base remote's current default branch. Base movement schedules an implementer to merge the exact fetched commit, verify and commit, followed by fresh review. No rebase, force-push or Main-authored merge commit. Merge conflicts require a Decision authorizing implementation, not direct merge by Main.
 
-Review pass opens/reuses one non-draft PR. Main supplies a semantic title and Summary, Verification and Issues sections, including every `Closes #n`. User edits stop wholesale body regeneration; required verification/closures are repaired. One canonical `<!-- merro:review-notes -->` comment holds passing review, verification and non-blocking findings. Private IDs are removed from titles, bodies, comments, notifications and merge prompts.
+Passing review persists Reviewed and reports completion before publication, including completion hooks. Publishing fetches the push remote branch first and publishes the exact reviewed commit with an ordinary push. Absent/equal/remote-behind branches are safe; remote-ahead/diverged branches block with reconciliation and fresh-review guidance. A concurrent remote update cannot be overwritten. PublishBlocked retains review and any PR identity; restart/continuation reuses the single PR. AwaitingMerge begins only after publication and metadata synchronization succeed.
+
+Main generates a concise conventional title from task intent and branch kind. Summary uses reviewed product-facing changes, Verification uses deduplicated passing commands, and Issues includes every `Closes #n`. Activity summaries and legacy worker PR suggestions remain history, never PR content. Generated title/body omit internal ancestry, working paths and lifecycle commentary. User edits stop wholesale body regeneration; required verification/closures are repaired. One canonical `<!-- merro:review-notes -->` comment holds passing review, verification and non-blocking findings. Private IDs are removed from titles, bodies, comments, notifications and merge prompts.
 
 External requested changes or required-check failure schedule fresh implementation and review. Optional failures warn. Unknown GitHub policy blocks rather than assuming no requirements. Effective diff changes invalidate review; unchanged rewrites may preserve it.
 

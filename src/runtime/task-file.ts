@@ -48,11 +48,12 @@ export function renderTaskFile(input: TaskFileInput): string {
         `Create exactly one final merge commit with first parent ${input.expectedCommit} and second parent ${input.baseUpdate.baseCommit}, using the configured Git identity. If the base is already an ancestor, create one ordinary commit directly on ${input.expectedCommit} instead; use --allow-empty when no changes remain after verification. Do not amend or rewrite prior commits.`,
       ] : [`Create exactly one new commit directly on ${input.expectedCommit}, with the configured Git identity. Do not amend or rewrite prior commits.`]),
       "Do not push branches, create pull requests, or merge pull requests. Main owns those operations.",
-      "Run repository CI and report at least one verification command with its actual exit code. Call merro_submit_result exactly once with status success or failed. On success include the final commit SHA and passing verification. On failure include a reason and diagnostics. Stop after submission.",
+      "Run repository CI and report at least one verification command with its actual exit code. Call merro_submit_result exactly once with status success or failed. On success include the final commit SHA, passing verification and changes: concise product-facing bullets describing the actual changes and regression coverage. Keep activity/status in summary; omit commit ancestry, working paths, Merro state and publication commentary from changes. Main generates PR title/body from task intent, these reviewed changes and verification commands; do not supply PR prose. On failure include a reason and diagnostics. Stop after submission.",
     ]
     : [
       `Review the exact commit ${input.expectedCommit} for correctness, regressions, security, and missing tests.`,
       "Do not modify files, create commits, push, or change orchestration state. Treat the checkout as read-only.",
+      "Check the implementation's product-facing changes against the reviewed diff. Reject materially inaccurate bullets; exclude ancestry, working paths and publication commentary from PR-facing changes.",
       "Run verification where feasible and report every final successful command, working directory, Project, and exit code.",
       "Call merro_submit_result exactly once. Use pass only when no blocking findings remain; use reject for actionable blocking findings; use failed only when review could not be completed. Stop after submission.",
     ];

@@ -53,7 +53,7 @@ The Worker calls `merro_submit_result`. Model parameters do not include `task_id
 
 Persisted protocol artifacts include private `task_id` for matching, not public presentation:
 
-- Implementation: success/failed, summary, commit, verification; optional PR title/body; failure reason/diagnostics.
+- Implementation: success/failed, activity summary, commit, verification; optional `changes` with 1-20 single-line product-facing bullets, at most 300 characters each; failure reason/diagnostics. Legacy PR title/body remain accepted for historical compatibility but are never used to publish PR content.
 - Review: pass/reject/failed, summary, reviewed commit, findings, verification; failure reason.
 - Finding: blocking/non-blocking/note, summary, optional repo-relative file and line range. Blocking findings require rejection.
 - Verification: exact command, Project, working directory and exit code, or manual summary. No environment secrets or full logs.
@@ -66,7 +66,7 @@ Implementers edit, verify, fix and reverify before making one final commit direc
 
 For approved base updates, merge the exact fetched base with `--no-ff --no-commit`, resolve and verify, then produce one final merge commit with expected HEAD and approved base as parents. If base is already an ancestor, one ordinary commit is allowed. Main checks parents/ancestry and requires fresh review.
 
-Reviewers inspect the exact expected commit without edits or implementer conversation history. Pass when no blocking findings remain; reject with actionable findings; failed only when review cannot complete. The next implementer receives the latest complete review.
+Reviewers inspect the exact expected commit and the implementation's structured changes without edits or implementer conversation history. Check that product-facing bullets describe the reviewed diff, with no ancestry, working paths or publication commentary. Pass when no blocking findings remain; reject with actionable findings; failed only when review cannot complete. The next implementer receives the latest complete review.
 
 Verification follows repository guidance: nearest/root AGENTS, contributor/test docs, CI, package scripts, README. Report final relevant checks against final code. An unavailable instruction needs a recorded equivalent/fallback reason, not invented success.
 

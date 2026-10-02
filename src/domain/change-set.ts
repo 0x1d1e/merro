@@ -5,7 +5,9 @@ const allowedTransitions: Readonly<Record<FlowChangeSetState, ReadonlySet<Change
   Planned: new Set(["Ready", "Blocked", "Obsolete", "Cancelled"]),
   Ready: new Set(["Planned", "Implementing", "Blocked", "Obsolete", "Cancelled"]),
   Implementing: new Set(["Reviewing", "Blocked", "Obsolete"]),
-  Reviewing: new Set(["Implementing", "AwaitingMerge", "Blocked", "Obsolete"]),
+  Reviewing: new Set(["Implementing", "Reviewed", "Blocked", "Obsolete"]),
+  Reviewed: new Set(["Publishing", "Implementing", "Reviewing", "Blocked", "Obsolete"]),
+  Publishing: new Set(["AwaitingMerge", "Implementing", "Reviewing", "PublishBlocked", "Blocked", "Obsolete"]),
   AwaitingMerge: new Set(["Implementing", "Reviewing", "Done", "Blocked", "Obsolete"]),
 };
 
@@ -30,7 +32,7 @@ export function assertChangeSetTransition(
     throw new InvalidChangeSetTransitionError(from, to);
   }
 
-  if (from === "Blocked") {
+  if (from === "Blocked" || from === "PublishBlocked") {
     if (to === "Obsolete" || to === "Cancelled") return;
     if (blockedResumeState !== null && to === blockedResumeState) return;
     throw new InvalidChangeSetTransitionError(from, to);

@@ -85,6 +85,69 @@ test("Git client creates per-ChangeSet clone, validates one commit, and pushes w
   await assert.rejects(gitClient.deleteClone(workRoot, project.path), /outside work root/);
 });
 
+for (const relation of ["absent", "equal", "remote-behind", "local-behind", "diverged", "race"] as const) {
+  test(`publication fetches first and handles ${relation} without overwriting remote work`, async (t) => {
+    const root = await tempDirectory();
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const source = await createProject(root);
+    const project = { slug: "p", path: source.path, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" };
+    const client = new GitClient();
+    const clone = await client.createChangeSetClone(project, join(root, "work"), "fix/publish");
+    await writeFile(join(clone.path, "local.txt"), "reviewed\n");
+    await git(clone.path, "add", ".");
+    await git(clone.path, "commit", "-m", "fix: reviewed change");
+    if (relation !== "absent") await client.pushBranch(project, clone.path, clone.branchName);
+    const external = join(root, "external");
+    if (["local-behind", "diverged", "race"].includes(relation)) {
+      await systemCommandRunner.run("git", ["clone", "--branch", clone.branchName, "--", source.bare, external]);
+      await git(external, "config", "user.name", "Other");
+      await git(external, "config", "user.email", "other@example.test");
+      await writeFile(join(external, "external.txt"), "other work\n");
+      await git(external, "add", ".");
+      await git(external, "commit", "-m", "external work");
+      if (relation !== "race") await git(external, "push", "origin", clone.branchName);
+    }
+    if (relation === "remote-behind" || relation === "diverged") {
+      await writeFile(join(clone.path, "second.txt"), "more reviewed work\n");
+      await git(clone.path, "add", ".");
+      await git(clone.path, "commit", "-m", "fix: second change");
+    }
+    const reviewed = await client.currentCommit(clone.path);
+    const remoteBefore = await client.remoteBranchCommit(project, clone.branchName);
+    const calls: Array<readonly string[]> = [];
+    const publisher = new GitClient({ async run(file, args, options) {
+      calls.push(args);
+      if (relation === "race" && args[0] === "push") await git(external, "push", "origin", clone.branchName);
+      return systemCommandRunner.run(file, args, options);
+    } });
+    if (["local-behind", "diverged", "race"].includes(relation)) {
+      await assert.rejects(publisher.pushBranch(project, clone.path, clone.branchName, reviewed), relation === "race" ? /rejected|non-fast-forward/ : /ahead|diverged/);
+      assert.equal(await client.remoteBranchCommit(project, clone.branchName), relation === "race" ? await git(external, "rev-parse", "HEAD") : remoteBefore);
+      if (relation !== "race") assert.equal(calls.some((args) => args[0] === "push"), false);
+    } else {
+      await publisher.pushBranch(project, clone.path, clone.branchName, reviewed);
+      assert.equal(await client.remoteBranchCommit(project, clone.branchName), reviewed);
+      assert.ok(calls.findIndex((args) => args[0] === "fetch") < calls.findIndex((args) => args[0] === "push"));
+    }
+    assert.equal(await client.currentCommit(clone.path), reviewed);
+    assert.ok(calls.every((args) => !args.some((arg) => /--force|^\+/.test(arg))));
+  });
+}
+
+test("publication refuses dirty or changed reviewed checkout without network writes", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = await createProject(root);
+  const project = { slug: "p", path: source.path, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" };
+  const client = new GitClient();
+  const clone = await client.createChangeSetClone(project, join(root, "work"), "fix/publish");
+  await writeFile(join(clone.path, "untracked.txt"), "unfinished");
+  await assert.rejects(client.pushBranch(project, clone.path, clone.branchName), /uncommitted|untracked/);
+  await rm(join(clone.path, "untracked.txt"));
+  await assert.rejects(client.pushBranch(project, clone.path, clone.branchName, "a".repeat(40)), /reviewed commit/);
+  assert.equal(await client.remoteBranchCommit(project, clone.branchName), null);
+});
+
 test("ChangeSet creation clones the registered local repository and fetches only the authoritative base", async (t) => {
   const root = await tempDirectory();
   t.after(() => rm(root, { recursive: true, force: true }));
