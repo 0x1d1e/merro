@@ -1248,7 +1248,14 @@ export class MainOrchestrator {
         }
         const reason = presence.reason ?? "Implementation worker exited without submitting a result";
         if (presence.alive || liveTaskIds.has(task.id)) unsafeProjects.add(item.projectSlug);
-        store.finalizeTask({ id: task.id, outcome: "failed", summary: reason, resultJson: JSON.stringify({ taskId: task.id, reason }) });
+        const failure = {
+          taskId: task.id,
+          reason,
+          ...(presence.exitStatus !== undefined ? { exitStatus: presence.exitStatus } : {}),
+          ...(presence.exitSignal !== undefined ? { exitSignal: presence.exitSignal } : {}),
+          ...(presence.diagnosticPath !== undefined ? { diagnosticPath: presence.diagnosticPath } : {}),
+        };
+        store.finalizeTask({ id: task.id, outcome: "failed", summary: reason, resultJson: JSON.stringify(failure) });
         if (this.#obsoleteIfUnowned(store, item, unsafeProjects)) continue;
         if (presence.alive && !presence.identityMatches) {
           this.#block(store, item, "task_failed", `Worker identity check failed: ${reason}`);

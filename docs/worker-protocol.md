@@ -33,7 +33,7 @@ Pi labels the initial CLI task input interactive. Accept that first input, then 
 
 ## tmux and identity
 
-Sessions are `merro-<project>`, windows `impl-<change>` or `rev-<change>`. One pane per window. Disable automatic rename and allow-rename; persist stable window ID and exact pane ID. Sessions are detached, never auto-attached. The last exiting window may remove its session.
+Sessions are `merro-<project>`, windows `impl-<change>` or `rev-<change>`. One pane per window. Disable automatic rename and allow-rename; persist stable window ID and exact pane ID. Sessions are detached, never auto-attached. Host workers enable `remain-on-exit`: an unexpected Pi exit leaves the exact dead pane, tmux exit status/signal and scrollback available to reconciliation. Main writes a bounded plain-text pane capture to `.merro/runtime/diagnostics/<task-attempt>.log` before finalizing the infrastructure failure; the log survives Task scratch cleanup. A missing pane remains distinct evidence of external tmux/session removal.
 
 Ownership is private metadata: workspace owner marker, Project, Task and ChangeSet keys, runtime kind and clone path. Keep the workspace owner marker across restarts/moves. Tmux options and Docker labels are machine metadata, not public names. Persisted legacy ownership may migrate only after exact recorded runtime/process proof; never rediscover/adopt by window name alone.
 
@@ -70,4 +70,4 @@ Verification follows repository guidance: nearest/root AGENTS, contributor/test 
 
 ## Cleanup
 
-Submission/finalization is not process-exit proof. Main refreshes inventory before successor launch, clone mutation or cleanup. Unsafe Projects retain artifacts. Cleanup retries survive Main restart; completion is mutable runtime metadata, not a Task-history rewrite. Preserve stale mismatched results and successor-owned input. Never remove an orphan's clone automatically.
+Submission/finalization is not process-exit proof. Main refreshes inventory before successor launch, clone mutation or cleanup. Unsafe Projects retain artifacts. Cleanup retries survive Main restart; completion is mutable runtime metadata, not a Task-history rewrite. Retained host panes are removed only after exact Task/window identity is rechecked and the pane is confirmed dead. Failure diagnostics are bounded, private runtime artifacts; launch secrets and staged Pi configuration are still removed. Preserve stale mismatched results and successor-owned input. Never remove an orphan's clone automatically.

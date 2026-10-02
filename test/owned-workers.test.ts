@@ -1,9 +1,9 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { Project } from "../src/domain/model.js";
 import { CommandError, type CommandRunner } from "../src/runtime/commands.js";
@@ -27,7 +27,7 @@ test("owned worker inventory includes live panes, labeled containers, and legacy
         if (args[0] === "list-panes") return { stdout: "%1 0\n%2 1\n%3 0\n", stderr: "" };
         if (args[0] === "display-message") return { stdout: "impl-pane-task\n", stderr: "" };
         if (args[0] === "show-option") {
-          const key = args.at(-1)!;
+          const key = args.at(-1) ?? "";
           const values: Record<string, string> = {
             "@merro_owner": owner, "@merro_project": project.slug,
             "@merro_task_id": "pane-task", "@merro_work_item_id": "work-1",
@@ -39,7 +39,8 @@ test("owned worker inventory includes live panes, labeled containers, and legacy
       if (file === "docker") {
         if (args[0] === "ps") return { stdout: ["a", "b", "c", "d", "e", "f"].map(container).join("\n"), stderr: "" };
         if (args[0] === "inspect") {
-          const id = args[1]!;
+          const id = args[1];
+          assert.ok(id);
           const labels: Record<string, string> = { "merro.task_id": `${id[0]}-task` };
           if (id === container("a")) Object.assign(labels, { "merro.owner": owner, "merro.project": project.slug, "merro.work_item_id": "work-2", "merro.clone_path": "/container-clone" });
           if (id === container("b")) Object.assign(labels, { "merro.owner": "foreign", "merro.project": project.slug });
@@ -91,7 +92,7 @@ test("planned readable tmux window proves Task identity through its ownership ma
   const runtime = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "none" }, commands: {
     async run(file, args) {
       if (file !== "tmux") throw new Error(`unexpected command: ${file}`);
-      if (args[0] === "display-message") return { stdout: "%4 123 0 node merro-example impl-safety @4 1", stderr: "" };
+      if (args[0] === "display-message") return { stdout: "%4\t123\t0\tnode\tmerro-example\timpl-safety\t@4\t1\t\t\n", stderr: "" };
       if (args[0] === "show-option") return { stdout: args.at(-1) === "@merro_task_id" ? "task-uuid" : "", stderr: "" };
       throw new Error(`unexpected tmux command: ${args.join(" ")}`);
     },
@@ -105,17 +106,31 @@ test("planned readable tmux window proves Task identity through its ownership ma
 
 for (const dead of [false, true]) {
   test(`host process inspection preserves uncertainty and recognizes dead panes (${dead})`, async () => {
+    const calls: string[] = [];
     const runtime = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "none" }, commands: {
-      async run(file) {
-        if (file === "tmux") return { stdout: `%1 123 ${dead ? "1" : "0"} node merro-example impl-safety @1 1`, stderr: "" };
+      async run(file, args) {
+        calls.push(`${file} ${args[0]}`);
+        if (file === "tmux") {
+          if (args[0] === "display-message") return { stdout: `%1\t123\t${dead ? "1" : "0"}\tnode\tmerro-example\timpl-safety\t@1\t1\t${dead ? "1" : ""}\t\n`, stderr: "" };
+          if (args[0] === "show-option") return { stdout: "host\n", stderr: "" };
+          if (args[0] === "capture-pane") return { stdout: "Pi exited\n", stderr: "" };
+          throw new Error(`unexpected tmux command: ${args.join(" ")}`);
+        }
         throw new Error("ps unavailable");
       },
     } });
     const record = { ...runtime.plan({ taskId: "host", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement", project,
       clonePath: "/clone", taskFile: "Test", expectedCommit: "a".repeat(40), projectSettings: null }),
       paneId: "%1", processPid: 123, processStartedAt: "2026-01-01T00:00:00.000Z" };
-    if (dead) assert.equal((await runtime.inspect(record, "host")).alive, false);
-    else await assert.rejects(runtime.inspect(record, "host"), /ps unavailable/);
+    if (dead) {
+      const presence = await runtime.inspect(record, "host");
+      assert.equal(presence.alive, false);
+      assert.equal(presence.identityMatches, true);
+      assert.equal(presence.exitStatus, 1);
+      assert.ok(presence.diagnosticPath);
+      assert.match(await readFile(presence.diagnosticPath, "utf8"), /Pi exited/);
+      assert.ok(calls.every((call) => call.startsWith("tmux ")));
+    } else await assert.rejects(runtime.inspect(record, "host"), /ps unavailable/);
   });
 }
 
@@ -205,7 +220,8 @@ test("path-hash labels without exact workspace Task mounts are not ownership pro
   const runtime = new WorkerRuntime({ workspacePath, config: DEFAULT_CONFIG, commands: { async run(file, args) {
     if (file === "tmux") throw new Error("no such session");
     if (args[0] === "ps") return { stdout: ["a", "b", "c", "d"].map(container).join("\n"), stderr: "" };
-    const id = args[1]!;
+    const id = args[1];
+    assert.ok(id);
     return { stdout: JSON.stringify([{ Id: id, State: { Running: true },
       Config: { Labels: { "merro.task_id": "legacy", "merro.project": project.slug,
         "merro.owner": id === container("d") ? "workspace:607bb118-019e-4151-8e64-0776b47b8016" : oldOwner } },
@@ -296,16 +312,18 @@ for (const identity of ["matching", "wrong-pane", "wrong-pid", "wrong-start", "n
         if (args[0] === "show-option") {
           const values: Record<string, string> = { "@merro_owner": sessionOwner, "@merro_project": project.slug,
             "@merro_task_id": "legacy", "@merro_work_item_id": "work", "@merro_clone_path": "/clone", "@merro_runtime_kind": "host" };
-          return { stdout: values[args.at(-1)!] ?? "", stderr: "" };
+          return { stdout: values[args.at(-1) ?? ""] ?? "", stderr: "" };
         }
         if (args[0] === "display-message") {
           if (args.includes("merro-example:impl-gone")) throw new Error("no such window");
           return { stdout: args.at(-1) === "#{pane_id}" ? (identity === "wrong-pane" ? "%2" : "%1")
             : args.at(-1) === "#{window_name}" ? "impl-legacy"
-            : `%1 ${identity === "wrong-pid" ? "999" : "123"} ${identity === "dead" ? "1" : "0"} node merro-example impl-safety @1 1`, stderr: "" };
+            : `%1\t${identity === "wrong-pid" ? "999" : "123"}\t${identity === "dead" ? "1" : "0"}\tnode\tmerro-example\timpl-safety\t@1\t1\t${identity === "dead" ? "1" : ""}\t\n`, stderr: "" };
         }
         if (args[0] === "set-option") {
-          sessionOwner = args[args.indexOf("@merro_owner") + 1]!;
+          const nextOwner = args[args.indexOf("@merro_owner") + 1];
+          assert.ok(nextOwner);
+          sessionOwner = nextOwner;
           assert.equal(args[args.indexOf("MERRO_OWNER") + 1], sessionOwner);
           migrations++;
           return { stdout: "", stderr: "" };
