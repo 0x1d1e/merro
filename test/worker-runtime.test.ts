@@ -101,7 +101,12 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
 
   const runtime = new WorkerRuntime({
     workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: "none" },
+    config: {
+      ...DEFAULT_CONFIG,
+      sandbox: "none",
+      worker_models: { implement: null, review: "openai/gpt-4o" },
+      worker_thinking: { implement: null, review: "high" },
+    },
     commands,
     piConfigPath,
   });
@@ -146,6 +151,8 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(!mountArgs.some((value) => value.includes(projectPath)));
   assert.ok(containerArgs.includes("--read-only"));
   assert.ok(containerArgs.includes("--cap-drop"));
+  assert.equal(containerArgs[containerArgs.indexOf("--model") + 1], "openai/gpt-4o");
+  assert.equal(containerArgs[containerArgs.indexOf("--thinking") + 1], "high");
   const start = calls.find((call) => call.file === "tmux" && call.args[0] === "new-session");
   assert.ok(start);
   assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-safety");

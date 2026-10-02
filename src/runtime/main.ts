@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import type { MerroConfig } from "../config.js";
+import type { MerroConfig, WorkerSettings } from "../config.js";
 import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type ChangeSet } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
@@ -22,8 +22,8 @@ import { GitClient } from "../vcs/git.js";
 
 type GitAdapter = Pick<GitClient, "discoverProject" | "createChangeSetClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint" | "fullDiff">
   & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone">>;
-type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
-  & Partial<Pick<GitHubClient, "findPullRequest">>;
+type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "issues" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
+  & Partial<Pick<GitHubClient, "findPullRequest" | "beginPass">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup" | "listOwnedWorkers">
   & Partial<Pick<WorkerRuntime, "plan" | "stop">>;
 
@@ -39,6 +39,7 @@ export interface MainOptions {
 
 export interface ObjectiveProposal {
   id: string;
+  workerSettings: WorkerSettings;
   changeSets: ChangeSet[];
   branches: Record<string, string>;
   relations: Relation[];
@@ -64,7 +65,9 @@ const emptyRuntime = (changeSetId: string): ChangeSetRuntimeRecord => ({
   infrastructureRetries: 0, implementationAttempt: 0, lastReworkTrigger: null, lastReconciledAt: null,
 });
 
-function proposalFingerprint(graph: Omit<ObjectiveProposal, "id">): string {
+type ObjectiveGraph = Omit<ObjectiveProposal, "id" | "workerSettings">;
+
+function proposalFingerprint(graph: ObjectiveGraph): string {
   return JSON.stringify({ changeSets: graph.changeSets.map((item) => item.id), branches: graph.branches, relations: graph.relations,
     unresolved: graph.unresolved, cycle: graph.cycle });
 }
@@ -395,7 +398,11 @@ export class MainOrchestrator {
     return this.#withStore(async (store) => {
       const prepared = await this.#prepareObjective(store, input);
       const id = randomUUID();
-      const proposal = { id, ...prepared.graph };
+      const workerSettings: WorkerSettings = {
+        implement: { model: this.#config.worker_models.implement, thinking: this.#config.worker_thinking.implement },
+        review: { model: this.#config.worker_models.review, thinking: this.#config.worker_thinking.review },
+      };
+      const proposal = { id, workerSettings, ...prepared.graph };
       this.#proposals.clear();
       this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph) });
       return proposal;
@@ -591,6 +598,9 @@ export class MainOrchestrator {
     await this.#withStore((store) => {
       const item = store.getChangeSet(changeSetId) ?? store.listChangeSets().find((item) => changeName(item) === semanticSlug(changeSetId));
       if (!item || item.state !== "Blocked" || !item.blockedResumeState) throw new Error(`ChangeSet ${changeSetId} is not Blocked`);
+      if (item.blockedReason === "policy_unknown" && store.latestBlock(item.id)?.retryable === false) {
+        throw new Error(`${changeName(item)} is blocked by deterministic GitHub branch policy. Fix the rules or API response; /merro-continue cannot help and Main will retry during reconciliation.`);
+      }
       store.transitionChangeSet(item.id, item.blockedResumeState);
       const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
       if (item.blockedReason === "review_cap" || item.blockedReason === "task_failed") runtime.infrastructureRetries = 0;
@@ -768,16 +778,18 @@ export class MainOrchestrator {
       const finalizedTaskCount = () => store.listTasks().filter((task) => task.status === "finalized").length;
       let inventoriedFinalizedTaskCount = -1;
       try {
+        this.#github.beginPass?.();
+        const issueCache = new Map<string, Map<number, GitHubIssue>>();
         const unavailableProjects = await this.#reconcileProjects(store);
         let orphans = await this.#workerSafetyPreflight(store, unsafeProjects);
         inventoriedFinalizedTaskCount = finalizedTaskCount();
         const scopeGates = new Set<string>();
         for (const objective of store.listObjectives()) {
           if (objective.state === "Active" && objective.issueScopes?.some((scope) => "query" in scope)) {
-            await this.#refreshObjectiveScope(store, objective, unavailableProjects, scopeGates, unsafeProjects);
+            await this.#refreshObjectiveScope(store, objective, unavailableProjects, scopeGates, unsafeProjects, issueCache);
           }
         }
-        await this.#reconcileIssues(store, unavailableProjects, orphans.changeSetIds);
+        await this.#reconcileIssues(store, unavailableProjects, orphans.changeSetIds, issueCache);
         await this.#reconcileTasks(store, unavailableProjects, unsafeProjects, orphans.liveTaskIds);
         // Result submission does not prove exit. Newly finalized live workers still occupy their slots.
         if (finalizedTaskCount() !== inventoriedFinalizedTaskCount) {
@@ -789,7 +801,7 @@ export class MainOrchestrator {
           if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
         }
         await this.#reconcilePullRequests(store, unavailableProjects, unsafeProjects);
-        const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds);
+        const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds, issueCache);
         for (const id of scopeGates) relationGates.add(id);
         this.#deriveReady(store, unavailableProjects, relationGates, unsafeProjects, orphans.changeSetIds);
         const tasks = store.listTasks();
@@ -806,9 +818,9 @@ export class MainOrchestrator {
         if (result.cycle) this.#blockCycle(store, result.cycle, new Set([...active.map((task) => task.changeSetId), ...orphans.changeSetIds]));
         for (const item of result.selected) {
           if (item.state === "Ready") store.transitionChangeSet(item.id, "Implementing");
-          await this.#launchTask(store, store.getChangeSet(item.id) ?? item);
+          await this.#launchTask(store, store.getChangeSet(item.id) ?? item, issueCache);
         }
-        await this.#finishObjectives(store, unavailableProjects, unsafeProjects);
+        await this.#finishObjectives(store, unavailableProjects, unsafeProjects, issueCache);
       } finally {
         // Cover exceptional exits and Tasks finalized by failed launches after scheduling.
         if (finalizedTaskCount() !== inventoriedFinalizedTaskCount) {
@@ -873,7 +885,7 @@ export class MainOrchestrator {
     }
   }
 
-  async #launchTask(store: MerroStore, item: ChangeSet): Promise<void> {
+  async #launchTask(store: MerroStore, item: ChangeSet, issueCache: Map<string, Map<number, GitHubIssue>>): Promise<void> {
     const role: TaskRole = item.state === "Reviewing" ? "review" : "implement";
     const project = store.getProject(item.projectSlug);
     if (!project) return this.#block(store, item, "project_unavailable", `Project ${item.projectSlug} is not registered`);
@@ -884,7 +896,11 @@ export class MainOrchestrator {
     let workerLaunchStarted = false;
     try {
       assertProjectSlug(project.slug);
-      const issues = await Promise.all(issueNumbers(item).map((number) => this.#github.issue(project, number)));
+      const issues = item.issues.length ? issueNumbers(item).map((number) => {
+        const issue = issueCache.get(project.slug)?.get(number);
+        if (!issue) throw new Error(`GitHub issue #${number} was not returned during reconciliation`);
+        return issue;
+      }) : [];
       const issue = issues[0] ?? null;
       const slug = changeName(item);
       this.#names.set(taskId, `${role === "implement" ? "impl" : "rev"}-${slug}`);
@@ -1046,39 +1062,71 @@ export class MainOrchestrator {
     return unavailable;
   }
 
-  async #reconcileIssues(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedChangeSetIds: ReadonlySet<string> = new Set()): Promise<void> {
-    for (let item of store.listChangeSets()) {
-      if (unavailableProjects.has(item.projectSlug)
-        || !item.issues.length || !store.hasActiveObjectiveForChangeSet(item.id) && !store.activeTask(item.id) && !occupiedChangeSetIds.has(item.id)) continue;
+  async #reconcileIssues(
+    store: MerroStore,
+    unavailableProjects: ReadonlySet<string>,
+    occupiedChangeSetIds: ReadonlySet<string>,
+    issueCache: Map<string, Map<number, GitHubIssue>>,
+  ): Promise<void> {
+    const byProject = new Map<string, { project: Project; items: ChangeSet[] }>();
+    for (const item of store.listChangeSets()) {
+      if (unavailableProjects.has(item.projectSlug) || !item.issues.length
+        || !store.hasActiveObjectiveForChangeSet(item.id) && !store.activeTask(item.id) && !occupiedChangeSetIds.has(item.id)) continue;
       const project = store.getProject(item.projectSlug);
       if (!project) continue;
-      try {
-        const issues = await Promise.all(issueNumbers(item).map((number) => this.#github.issue(project, number)));
-        if (issues.some((issue) => !["OPEN", "CLOSED"].includes(issue.state.toUpperCase()))) throw new Error("GitHub returned an unsupported issue state.");
-        const state = issues.every((issue) => issue.state.toUpperCase() === "CLOSED") ? "CLOSED" : "OPEN";
-        const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
-        const previousState = runtime.lastIssueState;
-        runtime.lastIssueState = state;
-        store.saveChangeSetRuntime(runtime);
+      const group = byProject.get(project.slug) ?? { project, items: [] };
+      group.items.push(item);
+      byProject.set(project.slug, group);
+    }
 
-        if (state === "OPEN" && item.state === "Blocked" && item.blockedReason === "github_unavailable" && item.blockedResumeState) {
-          store.transitionChangeSet(item.id, item.blockedResumeState);
-          item = store.getChangeSet(item.id) ?? item;
-        }
-        if (state === "CLOSED") {
-          const activeTask = store.activeTask(item.id);
-          if (activeTask) await this.#cancelTaskForClosedIssue(store, item, activeTask);
-          const current = store.getChangeSet(item.id);
-          if (current && !terminal(current) && !runtime.pullRequestNumber && !store.activeTask(item.id)) {
-            this.#completeClosedIssue(store, current);
-          }
-          continue;
-        }
-        if (previousState === "CLOSED" && item.state === "Done") {
-          for (const issue of issues.filter((issue) => issue.state.toUpperCase() === "OPEN")) this.#createReopenedIssueGeneration(store, item, issue);
-        }
+    for (const { project, items } of byProject.values()) {
+      let fetched: GitHubIssue[];
+      try {
+        const cached = issueCache.get(project.slug) ?? new Map<number, GitHubIssue>();
+        const numbers = [...new Set(items.flatMap(issueNumbers))].filter((number) => !cached.has(number));
+        fetched = numbers.length ? await this.#github.issues(project, numbers) : [];
+        for (const issue of fetched) cached.set(issue.number, issue);
+        issueCache.set(project.slug, cached);
       } catch (error) {
-        this.#blockForGitHubUnavailable(store, item, `Issue reconciliation failed: ${errorText(error)}`);
+        issueCache.set(project.slug, new Map());
+        for (const item of items) this.#blockForGitHubUnavailable(store, item, `Issue reconciliation failed: ${errorText(error)}`);
+        continue;
+      }
+
+      const issuesByNumber = issueCache.get(project.slug)!;
+      for (let item of items) {
+        try {
+          const issues = issueNumbers(item).map((number) => {
+            const issue = issuesByNumber.get(number);
+            if (!issue) throw new Error(`GitHub did not return issue #${number}`);
+            return issue;
+          });
+          if (issues.some((issue) => !["OPEN", "CLOSED"].includes(issue.state.toUpperCase()))) throw new Error("GitHub returned an unsupported issue state.");
+          const state = issues.every((issue) => issue.state.toUpperCase() === "CLOSED") ? "CLOSED" : "OPEN";
+          const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
+          const previousState = runtime.lastIssueState;
+          runtime.lastIssueState = state;
+          store.saveChangeSetRuntime(runtime);
+
+          if (state === "OPEN" && item.state === "Blocked" && item.blockedReason === "github_unavailable" && item.blockedResumeState) {
+            store.transitionChangeSet(item.id, item.blockedResumeState);
+            item = store.getChangeSet(item.id) ?? item;
+          }
+          if (state === "CLOSED") {
+            const activeTask = store.activeTask(item.id);
+            if (activeTask) await this.#cancelTaskForClosedIssue(store, item, activeTask);
+            const current = store.getChangeSet(item.id);
+            if (current && !terminal(current) && !runtime.pullRequestNumber && !store.activeTask(item.id)) {
+              this.#completeClosedIssue(store, current);
+            }
+            continue;
+          }
+          if (previousState === "CLOSED" && item.state === "Done") {
+            for (const issue of issues.filter((issue) => issue.state.toUpperCase() === "OPEN")) this.#createReopenedIssueGeneration(store, item, issue);
+          }
+        } catch (error) {
+          this.#blockForGitHubUnavailable(store, item, `Issue reconciliation failed: ${errorText(error)}`);
+        }
       }
     }
   }
@@ -1526,7 +1574,7 @@ export class MainOrchestrator {
             store.transitionChangeSet(item.id, item.blockedResumeState!);
             item = store.getChangeSet(item.id) ?? item;
           }
-          this.#block(store, item, "policy_unknown", policy.reason);
+          this.#block(store, item, "policy_unknown", policy.reason, policy.retryable);
           continue;
         }
         if (recovering) {
@@ -1676,9 +1724,9 @@ export class MainOrchestrator {
 
     if (item.issues.length) {
       try {
-        for (const number of issueNumbers(item)) {
-          const issue = await this.#github.issue(project, number);
-          if (issue.state.toUpperCase() !== "CLOSED") this.#notify(`GitHub issue #${number} remains open after merging ${pullRequest.url}; verify its Closes directive.`, "warning");
+        const issues = await this.#github.issues(project, issueNumbers(item));
+        for (const issue of issues) {
+          if (issue.state.toUpperCase() !== "CLOSED") this.#notify(`GitHub issue #${issue.number} remains open after merging ${pullRequest.url}; verify its Closes directive.`, "warning");
         }
       } catch (error) {
         this.#notify(`Could not verify issue closures for ${changeName(item)} after merging ${pullRequest.url}: ${errorText(error)}`, "warning");
@@ -1716,7 +1764,12 @@ export class MainOrchestrator {
     return true;
   }
 
-  async #rebuildRelations(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedChangeSetIds: ReadonlySet<string>): Promise<Set<string>> {
+  async #rebuildRelations(
+    store: MerroStore,
+    unavailableProjects: ReadonlySet<string>,
+    occupiedChangeSetIds: ReadonlySet<string>,
+    issueCache: Map<string, Map<number, GitHubIssue>>,
+  ): Promise<Set<string>> {
     const gated = new Set<string>();
     const analyzed: string[] = [];
     const relations: Relation[] = [];
@@ -1729,8 +1782,13 @@ export class MainOrchestrator {
       }
       if (!item.issues.length) { analyzed.push(item.id); continue; }
       try {
-        const project = store.getProject(item.projectSlug)!;
-        const issues = await Promise.all(issueNumbers(item).map((number) => this.#github.issue(project, number)));
+        const projectIssues = issueCache.get(item.projectSlug);
+        if (!projectIssues) throw new Error("Issue data was not loaded during reconciliation");
+        const issues = issueNumbers(item).map((number) => {
+          const issue = projectIssues.get(number);
+          if (!issue) throw new Error(`Issue #${number} was not returned during reconciliation`);
+          return issue;
+        });
         const approved = new Map<string, ChangeSet>();
         for (const objective of objectives) {
           const attached = store.listChangeSets(objective.id, true);
@@ -1789,20 +1847,26 @@ export class MainOrchestrator {
     }
   }
 
-  #block(store: MerroStore, item: ChangeSet, reason: ChangeSet["blockedReason"] & string, detail: string): void {
+  #block(store: MerroStore, item: ChangeSet, reason: ChangeSet["blockedReason"] & string, detail: string, retryable = true): void {
     const current = store.getChangeSet(item.id) ?? item;
-    const changed = current.state !== "Blocked" || current.blockedReason !== reason;
-    if (changed) store.transitionChangeSet(item.id, "Blocked", reason);
-    store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail });
+    const previous = store.latestBlock(item.id);
+    const changed = current.state !== "Blocked" || current.blockedReason !== reason
+      || previous?.reason !== reason || previous.detail !== detail || previous.retryable !== retryable;
+    if (!changed) return;
+    if (current.state !== "Blocked" || current.blockedReason !== reason) store.transitionChangeSet(item.id, "Blocked", reason);
+    store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable });
     const dependents = store.listRelations()
       .filter((relation) => relation.kind === "Requires" && relation.to === item.id)
       .map((relation) => store.getChangeSet(relation.from))
       .filter((dependent): dependent is ChangeSet => dependent !== null)
       .map((dependent) => `${changeName(dependent)} (${dependent.state})`);
     const dependentsNote = dependents.length > 0 ? ` Direct dependents: ${dependents.join(", ")}.` : "";
-    const message = `${changeName(item)} blocked\n\n${publicText(detail, this.#names)}.${dependentsNote}\nRetry available after fixing the cause: /merro-continue ${changeName(item)}`;
+    const recovery = retryable
+      ? `Retry available after fixing the cause: /merro-continue ${changeName(item)}`
+      : "Fix the underlying GitHub policy/API response; Main will retry on reconciliation. /merro-continue cannot retry this deterministic blocker.";
+    const message = `${changeName(item)} blocked\n\n${publicText(detail, this.#names)}.${dependentsNote}\n${recovery}`;
     this.#notify(message, "warning");
-    if (changed) this.#queueNotification("blocked", item.id, message);
+    this.#queueNotification("blocked", item.id, message);
   }
 
   #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" {
@@ -1870,7 +1934,14 @@ export class MainOrchestrator {
     return item;
   }
 
-  async #refreshObjectiveScope(store: MerroStore, objective: Objective, unavailableProjects: ReadonlySet<string> = new Set(), schedulingGates: Set<string> = new Set(), unsafeProjects: ReadonlySet<string> = new Set()): Promise<boolean> {
+  async #refreshObjectiveScope(
+    store: MerroStore,
+    objective: Objective,
+    unavailableProjects: ReadonlySet<string>,
+    schedulingGates: Set<string>,
+    unsafeProjects: ReadonlySet<string>,
+    issueCache: Map<string, Map<number, GitHubIssue>>,
+  ): Promise<boolean> {
     try {
       let scopes = objective.issueScopes;
       if (scopes === undefined) {
@@ -1894,7 +1965,10 @@ export class MainOrchestrator {
           if (!project || unavailableProjects.has(project.slug)) throw new Error(`Project '${scope.projectSlug}' is unavailable`);
           const issues = "query" in scope
             ? await this.#github.listOpenIssues(project, scope.query)
-            : await Promise.all(scope.numbers.map((number) => this.#github.issue(project, number)));
+            : await this.#github.issues(project, scope.numbers);
+          const cached = issueCache.get(project.slug) ?? new Map<number, GitHubIssue>();
+          for (const issue of issues) cached.set(issue.number, issue);
+          issueCache.set(project.slug, cached);
           const matching = issues.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue));
           if ("query" in scope) queryResults.set(project.slug, new Set(matching.map((issue) => issue.number)));
           for (const issue of matching) discovered.push({ projectSlug: project.slug, issue });
@@ -1910,7 +1984,14 @@ export class MainOrchestrator {
         if (!item.issues.length || !queryResults.has(item.projectSlug)
           || issueNumbers(item).some((number) => queryResults.get(item.projectSlug)!.has(number))) continue;
         try {
-          const issue = await this.#github.issue(store.getProject(item.projectSlug)!, issueNumbers(item)[0]!);
+          const project = store.getProject(item.projectSlug)!;
+          let issue = issueCache.get(item.projectSlug)?.get(issueNumbers(item)[0]!);
+          if (!issue) {
+            issue = await this.#github.issue(project, issueNumbers(item)[0]!);
+            const cached = issueCache.get(item.projectSlug) ?? new Map<number, GitHubIssue>();
+            cached.set(issue.number, issue);
+            issueCache.set(item.projectSlug, cached);
+          }
           // Closure is authoritative satisfaction, not scope removal. Issue reconciliation handles it.
           if (issue.state.toUpperCase() === "CLOSED") continue;
           const scope = scopes.find((entry) => entry.projectSlug === item.projectSlug)!;
@@ -1955,12 +2036,17 @@ export class MainOrchestrator {
     }
   }
 
-  async #finishObjectives(store: MerroStore, unavailableProjects: ReadonlySet<string> = new Set(), unsafeProjects: ReadonlySet<string> = new Set()): Promise<void> {
+  async #finishObjectives(
+    store: MerroStore,
+    unavailableProjects: ReadonlySet<string>,
+    unsafeProjects: ReadonlySet<string>,
+    issueCache: Map<string, Map<number, GitHubIssue>> = new Map(),
+  ): Promise<void> {
     for (const objective of store.listObjectives()) {
       if (objective.state !== "Active") continue;
       const items = store.listChangeSets(objective.id);
       if (!items.every(terminal)) continue;
-      if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects, new Set(), unsafeProjects)) continue;
+      if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects, new Set(), unsafeProjects, issueCache)) continue;
       if (!store.listChangeSets(objective.id).every(terminal)) continue;
       store.setObjectiveState(objective.id, "Done");
       const message = `${objective.goal} is Done.`;

@@ -63,6 +63,27 @@ test("GitHub issue discovery uses gh JSON and parses issue labels", async () => 
   assert.equal(commands.calls[1]?.options?.cwd, project.path);
 });
 
+test("issue batch reads use one GraphQL request and preserve requested order", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: JSON.stringify({ data: { repository: {
+      issue_0: { number: 17, title: "Seventeen", body: "Details", url: "https://github.com/acme/widget/issues/17", state: "OPEN", updatedAt: "2026-01-01", labels: { nodes: [{ name: "bug" }] }, milestone: { title: "v1" } },
+      issue_1: { number: 18, title: "Eighteen", body: "Details", url: "https://github.com/acme/widget/issues/18", state: "CLOSED", updatedAt: "2026-01-02", labels: { nodes: [] }, milestone: null },
+    } } }), stderr: "" },
+  ]);
+  const github = new GitHubClient(commands);
+
+  const issues = await github.issues(project, [17, 18, 17]);
+
+  assert.deepEqual(issues.map((issue) => issue.number), [17, 18]);
+  assert.deepEqual(issues[0]?.labels, ["bug"]);
+  assert.equal(issues[1]?.milestone, null);
+  assert.equal(commands.calls.length, 2);
+  assert.equal(commands.calls[1]?.args[0], "api");
+  assert.equal(commands.calls[1]?.args[1], "graphql");
+  assert.ok(commands.calls[1]?.args.some((argument) => argument === "number_0=17"));
+});
+
 test("scope discovery consumes every page, excludes PRs, and filters all approved labels and milestone", async () => {
   const issue = (number: number, labels = ["feature"], milestone = "v1") => ({
     number, title: `Issue ${number}`, body: "scope", html_url: `https://github.com/acme/widget/issues/${number}`,
@@ -88,6 +109,42 @@ test("scope discovery rejects incomplete or malformed responses instead of repor
     ]);
     await assert.rejects(new GitHubClient(commands).listOpenIssues(project));
   }
+});
+
+test("repository identity is cached within a reconciliation pass and refreshed between passes", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: repository("acme/widget"), stderr: "" },
+  ]);
+  const github = new GitHubClient(commands);
+
+  await Promise.all([github.repository(project.baseRemote), github.repository(project.baseRemote)]);
+  await github.repository(project.baseRemote);
+  assert.equal(commands.calls.length, 1);
+
+  github.beginPass();
+  await github.repository(project.baseRemote);
+  assert.equal(commands.calls.length, 2);
+});
+
+test("transient GitHub failures retry with a bounded retry while permanent failures do not", async () => {
+  const transient = new GitHubClient(new FakeCommands([
+    new Error("HTTP 503: Service Unavailable"),
+    { stdout: repository("acme/widget"), stderr: "" },
+  ]));
+  assert.equal((await transient.repository(project.baseRemote)).nameWithOwner, "acme/widget");
+
+  const permanentCommands = new FakeCommands([new Error("HTTP 403: Forbidden")]);
+  await assert.rejects(new GitHubClient(permanentCommands).repository(project.baseRemote), /HTTP 403/);
+  assert.equal(permanentCommands.calls.length, 1);
+
+  const exhaustedCommands = new FakeCommands([
+    new Error("HTTP 503: Service Unavailable"),
+    new Error("HTTP 503: Service Unavailable"),
+    new Error("HTTP 503: Service Unavailable"),
+  ]);
+  await assert.rejects(new GitHubClient(exhaustedCommands).repository(project.baseRemote), /HTTP 503/);
+  assert.equal(exhaustedCommands.calls.length, 3);
 });
 
 test("branch protection is unknown on GitHub API failure", async () => {
@@ -220,6 +277,48 @@ test("squash merge requires the approved pull request head commit", async () => 
   await assert.rejects(new GitHubClient(new FakeCommands([])).mergeSquash(project, 23, "bad-sha"), /invalid expected/);
 });
 
+test("transient squash merge retries only after confirming the approved pull request head", async () => {
+  const expectedHead = "a".repeat(40);
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 503: Service Unavailable"),
+    { stdout: JSON.stringify({
+      number: 23, title: "Retry safely", body: "", url: "https://github.com/acme/widget/pull/23",
+      state: "OPEN", isDraft: false, mergedAt: null, mergeable: "MERGEABLE",
+      headRefName: "feature", baseRefName: "main", headRefOid: expectedHead, baseRefOid: "b".repeat(40),
+      reviews: [], statusCheckRollup: [],
+    }), stderr: "" },
+    { stdout: "", stderr: "" },
+  ]);
+
+  await new GitHubClient(commands).mergeSquash(project, 23, expectedHead);
+
+  assert.equal(commands.calls.length, 4);
+  assert.equal(commands.calls[1]?.args[1], "merge");
+  assert.equal(commands.calls[2]?.args[1], "view");
+  assert.equal(commands.calls[3]?.args[1], "merge");
+});
+
+test("transient merge response loss is reconciled without issuing a second merge", async () => {
+  const expectedHead = "a".repeat(40);
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 503: Service Unavailable"),
+    { stdout: JSON.stringify({
+      number: 23, title: "Already merged", body: "", url: "https://github.com/acme/widget/pull/23",
+      state: "CLOSED", isDraft: false, mergedAt: "2026-01-01T00:00:00Z", mergeCommit: { oid: "c".repeat(40) },
+      mergeable: "UNKNOWN", headRefName: "feature", baseRefName: "main", headRefOid: expectedHead,
+      baseRefOid: "b".repeat(40), reviews: [], statusCheckRollup: [],
+    }), stderr: "" },
+  ]);
+
+  await new GitHubClient(commands).mergeSquash(project, 23, expectedHead);
+
+  assert.equal(commands.calls.length, 3);
+  assert.equal(commands.calls[1]?.args[1], "merge");
+  assert.equal(commands.calls[2]?.args[1], "view");
+});
+
 test("squash merge classifies permanent rejection separately from availability failure", async () => {
   const expectedHead = "a".repeat(40);
   const rejected = new GitHubClient(new FakeCommands([
@@ -239,6 +338,25 @@ test("squash merge classifies permanent rejection separately from availability f
     unavailable.mergeSquash(project, 23, expectedHead),
     (error: unknown) => error instanceof GitHubMergeError && error.kind === "unavailable",
   );
+});
+
+test("transient pull request creation reconciles before retry to avoid duplicates", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: repository("contributor/widget"), stderr: "" },
+    { stdout: "[]", stderr: "" },
+    new Error("HTTP 503: Service Unavailable"),
+    { stdout: JSON.stringify([{
+      number: 31, title: "Create safely", body: "", url: "https://github.com/acme/widget/pull/31",
+      state: "OPEN", headRefName: "fix-widget", headRefOid: "a".repeat(40), baseRefName: "main",
+    }]), stderr: "" },
+  ]);
+
+  const pullRequest = await new GitHubClient(commands).createPullRequest(project, "fix-widget", "Create safely", "Details");
+
+  assert.equal(pullRequest.number, 31);
+  assert.equal(commands.calls.filter((call) => call.args[1] === "create").length, 1);
+  assert.equal(commands.calls.filter((call) => call.args[1] === "list").length, 2);
 });
 
 test("reviewer write permissions are parsed and cached per repository and account", async () => {
@@ -358,6 +476,24 @@ test("branch rulesets remain authoritative when classic protection returns 404",
   assert.deepEqual(policy, {
     known: true,
     requiredStatusChecks: ["ruleset-ci"],
+    requiredApprovingReviewCount: 0,
+    requireCodeOwnerReviews: false,
+    dismissStaleApprovals: false,
+  });
+});
+
+test("non_fast_forward ruleset policy is supported without affecting merge readiness", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 404: Branch not protected"),
+    { stdout: JSON.stringify([{ type: "non_fast_forward", parameters: {} }]), stderr: "" },
+  ]);
+
+  const policy = await new GitHubClient(commands).branchProtection(project);
+
+  assert.deepEqual(policy, {
+    known: true,
+    requiredStatusChecks: [],
     requiredApprovingReviewCount: 0,
     requireCodeOwnerReviews: false,
     dismissStaleApprovals: false,

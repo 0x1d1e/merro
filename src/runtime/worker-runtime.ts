@@ -253,9 +253,14 @@ export class WorkerRuntime {
       environment.GH_TOKEN = token;
     }
 
+    const roleArguments = [
+      ...(this.#config.worker_models[input.role] ? ["--model", this.#config.worker_models[input.role]!] : []),
+      ...(this.#config.worker_thinking[input.role] ? ["--thinking", this.#config.worker_thinking[input.role]!] : []),
+    ];
+    const commonPiArgs = ["--no-session", "--tui-mode", "regular", "--approve", ...roleArguments];
     const piArgs = [
-      "pi", "--no-session", "--tui-mode", "regular", "--approve", "--extension",
-      join(TASK_MOUNT, "merro-runtime", "tools", "worker-result.js"),
+      "pi", ...commonPiArgs,
+      "--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-result.js"),
       "--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-lifecycle.js"),
       "--", `@${CLONE_MOUNT}/.merro-task.md`,
     ];
@@ -322,8 +327,8 @@ export class WorkerRuntime {
           MERRO_TASK_SCRATCH: scratchPath,
         };
         const hostArgs = [
-          "pi", "--no-session", "--tui-mode", "regular", "--approve", "--extension",
-          join(extensionRoot, "tools", "worker-result.js"),
+          "pi", ...commonPiArgs,
+          "--extension", join(extensionRoot, "tools", "worker-result.js"),
           "--extension", join(extensionRoot, "tools", "worker-lifecycle.js"),
           "--", `@${taskFilePath}`,
         ];

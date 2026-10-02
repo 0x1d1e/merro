@@ -69,10 +69,15 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
       const proposal = await main.proposeObjective(input);
       const names = new Map(proposal.changeSets.map((item) => [item.id, changeName(item)]));
       const plans = proposal.changeSets.map((item) => ({ change: changeName(item), project: item.projectSlug, issues: issueNumbers(item), branch: proposal.branches[item.id] }));
+      const settings = (role: "implement" | "review") => {
+        const choice = proposal.workerSettings[role];
+        return `model: ${choice.model ?? "Pi default"}, thinking: ${choice.thinking ?? "Pi default"}`;
+      };
+      const workerSettings = { implement: proposal.workerSettings.implement, review: proposal.workerSettings.review };
       const warning = proposal.cycle ? "\nBlocked: dependency cycle." : proposal.unresolved.length ? "\nBlocked: unresolved issue dependencies." : "";
-      const message = publicText(`Plan\n\n${plans.map((plan) => `${plan.project}: ${plan.issues.map((number) => `#${number}`).join(" ")}\nChange: ${plan.change}\nBranch: ${plan.branch}`).join("\n\n")}\nDelivery: ${input.delivery === "separate" ? "separate changes" : "one change per Project"}\nPRs: ${plans.length}\nImplementation: one worker per change\nReview: one fresh worker per change${warning}\n\nApprove?`, names);
-      pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details: plans });
-      return result(message, { plans, relations: proposal.relations.map((edge) => ({ kind: edge.kind, from: names.get(edge.from) ?? "dependency", to: names.get(edge.to) ?? "dependency" })) });
+      const message = publicText(`Plan\n\n${plans.map((plan) => `${plan.project}: ${plan.issues.map((number) => `#${number}`).join(" ")}\nChange: ${plan.change}\nBranch: ${plan.branch}`).join("\n\n")}\nDelivery: ${input.delivery === "separate" ? "separate changes" : "one change per Project"}\nPRs: ${plans.length}\nImplementation: one worker per change (${settings("implement")})\nReview: one fresh worker per change (${settings("review")})${warning}\n\nApprove?`, names);
+      pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details: { plans, workerSettings } });
+      return result(message, { plans, workerSettings, relations: proposal.relations.map((edge) => ({ kind: edge.kind, from: names.get(edge.from) ?? "dependency", to: names.get(edge.to) ?? "dependency" })) });
     } });
   pi.registerTool({ name: "merro_start_objective", label: "Approve plan", description: "Approve the single pending plan only after explicit user approval such as 'approve'. Optionally select by semantic change name; never ask for an identifier or repeat the plan parameters.", parameters: Type.Object({ change: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, args) {
@@ -80,7 +85,7 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
       await main.runPass();
       return result(`Started ${started.changeSets.map(changeName).join(", ")}.\n${started.changeSets.map((item) => `tmux: merro-${item.projectSlug} / impl-${changeName(item)}`).join("\n")}`);
     } });
-  pi.registerTool({ name: "merro_continue_change", label: "Continue change", description: "Retry a blocked change after the user fixes its cause and asks to continue.",
+  pi.registerTool({ name: "merro_continue_change", label: "Continue change", description: "Retry a retryable blocked change after the user fixes its cause. Deterministic unsupported GitHub policy blockers need policy changes and automatic reconciliation, not continuation.",
     parameters: Type.Object({ change: Type.String() }, { additionalProperties: false }),
     async execute(_id, args) { const name = text(args, "change"); await main.continueChangeSet(name); return result(`Continued ${name}.`); } });
   pi.registerTool({ name: "merro_resolve_decision", label: "Resolve decision", description: "Approve or reject a pending merge/conflict decision only after explicit user approval. Select by semantic change name, never by an internal identifier.",

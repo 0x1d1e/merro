@@ -1,4 +1,4 @@
-import { CommandError, systemCommandRunner, type CommandRunner } from "../runtime/commands.js";
+import { CommandError, systemCommandRunner, type CommandOptions, type CommandRunner } from "../runtime/commands.js";
 import type { IssueQuery, Project } from "../domain/model.js";
 import { matchesIssueQuery } from "../domain/objective.js";
 
@@ -66,6 +66,7 @@ export interface BranchProtection {
 export interface UnknownBranchProtection {
   known: false;
   reason: string;
+  retryable: boolean;
 }
 
 export type BranchPolicy = BranchProtection | UnknownBranchProtection;
@@ -237,31 +238,86 @@ export class GitHubMergeError extends Error {
   }
 }
 
+type RetryDecision<T> = { type: "retry" } | { type: "fail" } | { type: "done"; value: T };
+
+function isTransientGitHubFailure(error: unknown): boolean {
+  const code = error instanceof CommandError ? error.causeCode : null;
+  if (code && /^(?:ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|ECONNABORTED)$/.test(code)) return true;
+  const message = error instanceof CommandError ? `${error.stderr} ${error.message}` : error instanceof Error ? error.message : String(error);
+  return /\b(?:ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|ECONNABORTED)\b/.test(message)
+    || /(?:HTTP|status|response(?: code)?)[^\n]*\b(?:408|429|500|502|503|504)\b/i.test(message)
+    || /API rate limit exceeded|secondary rate limit|GitHub server error/i.test(message);
+}
+
 function isGitHubAvailabilityFailure(error: unknown): boolean {
   const message = error instanceof CommandError
     ? `${error.message} ${error.stderr} ${error.causeCode ?? ""}`
     : error instanceof Error ? error.message : String(error);
-  return /\b(?:ENOENT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN)\b|\b(?:401|429|502|503|504)\b|rate limit|timed? ?out|network|connection (?:reset|refused|closed)|could not resolve|failed to connect|not logged in|authentication token/i.test(message);
+  return isTransientGitHubFailure(error)
+    || /\bENOENT\b|\b401\b|rate limit|timed? ?out|network|connection (?:reset|refused|closed)|could not resolve|failed to connect|not logged in|authentication token/i.test(message);
 }
 
 export class GitHubClient {
   readonly #commands: CommandRunner;
+  readonly #repositoryCache = new Map<string, Promise<GitHubRepository>>();
   readonly #reviewerPermissionCache = new Map<string, { expiresAt: number; result: Promise<boolean> }>();
 
   constructor(commands: CommandRunner = systemCommandRunner) {
     this.#commands = commands;
   }
 
+  beginPass(): void {
+    this.#repositoryCache.clear();
+  }
+
+  async #retry<T>(
+    operation: () => Promise<T>,
+    afterTransientFailure?: (error: unknown) => Promise<RetryDecision<T>>,
+  ): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        if (attempt >= 2 || !isTransientGitHubFailure(error)) throw error;
+        const backoff = 250 * 2 ** attempt + Math.floor(Math.random() * 250);
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+        if (afterTransientFailure) {
+          let decision: RetryDecision<T>;
+          try {
+            decision = await afterTransientFailure(error);
+          } catch {
+            decision = { type: "fail" };
+          }
+          if (decision.type === "done") return decision.value;
+          if (decision.type === "fail") throw error;
+        }
+      }
+    }
+  }
+
+  async #read(args: readonly string[], options?: CommandOptions) {
+    return this.#retry(() => this.#commands.run("gh", args, options));
+  }
+
   async repository(reference: string): Promise<GitHubRepository> {
-    const result = await this.#commands.run("gh", [
-      "repo", "view", reference,
-      "--json", "nameWithOwner,url,sshUrl,defaultBranchRef",
-    ]);
-    return parseRepository(parseJson(result.stdout, "gh repo view"));
+    let pending = this.#repositoryCache.get(reference);
+    if (!pending) {
+      pending = this.#read([
+        "repo", "view", reference,
+        "--json", "nameWithOwner,url,sshUrl,defaultBranchRef",
+      ]).then((result) => parseRepository(parseJson(result.stdout, "gh repo view")));
+      this.#repositoryCache.set(reference, pending);
+    }
+    try {
+      return await pending;
+    } catch (error) {
+      if (this.#repositoryCache.get(reference) === pending) this.#repositoryCache.delete(reference);
+      throw error;
+    }
   }
 
   async repositoryInDirectory(path: string): Promise<GitHubRepository> {
-    const result = await this.#commands.run("gh", [
+    const result = await this.#read([
       "repo", "view", "--json", "nameWithOwner,url,sshUrl,defaultBranchRef",
     ], { cwd: path });
     return parseRepository(parseJson(result.stdout, "gh repo view"));
@@ -269,7 +325,7 @@ export class GitHubClient {
 
   async listOpenIssues(project: Project, query: IssueQuery = {}): Promise<GitHubIssue[]> {
     const repository = await this.repository(project.baseRemote);
-    const result = await this.#commands.run("gh", [
+    const result = await this.#read([
       "api", "--paginate", "--slurp", `repos/${repository.nameWithOwner}/issues?state=open&per_page=100`,
     ], { cwd: project.path });
     const pages = parseJson(result.stdout, "gh api issues");
@@ -285,12 +341,51 @@ export class GitHubClient {
   }
 
   async issue(project: Project, number: number): Promise<GitHubIssue> {
+    const [issue] = await this.issues(project, [number]);
+    if (!issue) throw new Error(`GitHub issue #${number} was not returned`);
+    return issue;
+  }
+
+  async issues(project: Project, numbers: readonly number[]): Promise<GitHubIssue[]> {
+    const unique = [...new Set(numbers)];
+    if (unique.some((number) => !Number.isSafeInteger(number) || number < 1)) throw new Error("GitHub issue numbers must be positive integers");
+    if (unique.length === 0) return [];
     const repository = await this.repository(project.baseRemote);
-    const result = await this.#commands.run("gh", [
-      "issue", "view", String(number), "--repo", repository.nameWithOwner,
-      "--json", "number,title,body,url,state,labels,updatedAt,milestone",
-    ], { cwd: project.path });
-    return parseIssue(parseJson(result.stdout, "gh issue view"));
+    const [owner, name, ...extra] = repository.nameWithOwner.split("/");
+    if (!owner || !name || extra.length) throw new Error(`invalid GitHub repository identity: ${repository.nameWithOwner}`);
+    const issues = new Map<number, GitHubIssue>();
+    for (let offset = 0; offset < unique.length; offset += 50) {
+      const batch = unique.slice(offset, offset + 50);
+      const variables = batch.map((_, index) => `$number_${index}: Int!`).join(", ");
+      const fields = batch.map((_, index) => `issue_${index}: issue(number: $number_${index}) { number title body url state updatedAt labels(first: 100) { nodes { name } } milestone { title } }`).join(" ");
+      const query = `query($owner: String!, $name: String!, ${variables}) { repository(owner: $owner, name: $name) { ${fields} } }`;
+      const args = ["api", "graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`];
+      batch.forEach((number, index) => {
+        args.push("-F", `number_${index}=${number}`);
+      });
+      const result = await this.#read(args, { cwd: project.path });
+      const response = object(parseJson(result.stdout, "gh api graphql issues"), "gh api graphql issues");
+      if (Array.isArray(response.errors) && response.errors.length) {
+        const message = response.errors.map((error) => typeof error === "object" && error !== null
+          && typeof (error as Record<string, unknown>).message === "string" ? (error as Record<string, unknown>).message : "GraphQL query failed").join("; ");
+        throw new Error(`gh api graphql issues: ${message}`);
+      }
+      const data = object(response.data, "gh api graphql issues.data");
+      const row = object(data.repository, "gh api graphql issues.repository");
+      batch.forEach((number, index) => {
+        const value = row[`issue_${index}`];
+        if (value === null || value === undefined) throw new Error(`GitHub issue #${number} was not found`);
+        const issue = object(value, "gh api graphql issue");
+        const labels = object(issue.labels, "gh api graphql issue.labels");
+        const normalized = { ...issue, labels: labels.nodes, milestone: issue.milestone };
+        issues.set(number, parseIssue(normalized));
+      });
+    }
+    return unique.map((number) => {
+      const issue = issues.get(number);
+      if (!issue) throw new Error(`GitHub issue #${number} was not returned`);
+      return issue;
+    });
   }
 
   async findPullRequest(project: Project, branchName: string): Promise<GitHubPullRequest | null> {
@@ -298,7 +393,7 @@ export class GitHubClient {
     const head = await this.repository(project.pushRemote);
     const owner = head.nameWithOwner.split("/")[0];
     if (!owner) throw new Error(`cannot determine GitHub head owner for ${head.nameWithOwner}`);
-    const result = await this.#commands.run("gh", [
+    const result = await this.#read([
       "pr", "list", "--repo", base.nameWithOwner, "--state", "all",
       "--head", `${owner}:${branchName}`,
       "--json", "number,title,body,url,state,isDraft,mergedAt,mergeCommit,mergeable,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewDecision,reviews,statusCheckRollup",
@@ -312,7 +407,7 @@ export class GitHubClient {
 
   async pullRequest(project: Project, number: number): Promise<GitHubPullRequest> {
     const repository = await this.repository(project.baseRemote);
-    const result = await this.#commands.run("gh", [
+    const result = await this.#read([
       "pr", "view", String(number), "--repo", repository.nameWithOwner,
       "--json", "number,title,body,url,state,isDraft,mergedAt,mergeCommit,mergeable,headRefName,baseRefName,headRefOid,baseRefOid,author,reviewDecision,reviews,statusCheckRollup",
     ], { cwd: project.path });
@@ -327,13 +422,13 @@ export class GitHubClient {
   ): Promise<void> {
     const repository = await this.repository(project.baseRemote);
     if (pullRequest.body !== body) {
-      await this.#commands.run("gh", [
+      await this.#retry(() => this.#commands.run("gh", [
         "pr", "edit", String(pullRequest.number), "--repo", repository.nameWithOwner, "--body", body,
-      ], { cwd: project.path });
+      ], { cwd: project.path }));
     }
 
     const endpoint = `repos/${repository.nameWithOwner}/issues/${pullRequest.number}/comments`;
-    const listed = await this.#commands.run("gh", [
+    const listed = await this.#read([
       "api", endpoint, "--paginate", "--jq", ".[] | {id, body, created_at}",
     ], { cwd: project.path });
     const comments = listed.stdout.trim()
@@ -345,22 +440,41 @@ export class GitHubClient {
     const canonical = comments.filter((comment) => comment.body.includes("<!-- merro:review-notes -->"))
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt)).at(-1);
     if (!canonical) {
-      await this.#commands.run("gh", [
-        "pr", "comment", String(pullRequest.number), "--repo", repository.nameWithOwner, "--body", reviewNotes,
-      ], { cwd: project.path });
+      await this.#postReviewComment(project, repository.nameWithOwner, pullRequest.number, reviewNotes);
       return;
     }
     if (canonical.body === reviewNotes) return;
     try {
-      await this.#commands.run("gh", [
+      await this.#retry(() => this.#commands.run("gh", [
         "api", "--method", "PATCH", `repos/${repository.nameWithOwner}/issues/comments/${canonical.id}`,
         "--field", `body=${reviewNotes}`,
-      ], { cwd: project.path });
+      ], { cwd: project.path }));
     } catch {
-      await this.#commands.run("gh", [
-        "pr", "comment", String(pullRequest.number), "--repo", repository.nameWithOwner, "--body", reviewNotes,
-      ], { cwd: project.path });
+      await this.#postReviewComment(project, repository.nameWithOwner, pullRequest.number, reviewNotes);
     }
+  }
+
+  async #postReviewComment(project: Project, repository: string, number: number, body: string): Promise<void> {
+    const endpoint = `repos/${repository}/issues/${number}/comments`;
+    await this.#retry(async () => {
+      await this.#commands.run("gh", [
+        "pr", "comment", String(number), "--repo", repository, "--body", body,
+      ], { cwd: project.path });
+    }, async () => {
+      try {
+        const listed = await this.#read(["api", endpoint, "--paginate", "--jq", ".[] | {body}"], { cwd: project.path });
+        const exists = listed.stdout.trim().split(/\r?\n/).some((line) => {
+          try {
+            return object(parseJson(line, "gh api pull request comments"), "gh api pull request comment").body === body;
+          } catch {
+            return false;
+          }
+        });
+        return exists ? { type: "done", value: undefined } : { type: "retry" };
+      } catch {
+        return { type: "fail" };
+      }
+    });
   }
 
   async createPullRequest(
@@ -379,15 +493,24 @@ export class GitHubClient {
     const owner = head.nameWithOwner.split("/")[0];
     if (!owner) throw new Error(`cannot determine GitHub head owner for ${head.nameWithOwner}`);
     const headRef = base.nameWithOwner === head.nameWithOwner ? branchName : `${owner}:${branchName}`;
-    const result = await this.#commands.run("gh", [
-      "pr", "create", "--repo", base.nameWithOwner,
-      "--head", headRef, "--base", project.defaultBranch,
-      "--title", title, "--body", body,
-    ], { cwd: project.path });
-    const url = result.stdout.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/)?.[0];
-    const number = url ? Number(url.match(/\/pull\/(\d+)/)?.[1]) : Number.NaN;
-    if (!Number.isSafeInteger(number) || number < 1) throw new Error(`gh pr create returned no pull request URL: ${result.stdout.trim()}`);
-    return this.pullRequest(project, number);
+    return this.#retry(async () => {
+      const result = await this.#commands.run("gh", [
+        "pr", "create", "--repo", base.nameWithOwner,
+        "--head", headRef, "--base", project.defaultBranch,
+        "--title", title, "--body", body,
+      ], { cwd: project.path });
+      const url = result.stdout.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/)?.[0];
+      const number = url ? Number(url.match(/\/pull\/(\d+)/)?.[1]) : Number.NaN;
+      if (!Number.isSafeInteger(number) || number < 1) throw new Error(`gh pr create returned no pull request URL: ${result.stdout.trim()}`);
+      return this.pullRequest(project, number);
+    }, async () => {
+      try {
+        const existing = await this.findPullRequest(project, branchName);
+        return existing ? { type: "done", value: existing } : { type: "retry" };
+      } catch {
+        return { type: "fail" };
+      }
+    });
   }
 
   async hasWritePermission(project: Project, username: string): Promise<boolean> {
@@ -401,7 +524,7 @@ export class GitHubClient {
       const repository = await this.repository(project.baseRemote);
       const path = `repos/${repository.nameWithOwner}/collaborators/${encodeURIComponent(username)}/permission`;
       try {
-        const response = await this.#commands.run("gh", ["api", path], { cwd: project.path });
+        const response = await this.#read(["api", path], { cwd: project.path });
         const row = object(parseJson(response.stdout, "gh api collaborator permission"), "gh api collaborator permission");
         const permission = typeof row.permission === "string" ? row.permission.toLowerCase() : "none";
         return permission === "write" || permission === "maintain" || permission === "admin";
@@ -424,42 +547,49 @@ export class GitHubClient {
     const branch = encodeURIComponent(branchName);
     const classicPath = `repos/${repository.nameWithOwner}/branches/${branch}/protection`;
     const rulesPath = `repos/${repository.nameWithOwner}/rules/branches/${branch}`;
+    let classicOutput: string | null = null;
+    try {
+      classicOutput = (await this.#read(["api", classicPath], { cwd: project.path })).stdout;
+    } catch (error) {
+      if (!isNotFound(error)) return { known: false, reason: error instanceof Error ? error.message : String(error), retryable: true };
+    }
+
     let classicChecks: string[] = [];
     let classicApprovals = 0;
     let classicCodeOwners = false;
     let dismissStaleApprovals = false;
+    if (classicOutput !== null) {
+      try {
+        const row = object(parseJson(classicOutput, "gh api branch protection"), "gh api branch protection");
+        if (hasPinnedCheckIdentity((row.required_status_checks as Record<string, unknown> | null)?.checks, "app_id")) {
+          throw new Error("classic branch protection pins required checks to an unsupported GitHub App identity");
+        }
+        const conversationResolution = typeof row.required_conversation_resolution === "object" && row.required_conversation_resolution !== null
+          ? row.required_conversation_resolution as Record<string, unknown>
+          : {};
+        if (conversationResolution.enabled === true) throw new Error("classic branch protection requires unsupported review-thread resolution");
+        classicChecks = statusCheckNames(row.required_status_checks);
+        const reviews = typeof row.required_pull_request_reviews === "object" && row.required_pull_request_reviews !== null
+          ? row.required_pull_request_reviews as Record<string, unknown>
+          : {};
+        if (reviews.require_last_push_approval === true) throw new Error("classic branch protection requires unsupported last-push approval");
+        classicApprovals = typeof reviews.required_approving_review_count === "number" ? reviews.required_approving_review_count : 0;
+        classicCodeOwners = reviews.require_code_owner_reviews === true;
+        dismissStaleApprovals = reviews.dismiss_stale_reviews === true;
+      } catch (error) {
+        return { known: false, reason: error instanceof Error ? error.message : String(error), retryable: false };
+      }
+    }
 
+    let rulesOutput: string;
     try {
-      const result = await this.#commands.run("gh", ["api", classicPath], { cwd: project.path });
-      const row = object(parseJson(result.stdout, "gh api branch protection"), "gh api branch protection");
-      if (hasPinnedCheckIdentity((row.required_status_checks as Record<string, unknown> | null)?.checks, "app_id")) {
-        throw new Error("classic branch protection pins required checks to an unsupported GitHub App identity");
-      }
-      const conversationResolution = typeof row.required_conversation_resolution === "object" && row.required_conversation_resolution !== null
-        ? row.required_conversation_resolution as Record<string, unknown>
-        : {};
-      if (conversationResolution.enabled === true) {
-        throw new Error("classic branch protection requires unsupported review-thread resolution");
-      }
-      classicChecks = statusCheckNames(row.required_status_checks);
-      const reviews = typeof row.required_pull_request_reviews === "object" && row.required_pull_request_reviews !== null
-        ? row.required_pull_request_reviews as Record<string, unknown>
-        : {};
-      if (reviews.require_last_push_approval === true) {
-        throw new Error("classic branch protection requires unsupported last-push approval");
-      }
-      classicApprovals = typeof reviews.required_approving_review_count === "number"
-        ? reviews.required_approving_review_count
-        : 0;
-      classicCodeOwners = reviews.require_code_owner_reviews === true;
-      dismissStaleApprovals = reviews.dismiss_stale_reviews === true;
+      rulesOutput = (await this.#read(["api", rulesPath], { cwd: project.path })).stdout;
     } catch (error) {
-      if (!isNotFound(error)) return { known: false, reason: error instanceof Error ? error.message : String(error) };
+      return { known: false, reason: error instanceof Error ? error.message : String(error), retryable: true };
     }
 
     try {
-      const result = await this.#commands.run("gh", ["api", rulesPath], { cwd: project.path });
-      const rules = parseJson(result.stdout, "gh api branch rules");
+      const rules = parseJson(rulesOutput, "gh api branch rules");
       if (!Array.isArray(rules)) throw new Error("gh api branch rules returned a non-array value");
       const requiredStatusChecks = [...classicChecks];
       let requiredApprovingReviewCount = classicApprovals;
@@ -483,12 +613,8 @@ export class GitHubClient {
             "dismiss_stale_reviews_on_push", "require_code_owner_review", "require_last_push_approval",
             "required_approving_review_count", "required_review_thread_resolution",
           ]));
-          if (ruleParameterEnabled(parameters, "require_last_push_approval")) {
-            throw new Error("ruleset requires unsupported last-push approval");
-          }
-          if (ruleParameterEnabled(parameters, "required_review_thread_resolution")) {
-            throw new Error("ruleset requires unsupported review-thread resolution");
-          }
+          if (ruleParameterEnabled(parameters, "require_last_push_approval")) throw new Error("ruleset requires unsupported last-push approval");
+          if (ruleParameterEnabled(parameters, "required_review_thread_resolution")) throw new Error("ruleset requires unsupported review-thread resolution");
           if (typeof parameters.required_approving_review_count === "number" && parameters.required_approving_review_count < 0) {
             throw new Error("ruleset has an invalid required approval count");
           }
@@ -500,7 +626,7 @@ export class GitHubClient {
           dismissStale ||= parameters.dismiss_stale_reviews_on_push === true;
         } else if (rule.type === "required_reviewers" || rule.type === "required_review_thread_resolution") {
           throw new Error(`ruleset contains unsupported merge requirement '${String(rule.type)}'`);
-        } else if (rule.type !== "creation" && rule.type !== "deletion") {
+        } else if (rule.type !== "creation" && rule.type !== "deletion" && rule.type !== "non_fast_forward") {
           throw new Error(`ruleset contains unsupported branch rule '${String(rule.type)}'`);
         }
       }
@@ -512,7 +638,7 @@ export class GitHubClient {
         dismissStaleApprovals: dismissStale,
       };
     } catch (error) {
-      return { known: false, reason: error instanceof Error ? error.message : String(error) };
+      return { known: false, reason: error instanceof Error ? error.message : String(error), retryable: false };
     }
   }
 
@@ -522,10 +648,24 @@ export class GitHubClient {
     }
     try {
       const repository = await this.repository(project.baseRemote);
-      await this.#commands.run("gh", [
-        "pr", "merge", String(number), "--repo", repository.nameWithOwner,
-        "--squash", "--match-head-commit", expectedHeadCommit,
-      ], { cwd: project.path });
+      await this.#retry(async () => {
+        await this.#commands.run("gh", [
+          "pr", "merge", String(number), "--repo", repository.nameWithOwner,
+          "--squash", "--match-head-commit", expectedHeadCommit,
+        ], { cwd: project.path });
+      }, async () => {
+        try {
+          const pullRequest = await this.pullRequest(project, number);
+          if (pullRequest.mergedAt && pullRequest.headRefOid.toLowerCase() === expectedHeadCommit.toLowerCase()) {
+            return { type: "done", value: undefined };
+          }
+          return pullRequest.state === "OPEN" && pullRequest.headRefOid.toLowerCase() === expectedHeadCommit.toLowerCase()
+            ? { type: "retry" }
+            : { type: "fail" };
+        } catch {
+          return { type: "fail" };
+        }
+      });
     } catch (error) {
       throw new GitHubMergeError(
         isGitHubAvailabilityFailure(error) ? "unavailable" : "rejected",

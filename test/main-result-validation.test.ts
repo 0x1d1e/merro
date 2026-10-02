@@ -29,7 +29,7 @@ for (const forged of ["implement", "review", "task_id", "schema"] as const) {
     const unexpected = async (): Promise<never> => { throw new Error("unexpected GitHub mutation"); };
     const github: NonNullable<MainOptions["github"]> = {
       repository: async () => repository, repositoryInDirectory: async () => repository,
-      listOpenIssues: async () => [issue], issue: async () => issue,
+      listOpenIssues: async () => [issue], issue: async () => issue, issues: async (_project, numbers) => numbers.map(() => issue),
       createPullRequest: unexpected, pullRequest: unexpected, branchProtection: unexpected,
       hasWritePermission: unexpected, mergeSquash: unexpected, syncPullRequestContent: unexpected,
     };

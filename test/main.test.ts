@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { DEFAULT_CONFIG } from "../src/config.js";
+import { DEFAULT_CONFIG, type MerroConfig } from "../src/config.js";
 import { MerroStore } from "../src/store/store.js";
 import type { Project, Relation } from "../src/domain/model.js";
 import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../src/github/client.js";
@@ -31,7 +31,11 @@ async function approveProposal(tools: Map<string, Parameters<MainToolAPI["regist
 test("combined plan delivers three issues as one change, branch, worker flow and PR without public identifiers", async (t) => {
   const uuid = "04393352-bcf7-4e9b-8f81-ad10d7f60123";
   let rejected = false;
-  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [96, 97, 100] }],
+  const harness = await createHarness(t, {
+    together: true,
+    projects: [{ slug: "kinetix", issueNumbers: [96, 97, 100] }],
+    workerModels: { implement: "anthropic/claude-sonnet-4", review: "openai/gpt-4.1" },
+    workerThinking: { implement: "high", review: "medium" },
     result(input, _number, result) {
       if (input.role === "implement") return { ...result, summary: `Harden plugin lifecycle safety (${input.changeSetId}, ${input.taskId}, ${uuid})`, pr: { title: `Harden plugin lifecycle safety ${uuid}`, body: "untrusted body" } };
       if (!rejected) { rejected = true; return { ...result, status: "reject", findings: [{ severity: "blocking", summary: "Fix unsafe removal" }] }; }
@@ -48,9 +52,16 @@ test("combined plan delivers three issues as one change, branch, worker flow and
   visible.push(JSON.stringify(proposed));
   assert.match(proposed.content[0]!.text, /Branch: chore\/plugin-lifecycle-safety/);
   assert.match(proposed.content[0]!.text, /PRs: 1/);
+  assert.match(proposed.content[0]!.text, /Implementation: one worker per change \(model: anthropic\/claude-sonnet-4, thinking: high\)/);
+  assert.match(proposed.content[0]!.text, /Review: one fresh worker per change \(model: openai\/gpt-4.1, thinking: medium\)/);
   assert.deepEqual((proposed.details as { relations: unknown[] }).relations, []);
+  assert.deepEqual((proposed.details as { workerSettings: unknown }).workerSettings, {
+    implement: { model: "anthropic/claude-sonnet-4", thinking: "high" },
+    review: { model: "openai/gpt-4.1", thinking: "medium" },
+  });
   visible.push(JSON.stringify(await tools.get("merro_start_objective")!.execute("approve", {})));
   assert.equal(harness.launches.length, 1);
+  assert.deepEqual(harness.issueBatches, [{ projectSlug: "kinetix", numbers: [96, 97, 100] }]);
   assert.equal(harness.launches[0]!.clonePath, join(harness.workspacePath, ".wt", "plugin-lifecycle-safety"));
   const restarted = harness.restartMain();
   for (let pass = 0; pass < 5; pass++) await restarted.runPass();
@@ -283,6 +294,7 @@ interface HarnessOptions {
   dismissStaleApprovals?: boolean;
   reviewerWritePermission?: (username: string) => boolean;
   branchPolicyAvailable?: boolean;
+  unsupportedPolicyReason?: string;
   failAfterPullRequestCreate?: boolean;
   remoteBranchExists?: boolean;
   baseMergeConflict?: boolean;
@@ -292,6 +304,7 @@ interface HarnessOptions {
   inspect?: () => Promise<WorkerPresence>;
   stop?: () => Promise<void>;
   issueFailure?: (projectSlug: string, number: number) => boolean;
+  singleIssueFailure?: (projectSlug: string, number: number) => boolean;
   scopeFailure?: (projectSlug: string) => boolean;
   ownedWorkers?: (project: Project) => Promise<OwnedWorker[]>;
   pullRequestFailure?: (number: number) => boolean;
@@ -302,6 +315,8 @@ interface HarnessOptions {
   launchFailure?: boolean | ((input: WorkerLaunchInput) => boolean);
   realWorkerPlan?: boolean;
   notifyCommand?: string;
+  workerModels?: MerroConfig["worker_models"];
+  workerThinking?: MerroConfig["worker_thinking"];
   commands?: import("../src/runtime/commands.js").CommandRunner;
   result?: (input: WorkerLaunchInput, launchNumber: number, defaultResult: Record<string, unknown>) => Record<string, unknown> | null;
 }
@@ -311,6 +326,7 @@ interface MainHarness {
   main: MainOrchestrator;
   projects: Map<string, Project>;
   issues: Map<string, GitHubIssue>;
+  issueBatches: Array<{ projectSlug: string; numbers: number[] }>;
   launches: WorkerLaunchInput[];
   pullRequests: Map<number, GitHubPullRequest>;
   reviewComments: Map<number, string>;
@@ -371,6 +387,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   }
 
   const launches: WorkerLaunchInput[] = [];
+  const issueBatches: Array<{ projectSlug: string; numbers: number[] }> = [];
   const notifications: string[] = [];
   const pullRequests = new Map<number, GitHubPullRequest>();
   let branchPolicyAvailable = options.branchPolicyAvailable ?? true;
@@ -407,10 +424,20 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       return [...issues.values()].filter((candidate) => candidate.url.includes(`/${project.slug}/issues/`));
     },
     async issue(project: Project, number: number) {
+      if (options.singleIssueFailure?.(project.slug, number)) throw new Error(`Single GitHub issue ${number} lookup was not expected`);
       if (options.issueFailure?.(project.slug, number)) throw new Error(`GitHub issue ${number} unavailable`);
       const found = issues.get(`${project.slug}:${number}`);
       if (!found) throw new Error(`issue ${number} not found`);
       return found;
+    },
+    async issues(project: Project, numbers: readonly number[]) {
+      issueBatches.push({ projectSlug: project.slug, numbers: [...numbers] });
+      return numbers.map((number) => {
+        if (options.issueFailure?.(project.slug, number)) throw new Error(`GitHub issue ${number} unavailable`);
+        const found = issues.get(`${project.slug}:${number}`);
+        if (!found) throw new Error(`issue ${number} not found`);
+        return found;
+      });
     },
     async createPullRequest(project: Project, branchName: string, title: string, body: string) {
       const existing = [...pullRequests.values()].find((candidate) => candidate.headRefName === branchName);
@@ -463,7 +490,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     },
     async branchProtection(_project: Project, branchName?: string) {
       branchPolicyBranches.push(branchName ?? _project.defaultBranch);
-      if (!branchPolicyAvailable) return { known: false as const, reason: "policy visibility unavailable" };
+      if (options.unsupportedPolicyReason) return { known: false as const, reason: options.unsupportedPolicyReason, retryable: false };
+      if (!branchPolicyAvailable) return { known: false as const, reason: "policy visibility unavailable", retryable: true };
       return {
         known: true as const,
         requiredStatusChecks: options.requireExternalApproval ? ["CI"] : [],
@@ -627,7 +655,14 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   const Main = options.together ? MainOrchestrator : SeparateChangesMain;
   const createMain = () => new Main({
     workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: options.realWorkerPlan ? "docker" : "none", max_concurrent_tasks: options.maxConcurrentTasks ?? 3, notify_command: options.notifyCommand ?? null },
+    config: {
+      ...DEFAULT_CONFIG,
+      sandbox: options.realWorkerPlan ? "docker" : "none",
+      max_concurrent_tasks: options.maxConcurrentTasks ?? 3,
+      notify_command: options.notifyCommand ?? null,
+      worker_models: options.workerModels ?? DEFAULT_CONFIG.worker_models,
+      worker_thinking: options.workerThinking ?? DEFAULT_CONFIG.worker_thinking,
+    },
     ...(options.commands ? { commands: options.commands } : {}),
     notify: (message) => { notifications.push(message); },
     git,
@@ -643,6 +678,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     main,
     projects,
     issues,
+    issueBatches,
     launches,
     pullRequests,
     reviewComments,
@@ -1002,15 +1038,15 @@ test("scope removal retires merge and conflict Decisions without closing the exi
   }
 });
 
-test("relation analysis failure holds new work until a fresh analysis succeeds", async (t) => {
+test("batched issue lookup failure blocks new work until a fresh reconciliation succeeds", async (t) => {
   let lookups = 0;
-  const harness = await createHarness(t, { issueFailure: () => ++lookups === 2 });
+  const harness = await createHarness(t, { issueFailure: () => ++lookups === 1, singleIssueFailure: () => true });
   await harness.main.startObjective({
-    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
+    goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }],
   });
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
-  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Planned");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.blockedReason, "github_unavailable");
   await harness.restartMain().runPass();
   assert.equal(harness.launches.length, 1);
 });
@@ -1866,6 +1902,65 @@ test("blocked reason follows external PR closure without losing resume state", a
   const item = (await harness.main.statusSnapshot()).changeSets[0]!;
   assert.equal(item.blockedReason, "pr_closed");
   assert.equal(item.blockedResumeState, "AwaitingMerge");
+});
+
+test("unchanged blocked policy is silent across repeated reconciliation passes", async (t) => {
+  const hookEvents: string[] = [];
+  const harness = await createHarness(t, {
+    branchPolicyAvailable: false,
+    notifyCommand: "notify-test",
+    commands: { async run(_file, _args, options) { hookEvents.push(options?.env?.MERRO_EVENT ?? "missing"); return { stdout: "", stderr: "" }; } },
+  });
+  await startDefaultObjective(harness.main);
+  for (let pass = 0; pass < 5; pass++) await harness.main.runPass();
+  const item = (await harness.main.statusSnapshot()).changeSets[0]!;
+  assert.equal(item.state, "Blocked");
+  assert.equal(item.blockedReason, "policy_unknown");
+  const blockedMessages = harness.notifications.filter((message) => message.includes(" blocked\n\n"));
+  assert.equal(blockedMessages.length, 1);
+  assert.deepEqual(hookEvents.filter((event) => event === "blocked"), ["blocked"]);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  const eventCount = (store.snapshot().event_log ?? []).filter((event) => event.event_type === "blocked").length;
+  store.close();
+  for (let pass = 0; pass < 2; pass++) await harness.main.runPass();
+  assert.equal(harness.notifications.filter((message) => message.includes(" blocked\n\n")).length, 1);
+  assert.deepEqual(hookEvents.filter((event) => event === "blocked"), ["blocked"]);
+  const after = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  assert.equal((after.snapshot().event_log ?? []).filter((event) => event.event_type === "blocked").length, eventCount);
+  after.close();
+});
+
+test("changed blocker detail emits a fresh event and notification", async (t) => {
+  const hookEvents: string[] = [];
+  const options: HarnessOptions = {
+    unsupportedPolicyReason: "ruleset contains unsupported rule one",
+    notifyCommand: "notify-test",
+    commands: { async run(_file, _args, commandOptions) { hookEvents.push(commandOptions?.env?.MERRO_EVENT ?? "missing"); return { stdout: "", stderr: "" }; } },
+  };
+  const harness = await createHarness(t, options);
+  await startDefaultObjective(harness.main);
+  for (let pass = 0; pass < 5; pass++) await harness.main.runPass();
+  assert.equal(harness.notifications.filter((message) => message.includes(" blocked\n\n")).length, 1);
+
+  options.unsupportedPolicyReason = "ruleset contains unsupported rule two";
+  await harness.main.runPass();
+
+  assert.equal(harness.notifications.filter((message) => message.includes(" blocked\n\n")).length, 2);
+  assert.deepEqual(hookEvents.filter((event) => event === "blocked"), ["blocked", "blocked"]);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  assert.equal((store.snapshot().event_log ?? []).filter((event) => event.event_type === "blocked").length, 2);
+  store.close();
+});
+
+test("deterministic unsupported policy cannot be retried with /merro-continue", async (t) => {
+  const harness = await createHarness(t, { unsupportedPolicyReason: "ruleset contains unsupported branch rule 'required_deployments'" });
+  await startDefaultObjective(harness.main);
+  for (let pass = 0; pass < 5; pass++) await harness.main.runPass();
+  const item = (await harness.main.statusSnapshot()).changeSets[0]!;
+  assert.equal(item.blockedReason, "policy_unknown");
+  await assert.rejects(harness.main.continueChangeSet(item.slug), /cannot help/);
+  assert.ok(harness.notifications.some((message) => message.includes("/merro-continue cannot retry this deterministic blocker")));
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, "Blocked");
 });
 
 test("notify_command runs for merge-ready, Objective Done, and Blocked, with failures isolated", async (t) => {
@@ -3110,6 +3205,7 @@ test("new Main consumes a healthy worker result after a crash without restarting
       },
       async listOpenIssues() { return [harness.issues.get("example:7")!]; },
       async issue() { return harness.issues.get("example:7")!; },
+      async issues(_project, numbers) { return numbers.map((number) => ({ ...harness.issues.get(`example:${number}`)! })); },
       async createPullRequest() { throw new Error("not reached"); },
       async pullRequest() { throw new Error("not reached"); },
       async syncPullRequestContent() {},

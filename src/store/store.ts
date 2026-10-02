@@ -1184,6 +1184,24 @@ export class MerroStore {
     }
   }
 
+  latestBlock(entityId: string): { reason: string; detail: string; retryable: boolean | null } | null {
+    const row = this.#db.prepare(`
+      SELECT payload_json FROM event_log
+      WHERE entity_type = 'ChangeSet' AND entity_id = ? AND event_type = 'blocked'
+      ORDER BY id DESC LIMIT 1
+    `).get(entityId);
+    if (typeof row?.payload_json !== "string") return null;
+    try {
+      const payload: unknown = JSON.parse(row.payload_json);
+      if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+      const data = payload as Record<string, unknown>;
+      if (typeof data.reason !== "string" || typeof data.detail !== "string") return null;
+      return { reason: data.reason, detail: data.detail, retryable: typeof data.retryable === "boolean" ? data.retryable : null };
+    } catch {
+      return null;
+    }
+  }
+
   appendEvent(entityType: string, entityId: string, eventType: string, payload: unknown): void {
     this.#db.prepare(`
       INSERT INTO event_log(entity_type, entity_id, event_type, payload_json, created_at)

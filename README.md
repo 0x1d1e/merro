@@ -102,7 +102,7 @@ Workers may outlive Main. Reopen Pi in the workspace to reconcile existing worke
 | `/merro-run` | Reconcile and schedule approved work |
 | `/merro-approve [change]` | Approve a pending merge/conflict decision |
 | `/merro-reject [change]` | Reject a merge or abandon conflict resolution |
-| `/merro-continue <change>` | Retry after fixing a blocked cause |
+| `/merro-continue <change>` | Retry a retryable blocker after fixing its cause |
 | `/stop [goal or change]` | Soft-stop Objectives; active Tasks finish |
 | `/unlock` | Clear stale ownership, never bypass live Main |
 | `/merro-export` | Export normal semantic status to `.merro/export.json` |
@@ -118,11 +118,13 @@ Edit `.merro/config.json`, then restart Main. Initial configuration is:
 ```json
 {
   "max_concurrent_tasks": 3,
-  "max_review_rounds": 3
+  "max_review_rounds": 3,
+  "worker_models": { "implement": null, "review": null },
+  "worker_thinking": { "implement": null, "review": null }
 }
 ```
 
-Both limits accept a positive integer or `"unlimited"`. Different changes may implement/review concurrently, but each ChangeSet has at most one active Worker. Hitting the review cap blocks the change; explicit continuation grants another round.
+Both limits accept a positive integer or `"unlimited"`. Set `worker_models` and `worker_thinking` independently for `implement` and `review`; `null` uses Pi's default. Model values are Pi model IDs, and thinking values pass through to Pi's `--thinking` option. Different changes may implement/review concurrently, but each ChangeSet has at most one active Worker. Hitting the review cap blocks the change; explicit continuation grants another round.
 
 Host workers inherit normal HOME, Pi config, auth, models, packages and extensions. Merro adds its lifecycle/result extensions and disables nested Main orchestration in workers. **Host mode is not a security sandbox.** Reviewers must not edit, but host filesystem permissions do not enforce that promise.
 
