@@ -156,6 +156,9 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(imageBuild.args.includes("PI_VERSION=0.99.1"));
   assert.ok(start.args.includes("@merro_owner"));
   assert.ok(start.args.includes("@merro_task_id"));
+  const remainOnExit = start.args.lastIndexOf("remain-on-exit");
+  assert.ok(remainOnExit >= 0);
+  assert.equal(start.args[remainOnExit + 1], "off");
   const owner = (await readFile(join(workspacePath, "workspace-owner"), "utf8")).trim();
   assert.ok(containerArgs.includes(`merro.owner=${owner}`));
   assert.equal(start.args[start.args.indexOf("MERRO_OWNER") + 1], owner);
@@ -571,6 +574,11 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   assert.ok(script.includes(`@${join(clonePath, ".merro-task.md")}`));
   assert.ok(!script.includes("/merro-task/"));
   assert.ok(!script.includes("/work/"));
+  const hostStart = calls.find((call) => call.file === "tmux" && (call.args[0] === "new-session" || call.args[0] === "new-window"));
+  assert.ok(hostStart);
+  const remainOnExit = hostStart.args.lastIndexOf("remain-on-exit");
+  assert.ok(remainOnExit >= 0);
+  assert.equal(hostStart.args[remainOnExit + 1], "on");
 
   const binPath = join(root, "bin");
   const fakePi = join(binPath, "pi");
@@ -598,4 +606,73 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   ]);
   assert.equal(await exists(workerScript), false);
   assert.ok(!calls.some((call) => call.file === "docker"));
+});
+
+
+test("dead host pane preserves exit diagnostics and cleanup removes the retained worker window", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-dead-pane-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspacePath = join(root, "runtime");
+  const clonePath = join(root, "clone");
+  await mkdir(clonePath);
+  let killed = false;
+  const runtime = new WorkerRuntime({
+    workspacePath,
+    config: { ...DEFAULT_CONFIG, sandbox: "none" },
+    commands: {
+      async run(file, args) {
+        assert.equal(file, "tmux");
+        if (args[0] === "display-message") {
+          if (args.at(-1) === "#{pane_id}\t#{window_id}\t#{pane_dead}") {
+            return { stdout: "%7\t@7\t1\n", stderr: "" };
+          }
+          return { stdout: "%7\t321\t1\tpi\tmerro-example\timpl-safety\t@7\t1\t0\t15\n", stderr: "" };
+        }
+        if (args[0] === "show-option") return { stdout: "host-task\n", stderr: "" };
+        if (args[0] === "capture-pane") return { stdout: "reviewer was still working\nlast visible line\n", stderr: "" };
+        if (args[0] === "kill-window") {
+          assert.equal(args.at(-1), "@7");
+          killed = true;
+          return { stdout: "", stderr: "" };
+        }
+        throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+      },
+    },
+  });
+  const record = {
+    ...runtime.plan({
+      taskId: "host-task",
+      changeSetId: "work-1",
+      changeSlug: "safety",
+      taskName: "implement-safety",
+      role: "implement",
+      project: { slug: "example", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" },
+      clonePath,
+      taskFile: "Implement this issue.",
+      expectedCommit: "c".repeat(40),
+      projectSettings: null,
+    }),
+    paneId: "%7",
+    windowId: "@7",
+    processPid: 321,
+    processStartedAt: "2026-01-01T00:00:00.000Z",
+  };
+  await mkdir(join(workspacePath, "tasks", "implement-safety"), { recursive: true });
+
+  const presence = await runtime.inspect(record, "host-task");
+  assert.equal(presence.alive, false);
+  assert.equal(presence.identityMatches, true);
+  assert.equal(presence.exitStatus, 0);
+  assert.equal(presence.exitSignal, 15);
+  assert.match(presence.reason ?? "", /signal 15/);
+  assert.ok(presence.diagnosticPath);
+  const diagnostics = await readFile(presence.diagnosticPath, "utf8");
+  assert.match(diagnostics, /status=0/);
+  assert.match(diagnostics, /signal=15/);
+  assert.match(diagnostics, /reviewer was still working/);
+
+  await runtime.cleanup(record);
+  assert.equal(killed, true);
+  assert.equal(await exists(join(workspacePath, "tasks", "implement-safety")), false);
+  assert.equal(await exists(presence.diagnosticPath), true);
 });

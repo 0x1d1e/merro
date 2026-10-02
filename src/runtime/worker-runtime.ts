@@ -63,6 +63,9 @@ export interface WorkerPresence {
   alive: boolean;
   identityMatches: boolean;
   reason: string | null;
+  exitStatus?: number | null;
+  exitSignal?: number | null;
+  diagnosticPath?: string | null;
 }
 
 export interface WorkerRuntimeOptions {
@@ -93,6 +96,12 @@ export function taskWindowName(role: TaskRole, slug: string): string {
 function missingTmuxTarget(error: unknown): boolean {
   const detail = error instanceof CommandError ? error.stderr : String(error);
   return /no such (?:session|window|pane)|missing (?:session|window|pane)|(?:can't|cannot|could not) find (?:session|window|pane)|no server running|error connecting.*(?:No such file|Connection refused)/i.test(detail);
+}
+
+function optionalTmuxNumber(value: string): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function parseDockerInspect(text: string): Record<string, unknown> {
@@ -344,7 +353,7 @@ export class WorkerRuntime {
         ...sessionMarkers,
         ";", "set-option", "-w", "-t", `${session}:${window}`, "automatic-rename", "off",
         ";", "set-option", "-w", "-t", `${session}:${window}`, "allow-rename", "off",
-        ";", "set-option", "-w", "-t", `${session}:${window}`, "remain-on-exit", "off",
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "remain-on-exit", sandbox === "none" ? "on" : "off",
         ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_task_id", input.taskId,
         ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_work_item_id", input.changeSetId,
         ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_clone_path", resolve(input.clonePath),
@@ -539,22 +548,48 @@ export class WorkerRuntime {
 
     let paneFound = false;
     try {
-      const result = (await this.#commands.run("tmux", [
-        "display-message", "-p", "-t", record.paneId ?? `=${record.tmuxSession}:${record.tmuxWindow}`,
-        "#{pane_id} #{pane_pid} #{pane_dead} #{pane_current_command} #{session_name} #{window_name} #{window_id} #{window_panes}",
-      ])).stdout.trim().split(/\s+/);
-      if (!result[0]) return { alive: false, identityMatches: false, reason: "Worker pane is missing" };
+      const format = [
+        "#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_current_command}", "#{session_name}",
+        "#{window_name}", "#{window_id}", "#{window_panes}", "#{pane_dead_status}", "#{pane_dead_signal}",
+      ].join("\t");
+      const output = (await this.#commands.run("tmux", [
+        "display-message", "-p", "-t", record.paneId ?? `=${record.tmuxSession}:${record.tmuxWindow}`, format,
+      ])).stdout.replace(/\r?\n$/, "");
+      if (!output) return { alive: false, identityMatches: false, reason: "Worker pane is missing" };
       paneFound = true;
-      if (!/^%\d+$/.test(result[0]) || result.length !== 8) throw new Error("Cannot read exact worker pane identity");
-      if (result[2] === "1") return { alive: false, identityMatches: false, reason: "tmux pane process exited" };
+      const result = output.split("\t");
+      if (!/^%\d+$/.test(result[0] ?? "") || result.length !== 10 || !/^[01]$/.test(result[2] ?? "")) {
+        throw new Error("Cannot read exact worker pane identity");
+      }
       const pid = Number(result[1]);
-      const startedAt = record.processStartedAt === null ? null : await this.#hostProcessStartedAt(pid);
       const taskWindowMatches = (await this.#commands.run("tmux", ["show-option", "-wqv", "-t", result[0]!, "@merro_task_id"])).stdout.trim() === taskId;
-      const identityMatches = taskWindowMatches && record.paneId !== null
+      const stableIdentityMatches = taskWindowMatches && record.paneId !== null
         && result[0] === record.paneId
         && result[4] === record.tmuxSession && result[5] === record.tmuxWindow && result[7] === "1"
         && (!record.windowId || result[6] === record.windowId)
-        && (record.processPid === null || pid === record.processPid)
+        && (record.processPid === null || pid === record.processPid);
+      if (result[2] === "1") {
+        const exitStatus = optionalTmuxNumber(result[8] ?? "");
+        const exitSignal = optionalTmuxNumber(result[9] ?? "");
+        const diagnosticPath = stableIdentityMatches
+          ? await this.#retainDeadPaneDiagnostics(record, exitStatus, exitSignal)
+          : null;
+        const exitDetail = exitSignal !== null && exitSignal > 0
+          ? `signal ${exitSignal}`
+          : exitStatus !== null ? `status ${exitStatus}` : "unknown status";
+        return {
+          alive: false,
+          identityMatches: stableIdentityMatches,
+          reason: stableIdentityMatches
+            ? `Worker process exited before submitting a result (${exitDetail})${diagnosticPath ? `; diagnostics retained at ${diagnosticPath}` : ""}`
+            : "Exited worker pane identity does not match the active Task",
+          exitStatus,
+          exitSignal,
+          diagnosticPath,
+        };
+      }
+      const startedAt = record.processStartedAt === null ? null : await this.#hostProcessStartedAt(pid);
+      const identityMatches = stableIdentityMatches
         && (record.processStartedAt === null || startedAt === record.processStartedAt)
         && await this.#foregroundPi(pid, result[3]!);
       return identityMatches
@@ -581,7 +616,58 @@ export class WorkerRuntime {
     await this.#commands.run("tmux", ["kill-window", "-t", record.windowId ?? record.paneId!]);
   }
 
+  async #retainDeadPaneDiagnostics(record: TaskRuntimeRecord, exitStatus: number | null, exitSignal: number | null): Promise<string | null> {
+    if (!record.paneId) return null;
+    let paneOutput = "";
+    try {
+      paneOutput = (await this.#commands.run("tmux", ["capture-pane", "-p", "-S", "-200", "-t", record.paneId])).stdout;
+    } catch (error) {
+      paneOutput = `[capture unavailable: ${String(error)}]\n`;
+    }
+    const directory = join(this.#workspacePath, "diagnostics");
+    const path = join(directory, `${safeName(basename(dirname(record.resultPath)))}.log`);
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(path, [
+        "Merro worker exit diagnostics",
+        `status=${exitStatus ?? "unknown"}`,
+        `signal=${exitSignal && exitSignal > 0 ? exitSignal : "none"}`,
+        "",
+        paneOutput,
+      ].join("\n"), { encoding: "utf8", mode: 0o600 });
+      return path;
+    } catch {
+      return null;
+    }
+  }
+
+  async #cleanupRetainedHostPane(record: TaskRuntimeRecord): Promise<void> {
+    const runtimeKind = record.runtimeKind ?? (record.containerId || this.#config.sandbox === "docker" ? "docker" : "host");
+    if (runtimeKind !== "host" || !record.paneId) return;
+    try {
+      const output = (await this.#commands.run("tmux", [
+        "display-message", "-p", "-t", record.paneId, "#{pane_id}\t#{window_id}\t#{pane_dead}",
+      ])).stdout.replace(/\r?\n$/, "");
+      const parts = output.split("\t");
+      if (parts.length !== 3 || !/^%\d+$/.test(parts[0] ?? "") || !/^@\d+$/.test(parts[1] ?? "") || !/^[01]$/.test(parts[2] ?? "")) {
+        throw new Error("Cannot read retained worker pane identity during cleanup");
+      }
+      const taskWindowMatches = (await this.#commands.run("tmux", [
+        "show-option", "-wqv", "-t", parts[0]!, "@merro_task_id",
+      ])).stdout.trim() === record.taskId;
+      const identityMatches = taskWindowMatches && parts[0] === record.paneId
+        && (!record.windowId || parts[1] === record.windowId);
+      if (!identityMatches) throw new Error(`refusing to clean retained pane for Task ${record.taskId}: identity does not match`);
+      if (parts[2] !== "1") throw new Error(`refusing to clean live worker pane for Task ${record.taskId}`);
+      await this.#commands.run("tmux", ["kill-window", "-t", record.windowId ?? record.paneId]);
+    } catch (error) {
+      if (missingTmuxTarget(error)) return;
+      throw error;
+    }
+  }
+
   async cleanup(record: TaskRuntimeRecord, options: { preserveResult?: boolean; preserveTaskInput?: boolean } = {}): Promise<void> {
+    await this.#cleanupRetainedHostPane(record);
     const scratch = dirname(record.resultPath);
     await this.#makeWritable(scratch);
     if (options.preserveResult) {
