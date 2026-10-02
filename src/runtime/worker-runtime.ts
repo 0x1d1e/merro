@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { type Dirent, existsSync, type Stats } from "node:fs";
 import { chmod, copyFile, link, lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MerroConfig } from "../config.js";
 import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
+import { semanticSlug } from "../domain/names.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
 import { CommandError, type CommandRunner, systemCommandRunner } from "./commands.js";
 import { dockerBindMount } from "./docker-mount.js";
@@ -34,7 +35,9 @@ export interface WorkerDependencyMount {
 
 export interface WorkerLaunchInput {
   taskId: string;
-  workItemId: string;
+  changeSetId: string;
+  changeSlug: string;
+  taskName: string;
   role: TaskRole;
   project: Project;
   clonePath: string;
@@ -48,7 +51,7 @@ export interface WorkerLaunchInput {
 export interface OwnedWorker {
   taskId: string | null;
   projectSlug: string;
-  workItemId: string | null;
+  changeSetId: string | null;
   clonePath: string | null;
   tmuxSession: string | null;
   tmuxWindow: string | null;
@@ -70,7 +73,7 @@ export interface WorkerRuntimeOptions {
 }
 
 function safeName(value: string): string {
-  const name = value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  const name = value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 128);
   if (!name) throw new Error("Task and Project identities must contain a safe tmux name");
   return name;
 }
@@ -83,11 +86,8 @@ function projectSession(project: Project): string {
   return `merro-${safeName(project.slug)}`;
 }
 
-export function taskWindowName(role: TaskRole, workItemId: string): string {
-  const issue = /^[^:]+:issue-(\d+):g\d+$/.exec(workItemId);
-  const local = /^[^:]+:local:(.+):g\d+$/.exec(workItemId);
-  const label = issue?.[1] ?? (local ? `local-${local[1]}` : workItemId);
-  return `${role === "implement" ? "impl" : "rev"}-${safeName(label)}`;
+export function taskWindowName(role: TaskRole, slug: string): string {
+  return `${role === "implement" ? "impl" : "rev"}-${semanticSlug(slug)}`;
 }
 
 function missingTmuxTarget(error: unknown): boolean {
@@ -187,12 +187,12 @@ export class WorkerRuntime {
     if (sandbox === "none" && network === "off") {
       throw new Error("network=off requires Docker sandboxing");
     }
-    const scratchPath = join(this.#workspacePath, "tasks", safeName(input.taskId));
+    const scratchPath = join(this.#workspacePath, "tasks", safeName(input.taskName));
     return {
       taskId: input.taskId,
       runtimeKind: sandbox === "docker" ? "docker" : "host",
       tmuxSession: projectSession(input.project),
-      tmuxWindow: taskWindowName(input.role, input.workItemId),
+      tmuxWindow: taskWindowName(input.role, input.changeSlug),
       paneId: null,
       containerId: null,
       processPid: null,
@@ -225,7 +225,7 @@ export class WorkerRuntime {
     await mkdir(homePath, { recursive: true, mode: 0o700 });
     await taskExcludeFile(input.clonePath);
     await writeFile(taskFilePath, input.taskFile, { encoding: "utf8", mode: 0o600 });
-    await this.#copyPiConfig(scratchConfigPath);
+    if (sandbox === "docker") await this.#copyPiConfig(scratchConfigPath);
     await this.#copyWorkerExtension(extensionRoot);
 
     const environment: Record<string, string> = {
@@ -235,6 +235,7 @@ export class WorkerRuntime {
       MERRO_TASK_ID: input.taskId,
       MERRO_TASK_ROLE: input.role,
       MERRO_RESULT_PATH: join(TASK_MOUNT, ".merro-result.json"),
+      MERRO_TASK_SCRATCH: TASK_MOUNT,
     };
     const workerGithub = input.projectSettings?.workerGithub ?? this.#config.worker_github === "on";
     if (workerGithub) {
@@ -244,12 +245,14 @@ export class WorkerRuntime {
     }
 
     const piArgs = [
-      "pi", "--no-session", "--print", "--extension",
+      "pi", "--no-session", "--tui-mode", "regular", "--approve", "--extension",
       join(TASK_MOUNT, "merro-runtime", "tools", "worker-result.js"),
+      "--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-lifecycle.js"),
       "--", `@${CLONE_MOUNT}/.merro-task.md`,
     ];
-    const cidPath = join(this.#workspacePath, "container-ids", `${safeName(input.taskId)}.cid`);
+    const cidPath = join(this.#workspacePath, "container-ids", `${safeName(input.taskName)}.cid`);
     let paneId: string | null = null;
+    let windowId: string | null = null;
     let containerId: string | null = null;
     let processPid: number | null = null;
     let processStartedAt: string | null = null;
@@ -263,7 +266,7 @@ export class WorkerRuntime {
         const image = await this.#resolveImage(input.project, input.projectSettings);
         await mkdir(dirname(cidPath), { recursive: true, mode: 0o700 });
         await rm(cidPath, { force: true });
-        const environmentPath = join(secretRoot, `${safeName(input.taskId)}.env`);
+        const environmentPath = join(secretRoot, `${safeName(input.taskName)}.env`);
         launchSecretPath = environmentPath;
         await mkdir(secretRoot, { recursive: true, mode: 0o700 });
         await writeFile(environmentPath, `${Object.entries(environment).map(([key, value]) => `${key}=${value}`).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
@@ -280,11 +283,11 @@ export class WorkerRuntime {
         });
         const dockerArgs = [
           "run", "--rm", "--cidfile", cidPath,
-          "--name", `merro-${safeName(input.taskId)}`,
+          "--name", `merro-${safeName(input.taskName)}`, "--interactive", "--tty",
           "--label", `merro.task_id=${input.taskId}`,
           "--label", `merro.project=${input.project.slug}`,
           "--label", `merro.owner=${owner}`,
-          "--label", `merro.work_item_id=${input.workItemId}`,
+          "--label", `merro.work_item_id=${input.changeSetId}`,
           "--label", `merro.clone_path=${resolve(input.clonePath)}`,
           "--user", `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
           "--workdir", CLONE_MOUNT,
@@ -298,26 +301,30 @@ export class WorkerRuntime {
           image,
           ...piArgs,
         ];
-        launchCommand = ["docker", ...dockerArgs].map(shellQuote).join(" ");
+        launchCommand = `exec ${["docker", ...dockerArgs].map(shellQuote).join(" ")}`;
       } else {
+        // Host workers inherit HOME, Pi packages, auth, models, settings, and environment.
+        const { HOME: _home, PI_CODING_AGENT_DIR: _config, ...workerEnvironment } = environment;
+        const inherited = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined
+          && key !== "TMUX" && key !== "TMUX_PANE" && key !== "GH_TOKEN" && key !== "GITHUB_TOKEN"));
         const hostEnvironment = {
-          ...environment,
-          HOME: homePath,
-          PI_CODING_AGENT_DIR: scratchConfigPath,
+          ...inherited as Record<string, string>, ...workerEnvironment,
           MERRO_RESULT_PATH: resultPath,
+          MERRO_TASK_SCRATCH: scratchPath,
         };
         const hostArgs = [
-          "pi", "--no-session", "--print", "--extension",
+          "pi", "--no-session", "--tui-mode", "regular", "--approve", "--extension",
           join(extensionRoot, "tools", "worker-result.js"),
+          "--extension", join(extensionRoot, "tools", "worker-lifecycle.js"),
           "--", `@${taskFilePath}`,
         ];
         const command = hostArgs.map(shellQuote).join(" ");
-        const scriptPath = join(secretRoot, `${safeName(input.taskId)}.sh`);
+        const scriptPath = join(secretRoot, `${safeName(input.taskName)}.sh`);
         launchSecretPath = scriptPath;
         await mkdir(secretRoot, { recursive: true, mode: 0o700 });
         await writeFile(scriptPath, shellScript(hostEnvironment, command), { encoding: "utf8", mode: 0o700 });
         await chmod(scriptPath, 0o700);
-        launchCommand = shellQuote(scriptPath);
+        launchCommand = `exec ${shellQuote(scriptPath)}`;
       }
 
       const existingSession = await this.#sessionExists(session, input.project);
@@ -335,13 +342,18 @@ export class WorkerRuntime {
         "-n", window, "-c", sandbox === "none" ? resolve(input.clonePath) : input.project.path,
         launchCommand,
         ...sessionMarkers,
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "automatic-rename", "off",
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "allow-rename", "off",
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "remain-on-exit", "off",
         ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_task_id", input.taskId,
-        ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_work_item_id", input.workItemId,
+        ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_work_item_id", input.changeSetId,
         ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_clone_path", resolve(input.clonePath),
         ";", "set-option", "-w", "-t", `${session}:${window}`, "@merro_runtime_kind", sandbox === "docker" ? "docker" : "host",
       ]);
       paneId = paneResult.stdout.trim() || null;
-      if (!paneId) throw new Error(`tmux did not return a pane ID for Task ${input.taskId}`);
+      if (!paneId || !/^%\d+$/.test(paneId)) throw new Error("tmux did not return an exact worker pane identity.");
+      windowId = (await this.#commands.run("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"])).stdout.trim();
+      if (!/^@\d+$/.test(windowId)) throw new Error("tmux did not return a stable worker window identity.");
 
       if (sandbox === "docker") {
         containerId = await this.#waitForContainerId(cidPath);
@@ -370,6 +382,7 @@ export class WorkerRuntime {
         tmuxSession: session,
         tmuxWindow: window,
         paneId,
+        windowId,
         containerId,
         processPid,
         processStartedAt,
@@ -381,7 +394,7 @@ export class WorkerRuntime {
         startedAt,
       };
     } catch (error) {
-      const partial = { ...plan, paneId, containerId, processPid, processStartedAt };
+      const partial = { ...plan, paneId, windowId, containerId, processPid, processStartedAt };
       try {
         if (windowLaunchAttempted) {
           const target = paneId ?? `${session}:${window}`;
@@ -395,7 +408,19 @@ export class WorkerRuntime {
             }
             throw killError;
           });
-          await this.stop(partial, input.taskId);
+          if (sandbox === "docker") {
+            try {
+              const container = containerId ?? `merro-${safeName(input.taskName)}`;
+              const inspected = parseDockerInspect((await this.#commands.run("docker", ["inspect", container])).stdout);
+              const labels = (inspected.Config as { Labels?: Record<string, string> } | undefined)?.Labels;
+              if (labels?.["merro.task_id"] !== input.taskId) throw new Error("Cannot verify container ownership during rollback");
+              if ((inspected.State as { Running?: boolean } | undefined)?.Running) {
+                await this.#commands.run("docker", ["stop", "--time", "10", container]);
+              }
+            } catch (rollbackError) {
+              if (!(rollbackError instanceof CommandError && /no such (?:object|container)/i.test(rollbackError.stderr))) throw rollbackError;
+            }
+          }
         }
         await this.cleanup(partial);
       } catch (rollbackError) {
@@ -423,12 +448,12 @@ export class WorkerRuntime {
         if (dead === "1") continue;
         const option = async (name: string): Promise<string | null> =>
           (await this.#commands.run("tmux", ["show-option", "-wqv", "-t", paneId, name])).stdout.replace(/\r?\n$/, "") || null;
-        const [taskId, workItemId, clonePath, kind, window] = await Promise.all([
+        const [taskId, changeSetId, clonePath, kind, window] = await Promise.all([
           option("@merro_task_id"), option("@merro_work_item_id"), option("@merro_clone_path"), option("@merro_runtime_kind"),
           this.#commands.run("tmux", ["display-message", "-p", "-t", paneId, "#{window_name}"]),
         ]);
         dockerPane ||= kind === "docker";
-        workers.push({ taskId, projectSlug: project.slug, workItemId, clonePath,
+        workers.push({ taskId, projectSlug: project.slug, changeSetId, clonePath,
           tmuxSession: session, tmuxWindow: window.stdout.replace(/\r?\n$/, ""), paneId, containerId: null });
       }
     }
@@ -468,7 +493,7 @@ export class WorkerRuntime {
         || recordedRuntimes.some((record) => record.taskId === taskId && record.containerId === inspect.Id));
       if (!legacyOwned && (labels["merro.owner"] !== owner || labels["merro.project"] !== project.slug)) continue;
       if (legacyOwned && labels["merro.project"] && labels["merro.project"] !== project.slug) continue;
-      workers.push({ taskId, projectSlug: project.slug, workItemId: labels["merro.work_item_id"] ?? null,
+      workers.push({ taskId, projectSlug: project.slug, changeSetId: labels["merro.work_item_id"] ?? null,
         clonePath: labels["merro.clone_path"] ?? mounts.find((mount) => mount.Destination === CLONE_MOUNT)?.Source ?? null,
         tmuxSession: null, tmuxWindow: null, paneId: null, containerId });
     }
@@ -478,12 +503,15 @@ export class WorkerRuntime {
   async inspect(record: TaskRuntimeRecord, taskId: string): Promise<WorkerPresence> {
     const runtimeKind = record.runtimeKind ?? (record.containerId || this.#config.sandbox === "docker" ? "docker" : "host");
     if (runtimeKind === "docker") {
-      const container = record.containerId ?? `merro-${safeName(taskId)}`;
+      const container = record.containerId ?? `merro-${safeName(basename(dirname(record.resultPath)))}`;
       let inspect: Record<string, unknown>;
       try {
         inspect = parseDockerInspect((await this.#commands.run("docker", ["inspect", container])).stdout);
       } catch (error) {
-        return { alive: false, identityMatches: false, reason: `Docker container is gone: ${String(error)}` };
+        if (error instanceof CommandError && /no such (?:object|container)/i.test(error.stderr)) {
+          return { alive: false, identityMatches: false, reason: "Worker container is missing" };
+        }
+        throw error;
       }
       const state = typeof inspect.State === "object" && inspect.State !== null
         ? inspect.State as Record<string, unknown>
@@ -502,7 +530,7 @@ export class WorkerRuntime {
       if (!identityMatches) return { alive: true, identityMatches: false, reason: "Docker container identity does not match the active Task" };
       try {
         const output = await this.#commands.run("docker", ["exec", actualId, "sh", "-lc", "tr '\\0' ' ' </proc/1/cmdline"]);
-        if (!output.stdout.includes("pi")) return { alive: true, identityMatches: false, reason: "container PID 1 is not the expected Pi process" };
+        if (!/\b(?:pi|cli\.js)\b/.test(output.stdout) || !output.stdout.includes("--tui-mode regular")) return { alive: true, identityMatches: false, reason: "container PID 1 is not the expected Pi process" };
       } catch (error) {
         return { alive: true, identityMatches: false, reason: `cannot verify Pi process identity: ${String(error)}` };
       }
@@ -512,24 +540,26 @@ export class WorkerRuntime {
     let paneFound = false;
     try {
       const result = (await this.#commands.run("tmux", [
-        "display-message", "-p", "-t", `${record.tmuxSession}:${record.tmuxWindow}`,
-        "#{pane_id} #{pane_pid} #{pane_dead} #{pane_current_command}",
+        "display-message", "-p", "-t", record.paneId ?? `=${record.tmuxSession}:${record.tmuxWindow}`,
+        "#{pane_id} #{pane_pid} #{pane_dead} #{pane_current_command} #{session_name} #{window_name} #{window_id} #{window_panes}",
       ])).stdout.trim().split(/\s+/);
+      if (!result[0]) return { alive: false, identityMatches: false, reason: "Worker pane is missing" };
       paneFound = true;
+      if (!/^%\d+$/.test(result[0]) || result.length !== 8) throw new Error("Cannot read exact worker pane identity");
       if (result[2] === "1") return { alive: false, identityMatches: false, reason: "tmux pane process exited" };
       const pid = Number(result[1]);
       const startedAt = record.processStartedAt === null ? null : await this.#hostProcessStartedAt(pid);
-      const hasProcessIdentity = record.paneId !== null || record.processPid !== null;
-      const taskWindowMatches = hasProcessIdentity || record.tmuxWindow.endsWith(safeName(taskId))
-        || (await this.#commands.run("tmux", ["show-option", "-wqv", "-t", `${record.tmuxSession}:${record.tmuxWindow}`, "@merro_task_id"])).stdout.trim() === taskId;
-      const identityMatches = taskWindowMatches
-        && (record.paneId === null || result[0] === record.paneId)
-        && (record.processPid === null || Number(result[1]) === record.processPid)
+      const taskWindowMatches = (await this.#commands.run("tmux", ["show-option", "-wqv", "-t", result[0]!, "@merro_task_id"])).stdout.trim() === taskId;
+      const identityMatches = taskWindowMatches && record.paneId !== null
+        && result[0] === record.paneId
+        && result[4] === record.tmuxSession && result[5] === record.tmuxWindow && result[7] === "1"
+        && (!record.windowId || result[6] === record.windowId)
+        && (record.processPid === null || pid === record.processPid)
         && (record.processStartedAt === null || startedAt === record.processStartedAt)
-        && (hasProcessIdentity || result[3] === "pi" || result[3] === "node");
+        && await this.#foregroundPi(pid, result[3]!);
       return identityMatches
         ? { alive: true, identityMatches: true, reason: null }
-        : { alive: true, identityMatches: false, reason: `tmux pane identity changed for Task ${taskId}` };
+        : { alive: true, identityMatches: false, reason: "Worker pane or foreground Pi identity is ambiguous; inspect it before retrying." };
     } catch (error) {
       if (paneFound || !missingTmuxTarget(error)) throw error;
       return { alive: false, identityMatches: false, reason: `tmux pane is gone: ${String(error)}` };
@@ -544,11 +574,11 @@ export class WorkerRuntime {
     }
     const runtimeKind = record.runtimeKind ?? (record.containerId || this.#config.sandbox === "docker" ? "docker" : "host");
     if (runtimeKind === "docker") {
-      const container = record.containerId ?? `merro-${safeName(taskId)}`;
+      const container = record.containerId ?? `merro-${safeName(basename(dirname(record.resultPath)))}`;
       await this.#commands.run("docker", ["stop", "--time", "10", container]);
       return;
     }
-    await this.#commands.run("tmux", ["kill-window", "-t", `${record.tmuxSession}:${record.tmuxWindow}`]);
+    await this.#commands.run("tmux", ["kill-window", "-t", record.windowId ?? record.paneId!]);
   }
 
   async cleanup(record: TaskRuntimeRecord, options: { preserveResult?: boolean; preserveTaskInput?: boolean } = {}): Promise<void> {
@@ -567,7 +597,7 @@ export class WorkerRuntime {
     }
     // Main preserves the shared input while a successor Task owns this clone.
     if (!options.preserveTaskInput) await rm(record.taskFilePath, { force: true });
-    const name = safeName(record.taskId);
+    const name = basename(scratch);
     await rm(join(this.#workspacePath, "container-ids", `${name}.cid`), { force: true });
     await rm(join(this.#workspacePath, "launch-secrets", `${name}.env`), { force: true });
     await rm(join(this.#workspacePath, "launch-secrets", `${name}.sh`), { force: true });
@@ -592,12 +622,6 @@ export class WorkerRuntime {
 
   async #copyPiConfig(target: string): Promise<void> {
     await mkdir(target, { recursive: true, mode: 0o700 });
-    if (this.#config.pi_config === "clean") {
-      await copyFile(join(this.#piConfigPath, "auth.json"), join(target, "auth.json")).catch((error: unknown) => {
-        if (typeof error !== "object" || error === null || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      });
-      return;
-    }
     await copyTree(this.#piConfigPath, target, new Set(["sessions", "logs", "cache", "tmp"]));
     await chmod(target, 0o700);
   }
@@ -615,7 +639,32 @@ export class WorkerRuntime {
     }
     await copyFile(workerExtension, join(tools, "worker-result.js"));
     await copyFile(resultProtocol, join(protocol, "result.js"));
+    await copyFile(join(compiledSource, "tools", "worker-lifecycle.js"), join(tools, "worker-lifecycle.js"));
+    await copyFile(join(compiledSource, "protocol", "worker-state.js"), join(protocol, "worker-state.js"));
     await writeFile(join(target, "package.json"), '{"type":"module"}\n', { encoding: "utf8", mode: 0o600 });
+  }
+
+  async #foregroundPi(panePid: number, currentCommand: string): Promise<boolean> {
+    if (!["pi", "node"].includes(currentCommand)) return false;
+    const group = Number((await this.#commands.run("ps", ["-p", String(panePid), "-o", "tpgid="])).stdout.trim());
+    if (!Number.isSafeInteger(group) || group < 1) return false;
+    const output = (await this.#commands.run("ps", ["-eo", "pid=,pgid=,comm=,args="])).stdout;
+    const foreground = output.split("\n").map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line))
+      .filter((row) => row && Number(row[2]) === group);
+    return foreground.filter((row) => row && this.#piCommand(row[3]!, row[4]!)).length === 1;
+  }
+
+  #piCommand(comm: string, args: string): boolean {
+    const argv = args.trim().split(/\s+/);
+    const executable = comm.split("/").at(-1);
+    return executable === "pi" || executable === "node" && Boolean(argv[1]
+      && (/\/(?:pi|pi\.js)$/.test(argv[1]) || /\/pi-coding-agent\/dist\/cli\.js$/.test(argv[1])));
+  }
+
+  async capturePane(record: TaskRuntimeRecord, taskId: string): Promise<string> {
+    const presence = await this.inspect(record, taskId);
+    if (!presence.identityMatches || !presence.alive || !record.paneId) throw new Error("Worker identity is ambiguous; capture refused.");
+    return (await this.#commands.run("tmux", ["capture-pane", "-p", "-t", record.paneId, "-S", "-200"])).stdout;
   }
 
   async #hostProcessStartedAt(pid: number): Promise<string> {

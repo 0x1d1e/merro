@@ -57,7 +57,7 @@ test("owned worker inventory includes live panes, labeled containers, and legacy
   const workers = await runtime.listOwnedWorkers(project);
   assert.deepEqual(workers.map((worker) => worker.taskId), ["pane-task", null, "a-task", "d-task"]);
   assert.equal(workers[0]?.clonePath, "/clone with\na newline");
-  assert.equal(workers[2]?.workItemId, "work-2");
+  assert.equal(workers[2]?.changeSetId, "work-2");
   assert.equal(workers[3]?.clonePath, "/legacy-clone");
   assert.ok(calls.every((call) => !/kill|stop|set-option|new-window|new-session/.test(call)));
 });
@@ -79,10 +79,10 @@ test("refusing an unowned session never stops its existing workers during launch
   t.after(() => rm(root, { recursive: true, force: true }));
   const calls: string[] = [];
   const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), piConfigPath: join(root, "missing"),
-    config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off", pi_config: "clean" }, commands: {
+    config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off" }, commands: {
       async run(file, args) { calls.push(`${file} ${args[0]}`); return { stdout: "", stderr: "" }; },
     } });
-  await assert.rejects(runtime.launch({ taskId: "unowned", workItemId: "work", role: "implement", project,
+  await assert.rejects(runtime.launch({ taskId: "unowned", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement", project,
     clonePath: root, taskFile: "Test", expectedCommit: "a".repeat(40), projectSettings: null }), /unowned tmux session/);
   assert.ok(calls.every((call) => /^tmux (?:has-session|show-option)$/.test(call)));
 });
@@ -91,27 +91,27 @@ test("planned readable tmux window proves Task identity through its ownership ma
   const runtime = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "none" }, commands: {
     async run(file, args) {
       if (file !== "tmux") throw new Error(`unexpected command: ${file}`);
-      if (args[0] === "display-message") return { stdout: "%4 123 0 node", stderr: "" };
+      if (args[0] === "display-message") return { stdout: "%4 123 0 node merro-example impl-safety @4 1", stderr: "" };
       if (args[0] === "show-option") return { stdout: args.at(-1) === "@merro_task_id" ? "task-uuid" : "", stderr: "" };
       throw new Error(`unexpected tmux command: ${args.join(" ")}`);
     },
   } });
-  const record = runtime.plan({ taskId: "task-uuid", workItemId: "example:issue-188:g1", role: "implement",
+  const record = runtime.plan({ taskId: "task-uuid", changeSetId: "example:issue-188:g1", changeSlug: "safety", taskName: "implement-safety", role: "implement",
     project, clonePath: "/clone", taskFile: "Test", expectedCommit: "a".repeat(40), projectSettings: null });
 
-  assert.equal(record.tmuxWindow, "impl-188");
-  assert.deepEqual(await runtime.inspect(record, "task-uuid"), { alive: true, identityMatches: true, reason: null });
+  assert.equal(record.tmuxWindow, "impl-safety");
+  assert.equal((await runtime.inspect(record, "task-uuid")).identityMatches, false);
 });
 
 for (const dead of [false, true]) {
   test(`host process inspection preserves uncertainty and recognizes dead panes (${dead})`, async () => {
     const runtime = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "none" }, commands: {
       async run(file) {
-        if (file === "tmux") return { stdout: `%1 123 ${dead ? "1" : "0"} node`, stderr: "" };
+        if (file === "tmux") return { stdout: `%1 123 ${dead ? "1" : "0"} node merro-example impl-safety @1 1`, stderr: "" };
         throw new Error("ps unavailable");
       },
     } });
-    const record = { ...runtime.plan({ taskId: "host", workItemId: "work", role: "implement", project,
+    const record = { ...runtime.plan({ taskId: "host", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement", project,
       clonePath: "/clone", taskFile: "Test", expectedCommit: "a".repeat(40), projectSettings: null }),
       paneId: "%1", processPid: 123, processStartedAt: "2026-01-01T00:00:00.000Z" };
     if (dead) assert.equal((await runtime.inspect(record, "host")).alive, false);
@@ -270,7 +270,7 @@ for (const identity of ["matching", "wrong-container", "wrong-task"]) {
         Mounts: [{ Source: "/old-workspace/tasks/legacy", Destination: "/merro-task" }],
       }]), stderr: "" };
     } } });
-    const record = { ...runtime.plan({ taskId: identity === "wrong-task" ? "different" : "legacy", workItemId: "work",
+    const record = { ...runtime.plan({ taskId: identity === "wrong-task" ? "different" : "legacy", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety",
       role: "implement", project, clonePath: "/clone", taskFile: "Test", expectedCommit: "a".repeat(40), projectSettings: null }),
       containerId: container(identity === "wrong-container" ? "b" : "a") };
     const workers = await runtime.listOwnedWorkers({ ...project, path: "/moved-source" }, null, [record]);
@@ -289,9 +289,9 @@ for (const identity of ["matching", "wrong-pane", "wrong-pid", "wrong-start", "n
         if (file === "docker") {
           if (args[0] === "inspect") return { stdout: JSON.stringify([{ Id: container(identity === "docker-wrong-id" ? "b" : "a"),
             State: { Running: true }, Config: { Labels: { "merro.task_id": "legacy" } } }]), stderr: "" };
-          return { stdout: args[0] === "exec" ? "pi --print" : "", stderr: "" };
+          return { stdout: args[0] === "exec" ? "pi --tui-mode regular" : "", stderr: "" };
         }
-        if (file === "ps") return { stdout: identity === "wrong-start" ? "Thu Jan 1 00:00:01 2026" : "Thu Jan 1 00:00:00 2026", stderr: "" };
+        if (file === "ps") return { stdout: args.at(-1) === "tpgid=" ? "123" : args[0] === "-eo" ? "123 123 node /usr/bin/node /opt/pi-coding-agent/dist/cli.js" : identity === "wrong-start" ? "Thu Jan 1 00:00:01 2026" : "Thu Jan 1 00:00:00 2026", stderr: "" };
         if (args[0] === "has-session") return { stdout: "", stderr: "" };
         if (args[0] === "show-option") {
           const values: Record<string, string> = { "@merro_owner": sessionOwner, "@merro_project": project.slug,
@@ -302,7 +302,7 @@ for (const identity of ["matching", "wrong-pane", "wrong-pid", "wrong-start", "n
           if (args.includes("merro-example:impl-gone")) throw new Error("no such window");
           return { stdout: args.at(-1) === "#{pane_id}" ? (identity === "wrong-pane" ? "%2" : "%1")
             : args.at(-1) === "#{window_name}" ? "impl-legacy"
-            : `%1 ${identity === "wrong-pid" ? "999" : "123"} ${identity === "dead" ? "1" : "0"} node`, stderr: "" };
+            : `%1 ${identity === "wrong-pid" ? "999" : "123"} ${identity === "dead" ? "1" : "0"} node merro-example impl-safety @1 1`, stderr: "" };
         }
         if (args[0] === "set-option") {
           sessionOwner = args[args.indexOf("@merro_owner") + 1]!;
@@ -314,7 +314,7 @@ for (const identity of ["matching", "wrong-pane", "wrong-pid", "wrong-start", "n
         throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
       },
     } });
-    const record = { ...runtime.plan({ taskId: "legacy", workItemId: "work", role: "implement", project,
+    const record = { ...runtime.plan({ taskId: "legacy", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement", project,
       clonePath: "/clone", taskFile: "Test", expectedCommit: "a".repeat(40), projectSettings: null }),
       runtimeKind: identity.startsWith("docker-") ? "docker" as const : "host" as const,
       containerId: identity === "docker-matching" || identity === "docker-wrong-id" ? container("a") : null,

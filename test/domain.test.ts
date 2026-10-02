@@ -1,17 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { Relation, WorkItem } from "../src/domain/model.js";
+import type { Relation, ChangeSet } from "../src/domain/model.js";
 import { parseObjectiveIssueScopes } from "../src/domain/objective.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../src/domain/relations.js";
 import { schedule } from "../src/domain/scheduler.js";
-import { assertWorkItemTransition } from "../src/domain/work-item.js";
+import { assertChangeSetTransition } from "../src/domain/change-set.js";
 
-function item(id: string, state: WorkItem["state"], priority: WorkItem["priority"] = "normal", readySince = "2026-01-01T00:00:00Z"): WorkItem {
+function item(id: string, state: ChangeSet["state"], priority: ChangeSet["priority"] = "normal", readySince = "2026-01-01T00:00:00Z"): ChangeSet {
   return {
     id,
     projectSlug: "p",
-    sourceType: "issue",
-    sourceRef: id,
+    slug: id,
+    issues: [],
     generation: 1,
     state,
     priority,
@@ -42,25 +42,25 @@ test("Objective issue scopes cover exactly the normalized linked Project set", (
   assert.deepEqual(parseObjectiveIssueScopes([{ projectSlug: "api", numbers: [] }], ["api"], { allowEmptyFixedSelections: true }), [{ projectSlug: "api", numbers: [] }]);
 });
 
-test("terminal WorkItems cannot reactivate", () => {
-  assert.throws(() => assertWorkItemTransition("Done", "Ready"), /invalid WorkItem transition/);
-  assert.doesNotThrow(() => assertWorkItemTransition("Reviewing", "Implementing"));
-  assert.doesNotThrow(() => assertWorkItemTransition("AwaitingMerge", "Done"));
+test("terminal ChangeSets cannot reactivate", () => {
+  assert.throws(() => assertChangeSetTransition("Done", "Ready"), /invalid ChangeSet transition/);
+  assert.doesNotThrow(() => assertChangeSetTransition("Reviewing", "Implementing"));
+  assert.doesNotThrow(() => assertChangeSetTransition("AwaitingMerge", "Done"));
 });
 
-test("unfinished WorkItems can become Obsolete when no Objective owns them", () => {
-  assert.doesNotThrow(() => assertWorkItemTransition("Implementing", "Obsolete"));
-  assert.doesNotThrow(() => assertWorkItemTransition("Reviewing", "Obsolete"));
-  assert.doesNotThrow(() => assertWorkItemTransition("AwaitingMerge", "Obsolete"));
-  assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Obsolete"));
-  assert.doesNotThrow(() => assertWorkItemTransition("AwaitingMerge", "Implementing"));
+test("unfinished ChangeSets can become Obsolete when no Objective owns them", () => {
+  assert.doesNotThrow(() => assertChangeSetTransition("Implementing", "Obsolete"));
+  assert.doesNotThrow(() => assertChangeSetTransition("Reviewing", "Obsolete"));
+  assert.doesNotThrow(() => assertChangeSetTransition("AwaitingMerge", "Obsolete"));
+  assert.doesNotThrow(() => assertChangeSetTransition("Blocked", "Obsolete"));
+  assert.doesNotThrow(() => assertChangeSetTransition("AwaitingMerge", "Implementing"));
 });
 
-test("Blocked WorkItems resume only to their persisted previous flow state", () => {
-  assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Ready", "Ready"));
-  assert.throws(() => assertWorkItemTransition("Blocked", "Reviewing", "Ready"), /invalid WorkItem transition/);
-  assert.throws(() => assertWorkItemTransition("Blocked", "Planned", null), /invalid WorkItem transition/);
-  assert.doesNotThrow(() => assertWorkItemTransition("Blocked", "Cancelled", "Ready"));
+test("Blocked ChangeSets resume only to their persisted previous flow state", () => {
+  assert.doesNotThrow(() => assertChangeSetTransition("Blocked", "Ready", "Ready"));
+  assert.throws(() => assertChangeSetTransition("Blocked", "Reviewing", "Ready"), /invalid ChangeSet transition/);
+  assert.throws(() => assertChangeSetTransition("Blocked", "Planned", null), /invalid ChangeSet transition/);
+  assert.doesNotThrow(() => assertChangeSetTransition("Blocked", "Cancelled", "Ready"));
 });
 
 test("Conflicts are canonicalized symmetrically", () => {
@@ -70,8 +70,8 @@ test("Conflicts are canonicalized symmetrically", () => {
 });
 
 test("issue relation analysis accepts affirmative references and rejects speculative or quoted evidence", () => {
-  const source = { ...item("source", "Planned"), sourceRef: "8" };
-  const target = { ...item("target", "Ready"), sourceRef: "7" };
+  const source = { ...item("source", "Planned"), issues: [{ projectSlug: "p", number: 8 }] };
+  const target = { ...item("target", "Ready"), issues: [{ projectSlug: "p", number: 7 }] };
   for (const body of ["Requires #7", "Depends on: #7", "Blocked by #7", "#8 requires #7"]) {
     assert.equal(analyzeIssueRelations(source, { title: "Work", body }, [source, target]).relations[0]?.to, target.id);
   }
@@ -81,14 +81,14 @@ test("issue relation analysis accepts affirmative references and rejects specula
   }
   const newer = { ...target, id: "newer", generation: 2 };
   assert.equal(analyzeIssueRelations(source, { title: "Work", body: "Requires #7" }, [source, target, newer]).relations[0]?.to, "newer");
-  assert.deepEqual(analyzeIssueRelations(source, { title: "Work", body: "Requires #99 and #8" }, [source, target]).unresolved, ["#99", "#8"]);
+  assert.deepEqual(analyzeIssueRelations(source, { title: "Work", body: "Requires #99 and #8" }, [source, target]).unresolved, ["#99"]);
   const crossProject = { ...target, projectSlug: "q" };
   assert.equal(analyzeIssueRelations(source, { title: "Work", body: "Requires q#7" }, [source, crossProject]).relations[0]?.to, target.id);
 });
 
 test("relation inference distinguishes conditional clauses, quotations, and apostrophes", () => {
-  const source = { ...item("source", "Planned"), sourceRef: "8" };
-  const target = { ...item("target", "Ready"), sourceRef: "7" };
+  const source = { ...item("source", "Planned"), issues: [{ projectSlug: "p", number: 8 }] };
+  const target = { ...item("target", "Ready"), issues: [{ projectSlug: "p", number: 7 }] };
   for (const body of ["Requires #7 if optional mode is enabled", "Depends on #7 unless compatibility mode is disabled",
     "Requires #99 if optional mode is enabled", '"Requires #99"', "'Requires #99'", '"Requires #99 because it\'s shared"',
     "'Requires #99 because it's shared'", 'Requires "#99"', "Requires '#99'", "If enabled, requires #99.",
@@ -117,7 +117,7 @@ test("Requires cycles are detected", () => {
 
 test("scheduler blocks dependents until prerequisite is Done", () => {
   const result = schedule({
-    workItems: [item("dependent", "Ready"), item("base", "AwaitingMerge")],
+    changeSets: [item("dependent", "Ready"), item("base", "AwaitingMerge")],
     relations: [requires("dependent", "base")],
     activeTaskCount: 0,
     maxConcurrentTasks: 3,
@@ -133,7 +133,7 @@ test("scheduler orders priority, downstream unblock count, age, then ID", () => 
     item("child", "Planned"),
   ];
   const result = schedule({
-    workItems: items,
+    changeSets: items,
     relations: [requires("child", "high-root")],
     activeTaskCount: 0,
     maxConcurrentTasks: 2,
@@ -141,9 +141,9 @@ test("scheduler orders priority, downstream unblock count, age, then ID", () => 
   assert.deepEqual(result.selected.map((entry) => entry.id), ["high-root", "high-leaf"]);
 });
 
-test("scheduler never selects conflicting Ready WorkItems together", () => {
+test("scheduler never selects conflicting Ready ChangeSets together", () => {
   const result = schedule({
-    workItems: [
+    changeSets: [
       item("first", "Ready", "high", "2026-01-01T00:00:00Z"),
       item("second", "Ready", "high", "2026-01-02T00:00:00Z"),
     ],
@@ -154,9 +154,9 @@ test("scheduler never selects conflicting Ready WorkItems together", () => {
   assert.deepEqual(result.selected.map((entry) => entry.id), ["first"]);
 });
 
-test("scheduler blocks a conflict against an already active WorkItem", () => {
+test("scheduler blocks a conflict against an already active ChangeSet", () => {
   const result = schedule({
-    workItems: [item("ready", "Ready"), item("active", "Implementing")],
+    changeSets: [item("ready", "Ready"), item("active", "Implementing")],
     relations: [conflicts("ready", "active")],
     activeTaskCount: 1,
     maxConcurrentTasks: 2,
@@ -166,7 +166,7 @@ test("scheduler blocks a conflict against an already active WorkItem", () => {
 
 test("Requires cycle does not stall unrelated Ready work", () => {
   const result = schedule({
-    workItems: [item("a", "Ready"), item("b", "Ready"), item("unrelated", "Ready")],
+    changeSets: [item("a", "Ready"), item("b", "Ready"), item("unrelated", "Ready")],
     relations: [requires("a", "b"), requires("b", "a")],
     activeTaskCount: 0,
     maxConcurrentTasks: 3,

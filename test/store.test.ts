@@ -18,8 +18,8 @@ function makeStore(): MerroStore {
 test("store enforces one non-terminal generation per source", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({ id: "p:issue-1:g1", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 1, state: "Ready", priority: "normal", readySince: "2026-01-01T00:00:00Z", blockedReason: null, blockedResumeState: null });
-    assert.throws(() => store.createWorkItem({ id: "p:issue-1:g2", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null }));
+    store.createChangeSet({ id: "p:issue-1:g1", projectSlug: "p", slug: "first-change", issues: [{ projectSlug: "p", number: 1 }], generation: 1, state: "Ready", priority: "normal", readySince: "2026-01-01T00:00:00Z", blockedReason: null, blockedResumeState: null });
+    assert.throws(() => store.createChangeSet({ id: "p:issue-1:g2", projectSlug: "p", slug: "second-change", issues: [{ projectSlug: "p", number: 1 }], generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null }));
   } finally {
     store.close();
   }
@@ -28,23 +28,23 @@ test("store enforces one non-terminal generation per source", () => {
 test("terminal generation allows a fresh generation", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({ id: "p:issue-1:g1", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 1, state: "AwaitingMerge", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
-    store.transitionWorkItem("p:issue-1:g1", "Done");
-    store.createWorkItem({ id: "p:issue-1:g2", projectSlug: "p", sourceType: "issue", sourceRef: "1", generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
-    assert.equal(store.getWorkItem("p:issue-1:g2")?.generation, 2);
+    store.createChangeSet({ id: "p:issue-1:g1", projectSlug: "p", slug: "first-change", issues: [{ projectSlug: "p", number: 1 }], generation: 1, state: "AwaitingMerge", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
+    store.transitionChangeSet("p:issue-1:g1", "Done");
+    store.createChangeSet({ id: "p:issue-1:g2", projectSlug: "p", slug: "second-change", issues: [{ projectSlug: "p", number: 1 }], generation: 2, state: "Planned", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
+    assert.equal(store.getChangeSet("p:issue-1:g2")?.generation, 2);
   } finally {
     store.close();
   }
 });
 
-test("external PR merge completes a blocked WorkItem regardless of its resume state", () => {
+test("external PR merge completes a blocked ChangeSet regardless of its resume state", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({
+    store.createChangeSet({
       id: "blocked-implement",
       projectSlug: "p",
-      sourceType: "issue",
-      sourceRef: "8",
+      slug: "blocked-implement",
+      issues: [{ projectSlug: "p", number: 8 }],
       generation: 1,
       state: "Implementing",
       priority: "normal",
@@ -52,33 +52,33 @@ test("external PR merge completes a blocked WorkItem regardless of its resume st
       blockedReason: null,
       blockedResumeState: null,
     });
-    store.transitionWorkItem("blocked-implement", "Blocked", "task_failed");
+    store.transitionChangeSet("blocked-implement", "Blocked", "task_failed");
 
-    store.completeWorkItemAfterExternalMerge("blocked-implement");
+    store.completeChangeSetAfterExternalMerge("blocked-implement");
 
-    assert.equal(store.getWorkItem("blocked-implement")?.state, "Done");
+    assert.equal(store.getChangeSet("blocked-implement")?.state, "Done");
   } finally {
     store.close();
   }
 });
 
-test("store enforces one active Task per WorkItem and immutable finalization", () => {
+test("store enforces one active Task per ChangeSet and immutable finalization", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({ id: "w", projectSlug: "p", sourceType: "local", sourceRef: "w", generation: 1, state: "Implementing", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
-    store.createTask({ id: "t1", workItemId: "w", role: "implement", attempt: 1 });
-    assert.throws(() => store.createTask({ id: "t2", workItemId: "w", role: "review", attempt: 1 }));
-    assert.throws(() => store.transitionWorkItem("w", "Obsolete"), /active Task/);
+    store.createChangeSet({ id: "w", projectSlug: "p", slug: "work", issues: [], generation: 1, state: "Implementing", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
+    store.createTask({ id: "t1", changeSetId: "w", role: "implement", attempt: 1 });
+    assert.throws(() => store.createTask({ id: "t2", changeSetId: "w", role: "review", attempt: 1 }));
+    assert.throws(() => store.transitionChangeSet("w", "Obsolete"), /active Task/);
     store.finalizeTask({ id: "t1", outcome: "success", summary: "done", resultJson: "{}", commitSha: "abc" });
     assert.equal(store.getTask("t1")?.outcome, "success");
-    store.transitionWorkItem("w", "Obsolete");
+    store.transitionChangeSet("w", "Obsolete");
     assert.throws(() => store.finalizeTask({ id: "t1", outcome: "failed", summary: "changed", resultJson: "{}" }), /already finalized/);
   } finally {
     store.close();
   }
 });
 
-test("SQLite trigger protects terminal WorkItem core fields", () => {
+test("SQLite trigger protects terminal ChangeSet core fields", () => {
   const db = new DatabaseSync(":memory:");
   try {
     db.exec(MIGRATION_1);
@@ -112,11 +112,11 @@ test("SQLite trigger protects terminal WorkItem core fields", () => {
 test("Blocked transition requires a typed reason and resumes only to the previous flow state", () => {
   const store = makeStore();
   try {
-    store.createWorkItem({
+    store.createChangeSet({
       id: "blocked",
       projectSlug: "p",
-      sourceType: "issue",
-      sourceRef: "2",
+      slug: "blocked",
+      issues: [{ projectSlug: "p", number: 2 }],
       generation: 1,
       state: "Ready",
       priority: "normal",
@@ -125,21 +125,21 @@ test("Blocked transition requires a typed reason and resumes only to the previou
       blockedResumeState: null,
     });
 
-    assert.throws(() => store.transitionWorkItem("blocked", "Blocked"), /requires a BlockReason/);
+    assert.throws(() => store.transitionChangeSet("blocked", "Blocked"), /requires a BlockReason/);
 
-    store.transitionWorkItem("blocked", "Blocked", "task_failed");
-    const blocked = store.getWorkItem("blocked");
+    store.transitionChangeSet("blocked", "Blocked", "task_failed");
+    const blocked = store.getChangeSet("blocked");
     assert.equal(blocked?.state, "Blocked");
     assert.equal(blocked?.blockedReason, "task_failed");
     assert.equal(blocked?.blockedResumeState, "Ready");
 
     assert.throws(
-      () => store.transitionWorkItem("blocked", "Reviewing"),
-      /invalid WorkItem transition/,
+      () => store.transitionChangeSet("blocked", "Reviewing"),
+      /invalid ChangeSet transition/,
     );
 
-    store.transitionWorkItem("blocked", "Ready");
-    const resumed = store.getWorkItem("blocked");
+    store.transitionChangeSet("blocked", "Ready");
+    const resumed = store.getChangeSet("blocked");
     assert.equal(resumed?.state, "Ready");
     assert.equal(resumed?.blockedReason, null);
     assert.equal(resumed?.blockedResumeState, null);
@@ -149,7 +149,7 @@ test("Blocked transition requires a typed reason and resumes only to the previou
   }
 });
 
-test("SQLite rejects Blocked WorkItems without reason and resume state", () => {
+test("SQLite rejects Blocked ChangeSets without reason and resume state", () => {
   const db = new DatabaseSync(":memory:");
   try {
     db.exec(MIGRATION_1);
@@ -342,7 +342,7 @@ test("v11 finalized Tasks enter cleanup once and retain immutable history across
   } finally { database.close(); }
 });
 
-test("store migrates v1 state without losing WorkItems", async (t) => {
+test("store migrates v1 state without losing ChangeSets", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "merro-migration-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const path = join(directory, "state.db");
@@ -366,7 +366,7 @@ test("store migrates v1 state without losing WorkItems", async (t) => {
 
   const store = new MerroStore(path);
   try {
-    assert.equal(store.getWorkItem("legacy")?.state, "Ready");
+    assert.equal(store.getChangeSet("legacy")?.state, "Ready");
   } finally {
     store.close();
   }

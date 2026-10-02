@@ -12,8 +12,8 @@ function item(id: string) {
   return {
     id,
     projectSlug: "p",
-    sourceType: "issue" as const,
-    sourceRef: id,
+    slug: id,
+    issues: [],
     generation: 1,
     state: "Ready" as const,
     priority: "normal" as const,
@@ -52,8 +52,8 @@ test("objectives preserve linked Projects and per-Objective review limits", () =
 test("cleanup completion retires finalized runtime records without changing Task history", () => {
   const store = makeStore();
   try {
-    store.createWorkItem(item("a"));
-    store.createWorkItem(item("b"));
+    store.createChangeSet(item("a"));
+    store.createChangeSet(item("b"));
     const runtime = {
       runtimeKind: "host" as const, tmuxSession: "merro-p", tmuxWindow: "impl-a", paneId: "%1",
       containerId: null, processPid: 1, processStartedAt: "2026-01-01T00:00:00Z",
@@ -62,12 +62,12 @@ test("cleanup completion retires finalized runtime records without changing Task
     };
     for (let index = 0; index < 100; index++) {
       const id = `cleaned-${index}`;
-      store.createTask({ id, workItemId: "a", role: "implement", attempt: index + 1, runtime: { ...runtime, taskId: id } });
+      store.createTask({ id, changeSetId: "a", role: "implement", attempt: index + 1, runtime: { ...runtime, taskId: id } });
       store.finalizeTask({ id, outcome: "failed", summary: "Finished", resultJson: "{}" });
       store.markTaskCleanupCompleted(id);
     }
-    store.createTask({ id: "pending", workItemId: "a", role: "implement", attempt: 101, runtime: { ...runtime, taskId: "pending" } });
-    store.createTask({ id: "no-runtime", workItemId: "b", role: "implement", attempt: 1 });
+    store.createTask({ id: "pending", changeSetId: "a", role: "implement", attempt: 101, runtime: { ...runtime, taskId: "pending" } });
+    store.createTask({ id: "no-runtime", changeSetId: "b", role: "implement", attempt: 1 });
     store.finalizeTask({ id: "no-runtime", outcome: "failed", summary: "No runtime", resultJson: "{}" });
     assert.equal(store.listTasksPendingCleanup().length, 0);
     assert.deepEqual(store.listActiveTaskInputPaths(), [runtime.taskFilePath]);
@@ -94,8 +94,8 @@ test("cleanup completion retires finalized runtime records without changing Task
 test("automatic relation rebuild preserves manual evidence and effective Requires precedence", () => {
   const store = makeStore();
   try {
-    store.createWorkItem(item("a"));
-    store.createWorkItem(item("b"));
+    store.createChangeSet(item("a"));
+    store.createChangeSet(item("b"));
     const manual = { kind: "Requires" as const, from: "a", to: "b", confidence: "explicit" as const, rationale: "Approved", evidence: "User" };
     const inferred = { ...manual, confidence: "high" as const, rationale: "Inferred", evidence: "Requires #7" };
     store.replaceRelations([manual]);
@@ -116,11 +116,11 @@ for (const activeEndpoint of ["a", "b"]) {
   test(`automatic conflicts touching active ${activeEndpoint} survive successful analysis until finalization`, () => {
     const store = makeStore();
     try {
-      store.createWorkItem(item("a"));
-      store.createWorkItem(item("b"));
+      store.createChangeSet(item("a"));
+      store.createChangeSet(item("b"));
       const conflict = { kind: "Conflicts" as const, from: "a", to: "b", confidence: "high" as const, rationale: "Scoped conflict", evidence: "Conflicts with #8" };
       store.rebuildAutomaticRelations(["a", "b"], [conflict]);
-      store.createTask({ id: "running", workItemId: activeEndpoint, role: "implement", attempt: 1 });
+      store.createTask({ id: "running", changeSetId: activeEndpoint, role: "implement", attempt: 1 });
       store.rebuildAutomaticRelations(["a", "b"], []);
       assert.deepEqual(store.listRelations(), [conflict]);
       store.finalizeTask({ id: "running", outcome: "failed", summary: "Finished", resultJson: "{}" });
@@ -134,8 +134,8 @@ for (const occupiedEndpoint of ["a", "b"]) {
   test(`automatic conflicts touching orphan ${occupiedEndpoint} survive successful analysis until exit`, () => {
     const store = makeStore();
     try {
-      store.createWorkItem(item("a"));
-      store.createWorkItem(item("b"));
+      store.createChangeSet(item("a"));
+      store.createChangeSet(item("b"));
       const conflict = { kind: "Conflicts" as const, from: "a", to: "b", confidence: "high" as const,
         rationale: "Scoped conflict", evidence: "Conflicts with #8" };
       store.rebuildAutomaticRelations(["a", "b"], [conflict]);
@@ -150,8 +150,8 @@ for (const occupiedEndpoint of ["a", "b"]) {
 test("runtime metadata, relation history, and Decisions survive store round trips", () => {
   const store = makeStore();
   try {
-    store.createWorkItem(item("a"));
-    store.createWorkItem(item("b"));
+    store.createChangeSet(item("a"));
+    store.createChangeSet(item("b"));
     store.replaceRelations([{
       kind: "Requires",
       from: "a",
@@ -165,8 +165,8 @@ test("runtime metadata, relation history, and Decisions survive store round trip
     assert.equal(store.listRelations().length, 0);
     assert.equal(store.listRelations(true).length, 1);
 
-    store.saveWorkItemRuntime({
-      workItemId: "a",
+    store.saveChangeSetRuntime({
+      changeSetId: "a",
       branchName: "fix/a",
       clonePath: "/tmp/a",
       baseCommit: "abc",
@@ -185,10 +185,10 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       lastReworkTrigger: null,
       lastReconciledAt: null,
     });
-    assert.equal(store.getWorkItemRuntime("a")?.implementationAttempt, 2);
-    assert.deepEqual(store.getWorkItemRuntime("a")?.baseUpdate, { baseRefName: "release", baseCommit: "d".repeat(40) });
+    assert.equal(store.getChangeSetRuntime("a")?.implementationAttempt, 2);
+    assert.deepEqual(store.getChangeSetRuntime("a")?.baseUpdate, { baseRefName: "release", baseCommit: "d".repeat(40) });
 
-    store.createTask({ id: "t1", workItemId: "a", role: "implement", attempt: 1 });
+    store.createTask({ id: "t1", changeSetId: "a", role: "implement", attempt: 1 });
     store.saveTaskRuntime({
       taskId: "t1",
       runtimeKind: "docker",
@@ -210,7 +210,7 @@ test("runtime metadata, relation history, and Decisions survive store round trip
 
     store.createDecision({
       id: "d1",
-      subjectType: "WorkItem",
+      subjectType: "ChangeSet",
       subjectId: "a",
       kind: "merge",
       payload: { pullRequest: 4 },
@@ -218,7 +218,7 @@ test("runtime metadata, relation history, and Decisions survive store round trip
     assert.equal(store.pendingDecisions()[0]?.id, "d1");
     assert.throws(() => store.createDecision({
       id: "d2",
-      subjectType: "WorkItem",
+      subjectType: "ChangeSet",
       subjectId: "a",
       kind: "merge",
       payload: {},

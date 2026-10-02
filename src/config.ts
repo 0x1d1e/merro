@@ -6,11 +6,9 @@ export interface MerroConfig {
   version: 1;
   max_concurrent_tasks: number | "unlimited";
   max_review_rounds: number | "unlimited";
-  pi_config: "copy" | "clean";
   sandbox: "docker" | "none";
   network: "on" | "off";
   worker_github: "on" | "off";
-  work_root: string | null;
   notify_command: string | null;
 }
 
@@ -18,11 +16,9 @@ export const DEFAULT_CONFIG: Readonly<MerroConfig> = {
   version: 1,
   max_concurrent_tasks: 3,
   max_review_rounds: 3,
-  pi_config: "copy",
-  sandbox: "docker",
+  sandbox: "none",
   network: "on",
   worker_github: "on",
-  work_root: null,
   notify_command: null,
 };
 
@@ -31,7 +27,9 @@ export function validateConfig(value: unknown): MerroConfig {
     throw new Error("Merro config must be an object");
   }
   const input = value as Record<string, unknown>;
-  const merged = { ...DEFAULT_CONFIG, ...input } as Record<string, unknown>;
+  // Deprecated clone-root settings are read only for persisted-config migration.
+  const { work_root: _oldRoot, pi_config: _oldPiConfig, ...current } = input;
+  const merged = { ...DEFAULT_CONFIG, ...current } as Record<string, unknown>;
 
   if (merged.version !== 1) throw new Error(`unsupported Merro config version: ${String(merged.version)}`);
   const concurrency = merged.max_concurrent_tasks;
@@ -42,11 +40,9 @@ export function validateConfig(value: unknown): MerroConfig {
   if (rounds !== "unlimited" && (!Number.isInteger(rounds) || Number(rounds) < 1)) {
     throw new Error("max_review_rounds must be a positive integer or unlimited");
   }
-  if (merged.pi_config !== "copy" && merged.pi_config !== "clean") throw new Error("pi_config must be copy or clean");
   if (merged.sandbox !== "docker" && merged.sandbox !== "none") throw new Error("sandbox must be docker or none");
   if (merged.network !== "on" && merged.network !== "off") throw new Error("network must be on or off");
   if (merged.worker_github !== "on" && merged.worker_github !== "off") throw new Error("worker_github must be on or off");
-  if (merged.work_root !== null && typeof merged.work_root !== "string") throw new Error("work_root must be a string or null");
   if (merged.notify_command !== null && typeof merged.notify_command !== "string") throw new Error("notify_command must be a string or null");
 
   return merged as unknown as MerroConfig;
@@ -58,7 +54,7 @@ export async function loadConfig(path: string): Promise<MerroConfig> {
     text = await readFile(path, "utf8");
   } catch (error) {
     if (typeof error !== "object" || error === null || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return saveConfig(path, DEFAULT_CONFIG);
+    throw new Error("Merro workspace config is missing. Run /merro init.");
   }
   return validateConfig(JSON.parse(text) as unknown);
 }

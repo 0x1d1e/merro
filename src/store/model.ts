@@ -16,8 +16,8 @@ export interface ObjectiveSettingsRecord {
   maxReviewRounds: ReviewRoundLimit | null;
 }
 
-export interface WorkItemRuntimeRecord {
-  workItemId: string;
+export interface ChangeSetRuntimeRecord {
+  changeSetId: string;
   branchName: string | null;
   clonePath: string | null;
   // Last base verified in this branch, not the latest observed GitHub tip.
@@ -39,7 +39,7 @@ export interface WorkItemRuntimeRecord {
 }
 
 export interface FinalSummaryRecord {
-  workItemId: string;
+  changeSetId: string;
   payload: unknown;
   createdAt: string;
 }
@@ -50,6 +50,7 @@ export interface TaskRuntimeRecord {
   tmuxSession: string;
   tmuxWindow: string;
   paneId: string | null;
+  windowId?: string | null;
   containerId: string | null;
   processPid: number | null;
   processStartedAt: string | null;

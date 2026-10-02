@@ -1,73 +1,73 @@
 # Worker protocol
 
-Read before changing Task files, the result tool, container/tmux launch, process identity, or verification rules.
+Read before changing Task files, result submission, launch or process identity. [Lifecycle](lifecycle.md) owns scheduling and recovery policy.
 
-## Isolation
+## Native Pi runtime
 
-- Each WorkItem gets a full local clone at `<work_root>/<project>/<derived-name>/` (`git clone --local` from the source repo, then remotes re-pointed to the real base/push URLs). New clone names are bounded readable slugs with a stable hash of the authoritative WorkItem ID; persisted clone paths remain unchanged. The source repo is never mounted or modified. Same clone serves implement, rework, review, PR, merge.
-- Clone creation runs the Project's setup command (deps, env files) inside the image.
-- Review of a dependency Project uses a throwaway read-only checkout at the exact merged commit. No cache in v0.1.
-- Task = one Docker container running Pi as a foreground process in one tmux window. Attach with `tmux attach -t merro-<project>`, then the window.
-- Mounts: clone (rw for implement, ro for review), per-Task scratch dir, copied Pi config dir (`pi_config: copy`, never the real one) or empty (`clean`). Model auth via env passthrough or copied auth file. Docker bind mounts use CSV-escaped `--mount` fields, never colon-delimited host-path parsing, including setup and dependency checkouts.
-- `worker_github: on` passes `GH_TOKEN` derived from the user's `gh` auth. Push, PR, and merge remain Main-only by contract. Branch protection is the real guard. `off` removes the token.
-- Network on by default. `sandbox: none` runs the same Task on the host in the clone.
-- Image: generic Merro (Node, git, common build tools) is tagged with the host Pi version so Workers have the same model/provider registry; overridable per Project by image name or Dockerfile.
+One Task is one fresh native Pi process in one tmux pane. Launch uses `pi --no-session --tui-mode regular` with an initial `@.merro-task.md` prompt and Merro's lifecycle/result extensions. No print-mode worker, reconstructed UI, steering API or alternate terminal backend.
 
-## Pi runtime boundary
+Host mode inherits the user's normal HOME, Pi config, models, auth, packages and unrelated extensions. Merro does not copy or replace host configuration. Worker-specific environment sets `MERRO_RUNTIME=worker`; the installed Main extension is inert under this marker, preventing nested orchestration. Host mode is not an OS security boundary. Worker restrictions, including reviewer non-editing, are contractual.
 
-Main Pi loads Merro's orchestration extension. Every Docker and host Worker Pi runs with `MERRO_RUNTIME=worker`; Merro's normal package entrypoint is intentionally inert in that runtime. It creates no Main state, lock, commands, tools, timers, or nested workers. The dedicated `merro_submit_result` extension remains active.
+Docker is optional. It stages normal Pi configuration into scratch, mounts only the change clone and Task/dependency scratch, and mounts the review clone read-only. It uses an interactive tty, version-matched Pi image, read-only container root and optional network isolation. Workers never receive Main's database mount. GitHub tokens are passed only when `worker_github` is enabled. Tokens and staged config are secrets removed by safe finalized cleanup.
 
-`pi_config: copy` preserves installed packages, unrelated extensions, settings, auth, and model/provider configuration in Task scratch without changing the host config. Package filtering is not required: the explicit runtime marker protects Merro even when it is loaded from another configuration location. The marker belongs to the worker launch environment only, never Main's environment or persisted Pi settings. Docker workers mount only the clone and Task scratch, not Main's store; `sandbox: none` is not an OS security boundary.
+## Paths and input
 
-`/status` and `/merro-export` use the live Main's serialized state access when available, waiting for an active reconciliation operation to release ownership. Export is a coherent detached snapshot, not mutable store access. Standalone commands still acquire the workspace lock; `/unlock` never bypasses live ownership.
+One full local clone per ChangeSet: `cwd/.wt/<semantic-slug>`. The same clone/branch serves implementation, review, rework and merge preparation. Cloning preserves the configured Git identity and repoints remotes to canonical base/push repositories; the registered source checkout is not the worker working directory.
 
-## tmux
+Task scratch is `.merro/runtime/tasks/<implement-or-review>-<change>-<attempt>/`. Names and collision suffixes are semantic, never UUIDs. Exact merged dependency checkouts live under Task scratch, read-only, without a shared cache.
 
-- Session `merro-<project>` created when a Project's first Task starts, detached, no Main window. Never auto-attached.
-- Window per Task (`impl-188`, `rev-188`), named by issue number or local WorkItem slug rather than Task UUID; one pane, Workers may not open more.
-- Session env `MERRO_PROJECT`, `MERRO_OWNER=workspace:<uuid>`, mirrored by `@merro_project` and `@merro_owner` session options. The owner is atomically persisted in `.merro/runtime/workspace-owner`, independent of Project paths; retain it across workspace moves and while workers live. Invalid identity fails inventory closed.
-- Task window options `@merro_task_id`, `@merro_work_item_id`, `@merro_clone_path`, `@merro_runtime_kind` identify owned live panes for reconciliation. Docker labels `merro.task_id`, `merro.project`, `merro.owner`, `merro.work_item_id`, `merro.clone_path` identify containers even if tmux is gone. Containers with old path-hash owners or no owner require an exact workspace Task scratch mount or stored matching Task/container identity as ownership proof, not the current Project path.
-- Legacy path-hash tmux markers migrate only after a stored runtime matches the pane, session, window, and live process identity. Host proof requires PID and start time; Docker proof requires container identity. This changes namespace metadata, not Task status or processes. Otherwise, mismatched session markers block that Project and are reported without adoption.
-- Last window exits, session may vanish. No supervisor hook.
+Main writes fresh `.merro-task.md` in the clone, excluded through Git's local exclude file. It contains change name, all issue contents/acceptance criteria, relevant Objective, guidance, repository instructions, dependencies, expected commit and role instructions. Review additionally receives full `base...HEAD` diff, implementation summary and verification, and prior findings. Task text contains no private Task/Objective/Decision/ChangeSet keys. Task history retains the input; safe finalization removes the shared file only when no successor owns it.
 
-## Process identity
+## Lifecycle events and observation
 
-Runtime record per active Task: Task ID, WorkItem, role, Project, tmux session/window, container ID, Pi PID inside container, start time, clone path.
-Host identity uses the pane ID, PID, and OS process start time (`ps`), not the unsupported tmux `pane_start_time` format. Window existence alone is not proof. Gone process + no valid result → failed. Identity mismatch → failed. No rediscovery or adoption. Owned-worker inventory may use finalized runtime identity to deduplicate a legacy Docker pane and container and recover their WorkItem; the worker remains an orphan, never an active Task. Match pane, session, and window together to avoid reusing another Task's pane ID; fall back to session/window only when the stored pane ID is absent.
-Pi exited but valid matching result exists → consume it.
+The lifecycle extension writes atomic `worker-state.json` beside the result:
 
-## Task input: `.merro-task.md`
+- `agent_start`: busy
+- `turn_end`: progress/activity
+- `agent_settled`: idle only when `ctx.isIdle()`
+- `merro_submit_result`: finished, which never regresses to busy/idle
 
-Written fresh by Main per Task into the clone (excluded via `.git/info/exclude`, never the repo's `.gitignore`). Contains only: WorkItem scope, relevant Objective context, latest review result, user and Project guidance, repo instructions, direct dependency context (WorkItem ID, Project, merged PR, commit, final summary), role instructions, verification expectations, and any exact updated-base commit to merge. Never the full backlog. Copied to Task history, deleted at finalization.
+Finished work shuts down on settling. State is event-derived, not inferred from the composer or terminal text. Main can read it after restart; humans watch the actual Pi TUI.
 
-## Task output: `merro_submit_result`
+Pi labels the initial CLI task input interactive. Accept that first input, then block interactive intervention and direct user shell commands. Changed requirements go through Main's stop-and-restart flow.
 
-Worker ends by calling the `merro_submit_result` tool, which validates the schema and local commit, writes `.merro-result.json` atomically in Task scratch, and terminates Pi's automatic follow-up. The result path must be beside the scratch `pi-config` directory, outside the checkout. Implementer success and all review results require a full Git commit ID that resolves locally to HEAD. Invalid submissions throw an actionable error without writing a result or terminating; the worker must explicitly correct and resubmit, never receive an automatically substituted SHA. Failed implementers retain the ability to report an unusable checkout without an exact-HEAD check. Main independently validates every artifact; worker prevalidation is not a trust boundary. Controlled `.merro-task.md` remains excluded, not globally ignored. Main validates: `task_id` equals the active Task, schema matches role, commit state matches, result is not stale. Then copies to Task history and deletes the file.
-Wrong `task_id`: don't consume, don't delete, WorkItem Blocked, report expected vs found.
+## tmux and identity
 
-Main retries pending finalized Task artifact cleanup every reconciliation pass, including after restart and when a Project is unavailable. Successful cleanup records `cleanup_completed_at` in mutable Task runtime metadata, not immutable Task history; completed cleanups leave the retry queue. Older runtimes without this marker enter the queue once. Result submission and Task finalization do not prove process exit. Refresh worker inventory after finalization before scheduling successors or cleaning artifacts, including on exceptional reconciliation exits. Defer cleanup while a Project has unowned live workers or an incomplete worker inventory. Remove Task scratch and launch credentials; preserve mismatched results and shared input owned by an active successor Task.
+Sessions are `merro-<project>`, windows `impl-<change>` or `rev-<change>`. One pane per window. Disable automatic rename and allow-rename; persist stable window ID and exact pane ID. Sessions are detached, never auto-attached. The last exiting window may remove its session.
 
-Implement result: `task_id`, `status: success|failed`, `summary`, `commit`, `verification[]`, optional `pr{title,body}`; failed adds `reason`, optional `diagnostics`.
-Review result: `task_id`, `status: pass|reject|failed`, `summary`, `reviewed_commit`, `findings[]`, `verification[]`; failed adds `reason`.
-Finding: `severity: blocking|non-blocking|note`, `summary`, optional repo-relative `file`, `line_start`, `line_end` (lines refer to reviewed commit). Any blocking finding means reject. `reviewed_commit` mismatch → failed, Main never substitutes current HEAD.
-Verification entry: `kind: command` (`project`, `cwd`, exact `command`, `exit_code`) or `kind: manual` (`project`, `summary`). Persist only the final successful set, or the final failing check for a verification-caused reject. No env vars, no full logs.
+Ownership is private metadata: workspace owner marker, Project, Task and ChangeSet keys, runtime kind and clone path. Keep the workspace owner marker across restarts/moves. Tmux options and Docker labels are machine metadata, not public names. Persisted legacy ownership may migrate only after exact recorded runtime/process proof; never rediscover/adopt by window name alone.
 
-## Implementer rules
+Host identity requires matching pane/window/session membership, ownership, recorded PID and OS start time, and exactly one foreground Pi process attributed to the pane's foreground process group. A Pi descendant somewhere in the tree is insufficient. Docker identity includes owned container, start time and foreground native Pi command. Launch uses `exec` so shell wrappers do not obscure the foreground process.
 
-Fresh Pi. Edits, verifies, fixes, re-verifies, makes exactly one final commit with the user's Git identity, writes the result. Verification failures stay inside the Task. Pre-commit hook failure: fix, re-verify, retry; hook-modified files: recreate the unfinalized commit. Merro validates the SHA exists, equals HEAD, and is the one new commit. Never amend a finalized commit. Cannot proceed safely → failed.
-For a base update, Main fetches and persists the exact base commit. The implementer merges that commit with `--no-ff --no-commit`, resolves conflicts, verifies the merged tree, and creates one final merge commit: first parent is the Task's expected HEAD, second parent is the approved base. Main validates both parents and base ancestry. If the base is already an ancestor, one ordinary commit is allowed instead. No rebase, branch push, or PR operations by workers. A fresh reviewer follows every successful base-update Task.
-Next implementer after a reject gets the full latest review: blocking, non-blocking, notes, verification. Blocking must be fixed.
+`capture-pane` requires verified identity and targets the exact pane. Stop targets exact recorded identity. Missing/dead, unreadable and ambiguous states are distinct: only confirmed disappearance permits recovery. Read failures and live identity mismatches fail closed without replacement.
 
-## Reviewer rules
+Main inventories owned panes/containers before scheduling or merge approval and after finalization. Finalized runtime identity can deduplicate a pane/container pair, but a live Worker without an active Task remains an orphan, never adopted.
 
-Fresh Pi, no implementer history. Gets scope, acceptance criteria, full `base...HEAD` diff, latest implementer summary, verification, prior findings, guidance, dependency context. Read-only mount enforces this. May inspect dependency Projects and run safe verification there. Dependency check failure rejects only if materially relevant to compatibility.
-Nearby out-of-scope issues may be reported; same-Project expanded work stays in the current WorkItem. Blocking work in another registered Project inside an approved Objective becomes or reuses a WorkItem there plus a Requires. After that dependency merges, a fresh review runs if the branch is unchanged.
-Non-blocking findings and notes: shown in the review-notes comment and again at merge approval. No follow-up WorkItems.
+## Result submission
 
-## Verification
+The Worker calls `merro_submit_result`. Model parameters do not include `task_id`: the extension injects the private key from launch environment. Success text/tool details expose no key.
 
-Workers choose checks from repo context. Precedence: nearest AGENTS.md, root AGENTS.md, contributor/test docs, CI config, package scripts, README. Stale or impossible instruction → closest equivalent plus a recorded fallback reason (also noted in PR). Guidance fix may ride in the same commit. Final relevant checks run against the final code. A required check that cannot complete → failed. No interactive commands. No fixed timeout; idle/wall-clock limit reports to the user.
+`MERRO_TASK_SCRATCH` must be explicit. `.merro-result.json` is written atomically inside that scratch and outside the checkout; deriving scratch from the result path would defeat location validation. Submission validates schema and local exact HEAD, publishes finished and terminates automatic follow-up. Invalid submissions throw actionable errors without writing a result; the Worker must correct/resubmit. Main independently validates the artifact and never substitutes a commit SHA.
 
-## Cost visibility
+Persisted protocol artifacts include private `task_id` for matching, not public presentation:
 
-Record per-Task duration and tokens/cost when Pi exposes them. `status` shows totals per Objective. No enforcement in v0.1.
+- Implementation: success/failed, summary, commit, verification; optional PR title/body; failure reason/diagnostics.
+- Review: pass/reject/failed, summary, reviewed commit, findings, verification; failure reason.
+- Finding: blocking/non-blocking/note, summary, optional repo-relative file and line range. Blocking findings require rejection.
+- Verification: exact command, Project, working directory and exit code, or manual summary. No environment secrets or full logs.
+
+Implementation success and passing review cannot contain failed command verification. Successful implementation needs at least one passing command before review. Exact expected Task/commit must match; stale artifacts block without consuming/deleting the mismatched result. Finalized results and Task history are immutable.
+
+## Role rules
+
+Implementers edit, verify, fix and reverify before making one final commit directly on the expected HEAD with the configured Git identity. Hooks may require recreating an unfinalized commit; finalized commits never amend. Required checks that cannot complete mean failure. Workers never push, open PRs or merge PRs.
+
+For approved base updates, merge the exact fetched base with `--no-ff --no-commit`, resolve and verify, then produce one final merge commit with expected HEAD and approved base as parents. If base is already an ancestor, one ordinary commit is allowed. Main checks parents/ancestry and requires fresh review.
+
+Reviewers inspect the exact expected commit without edits or implementer conversation history. Pass when no blocking findings remain; reject with actionable findings; failed only when review cannot complete. The next implementer receives the latest complete review.
+
+Verification follows repository guidance: nearest/root AGENTS, contributor/test docs, CI, package scripts, README. Report final relevant checks against final code. An unavailable instruction needs a recorded equivalent/fallback reason, not invented success.
+
+## Cleanup
+
+Submission/finalization is not process-exit proof. Main refreshes inventory before successor launch, clone mutation or cleanup. Unsafe Projects retain artifacts. Cleanup retries survive Main restart; completion is mutable runtime metadata, not a Task-history rewrite. Preserve stale mismatched results and successor-owned input. Never remove an orphan's clone automatically.

@@ -1,4 +1,5 @@
-import type { Relation, WorkItem } from "./model.js";
+import type { Relation, ChangeSet } from "./model.js";
+import { issueNumbers } from "./names.js";
 
 function maskQuotedSpans(line: string): string {
   const characters = [...line];
@@ -28,9 +29,9 @@ function maskQuotedSpans(line: string): string {
 
 /** Conservative inference from affirmative issue-reference statements, never general prose overlap. */
 export function analyzeIssueRelations(
-  item: WorkItem,
+  item: ChangeSet,
   issue: { title: string; body: string },
-  approvedItems: readonly WorkItem[],
+  approvedItems: readonly ChangeSet[],
 ): { relations: Relation[]; unresolved: string[] } {
   const relations: Relation[] = [];
   const unresolved: string[] = [];
@@ -52,13 +53,13 @@ export function analyzeIssueRelations(
         const projectSlug = reference[1] ?? item.projectSlug;
         const number = reference[2]!;
         const target = approvedItems.filter((candidate) => candidate.projectSlug === projectSlug
-          && candidate.sourceType === "issue" && candidate.sourceRef === number)
+          && issueNumbers(candidate).includes(Number(number)))
           .sort((left, right) => right.generation - left.generation)[0];
         if (!target || target.state === "Obsolete" || target.state === "Cancelled") {
           unresolved.push(reference[0]);
           continue;
         }
-        if (target.id === item.id) { unresolved.push(reference[0]); continue; }
+        if (target.id === item.id) continue; // Dependencies inside one combined change are implementation scope.
         relations.push({ kind, from: item.id, to: target.id, confidence: "high",
           rationale: "Affirmative issue-reference statement inside approved scope.", evidence: raw.trim() });
       }

@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { initializedState } from "./fixtures.js";
 import { MainOrchestrator, type MainOptions } from "../src/runtime/main.js";
 import { systemCommandRunner } from "../src/runtime/commands.js";
 import { WorkerRuntime } from "../src/runtime/worker-runtime.js";
@@ -15,6 +16,7 @@ for (const forged of ["implement", "review", "task_id", "schema"] as const) {
     const source = join(root, "source");
     const workspace = join(root, "main");
     await mkdir(source);
+    await initializedState(workspace);
     const git = async (cwd: string, ...args: string[]) => (await systemCommandRunner.run("git", args, { cwd })).stdout.trim();
     await git(source, "init", "--initial-branch=main");
     await git(source, "config", "user.name", "Test");
@@ -46,7 +48,7 @@ for (const forged of ["implement", "review", "task_id", "schema"] as const) {
         const head = await git(input.clonePath, "rev-parse", "HEAD");
         const result = input.role === "implement"
           ? { task_id: forged === "task_id" ? "forged-task" : input.taskId, status: "success", summary: "done",
-            commit: forged === "implement" ? base : head, verification: forged === "schema" ? "invalid" : [] }
+            commit: forged === "implement" ? base : head, verification: forged === "schema" ? "invalid" : [{ kind: "command", project: "p", cwd: input.clonePath, command: "git status --short", exit_code: 0 }] }
           : { task_id: input.taskId, status: "pass", summary: "reviewed", reviewed_commit: base, findings: [], verification: [] };
         await mkdir(dirname(plan.resultPath), { recursive: true });
         await writeFile(plan.resultPath, JSON.stringify(result));
@@ -62,11 +64,11 @@ for (const forged of ["implement", "review", "task_id", "schema"] as const) {
     await main.runPass();
     await main.runPass();
     if (forged === "review") {
-      assert.equal((await main.statusSnapshot()).workItems[0]?.state, "Reviewing");
+      assert.equal((await main.statusSnapshot()).changeSets[0]?.state, "Reviewing");
       await main.runPass();
     }
     const snapshot = await main.statusSnapshot();
-    assert.equal(snapshot.workItems[0]?.state, "Blocked");
+    assert.equal(snapshot.changeSets[0]?.state, "Blocked");
     assert.equal(snapshot.tasks.at(-1)?.outcome, "failed");
     assert.equal(snapshot.tasks.filter((task) => task.role === "review").length, forged === "review" ? 1 : 0);
   });

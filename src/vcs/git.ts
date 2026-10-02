@@ -5,7 +5,7 @@ import type { BaseUpdate, Project } from "../domain/model.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { CommandError, systemCommandRunner, type CommandRunner } from "../runtime/commands.js";
 
-export interface WorkItemClone {
+export interface ChangeSetClone {
   path: string;
   branchName: string;
   baseCommit: string;
@@ -47,7 +47,7 @@ export class GitClient {
     };
   }
 
-  async createWorkItemClone(project: Project, path: string, branchName: string): Promise<WorkItemClone> {
+  async createChangeSetClone(project: Project, path: string, branchName: string): Promise<ChangeSetClone> {
     const resolvedProject = await this.resolveProjectRemotes(project);
     await this.#run("git", ["check-ref-format", "--branch", branchName]);
     const userName = await this.#gitConfig(project.path, "user.name");
@@ -68,6 +68,17 @@ export class GitClient {
     await this.#run("git", ["switch", "--create", branchName, `origin/${project.defaultBranch}`], { cwd: path });
     const baseCommit = (await this.#run("git", ["rev-parse", "HEAD"], { cwd: path })).stdout.trim();
     return { path, branchName, baseCommit };
+  }
+
+  async discardAttempt(path: string, expectedCommit: string): Promise<void> {
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(expectedCommit)) throw new Error("Attempt base commit is invalid.");
+    await this.#run("git", ["reset", "--hard", expectedCommit], { cwd: path });
+    await this.#run("git", ["clean", "-fd", "-e", ".pi/"], { cwd: path });
+  }
+
+  async fullDiff(path: string, baseCommit: string): Promise<string> {
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseCommit)) throw new Error("Review base commit is invalid.");
+    return (await this.#run("git", ["diff", "--no-ext-diff", "--no-color", `${baseCommit}...HEAD`, "--"], { cwd: path })).stdout;
   }
 
   async currentCommit(path: string): Promise<string> {
@@ -164,15 +175,15 @@ export class GitClient {
     await this.#run("git", ["reset", "--hard", fetched], { cwd: clonePath });
   }
 
-  async ensureWorkItemClone(project: Project, path: string, branchName: string, expectedCommit: string): Promise<void> {
+  async ensureChangeSetClone(project: Project, path: string, branchName: string, expectedCommit: string): Promise<void> {
     if (!/^[0-9a-f]{40,64}$/i.test(expectedCommit)) throw new Error(`invalid authoritative branch SHA: ${expectedCommit}`);
     await this.#run("git", ["check-ref-format", "--branch", branchName]);
     try {
       const details = await lstat(path);
-      if (!details.isDirectory() || details.isSymbolicLink()) throw new Error(`WorkItem clone is not a directory: ${path}`);
+      if (!details.isDirectory() || details.isSymbolicLink()) throw new Error(`ChangeSet clone is not a directory: ${path}`);
     } catch (error) {
       if (typeof error !== "object" || error === null || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await this.#rebuildWorkItemClone(project, path, branchName, expectedCommit);
+      await this.#rebuildChangeSetClone(project, path, branchName, expectedCommit);
       return;
     }
 
@@ -194,11 +205,11 @@ export class GitClient {
     if (await this.currentCommit(path) !== expectedCommit) await this.syncBranchHead(project, path, branchName, expectedCommit);
   }
 
-  async #rebuildWorkItemClone(project: Project, path: string, branchName: string, expectedCommit: string): Promise<void> {
+  async #rebuildChangeSetClone(project: Project, path: string, branchName: string, expectedCommit: string): Promise<void> {
     const temporaryPath = join(dirname(path), `.merro-rebuild-${randomUUID()}`);
     await mkdir(dirname(path), { recursive: true });
     try {
-      await this.createWorkItemClone(project, temporaryPath, branchName);
+      await this.createChangeSetClone(project, temporaryPath, branchName);
       await this.syncBranchHead(project, temporaryPath, branchName, expectedCommit);
       await rename(temporaryPath, path);
     } catch (error) {

@@ -44,7 +44,7 @@ for (const role of ["implement", "review"] as const) {
       await assert.rejects(f.tool.execute("bad", { ...f.result, [key]: commit }), /git rev-parse HEAD/);
       await assert.rejects(readFile(f.resultPath), { code: "ENOENT" });
     }
-    await assert.rejects(f.tool.execute("stale", { ...f.result, task_id: "stale" }), /task_id mismatch/);
+    assert.ok(!("task_id" in f.tool.parameters.properties));
     const submitted = await f.tool.execute("corrected", f.result);
     assert.equal(submitted.terminate, true);
     assert.equal(JSON.parse(await readFile(f.resultPath, "utf8"))[key], f.head);
@@ -65,20 +65,20 @@ test("malformed review schema never writes a result", async (t) => {
 });
 
 test("worker extension rejects unvalidated environment result paths", () => {
-  const keys = ["MERRO_RUNTIME", "MERRO_TASK_ROLE", "MERRO_RESULT_PATH", "PI_CODING_AGENT_DIR"];
+  const keys = ["MERRO_RUNTIME", "MERRO_TASK_ROLE", "MERRO_RESULT_PATH", "MERRO_TASK_SCRATCH"];
   const previous = keys.map((key) => process.env[key]);
   try {
     process.env.MERRO_RUNTIME = "worker";
     process.env.MERRO_TASK_ROLE = "implement";
-    process.env.PI_CODING_AGENT_DIR = "/scratch/pi-config";
+    process.env.MERRO_TASK_SCRATCH = "/scratch";
     for (const path of ["relative.json", "/main/.merro/state.db", "/scratch/pi-config/result.json"]) {
       process.env.MERRO_RESULT_PATH = path;
       assert.throws(() => merroWorker({ registerTool() { assert.fail("must not register"); } }), /Task scratch/);
     }
-    process.env.PI_CODING_AGENT_DIR = join(process.cwd(), "nested", "pi-config");
+    process.env.MERRO_TASK_SCRATCH = join(process.cwd(), "nested");
     process.env.MERRO_RESULT_PATH = join(process.cwd(), "nested", ".merro-result.json");
     assert.throws(() => merroWorker({ registerTool() { assert.fail("must not register"); } }), /outside the checkout/);
-    process.env.PI_CODING_AGENT_DIR = "/scratch/unvalidated-config";
+    delete process.env.MERRO_TASK_SCRATCH;
     process.env.MERRO_RESULT_PATH = "/scratch/.merro-result.json";
     assert.throws(() => merroWorker({ registerTool() { assert.fail("must not register"); } }), /Task scratch/);
   } finally {

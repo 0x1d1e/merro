@@ -1,96 +1,71 @@
 # Lifecycle
 
-Read before changing states, relations, scheduling, PR or merge flow, reconciliation.
+Read before changing ChangeSet states, relations, scheduling, PR/merge flow or reconciliation. Terms belong to [CONTEXT.md](../CONTEXT.md).
 
-## Objective flow
+## Workspace and approval
 
-1. User states Objective + Projects.
-2. Main inspects repos and GitHub (open issues only), then calls `merro_propose_objective` to display WorkItems, authoritative relations, unresolved references, and cycles. The proposal uses the same issue-reference analysis as persistence; conversational prose must not add inferred edges.
-3. User approves. `merro_start_objective` requires the displayed proposal ID and identical inputs. A changed scope, generation, or relation graph requires a fresh proposal and approval; proposals expire on restart or replacement. Approval covers scope, structure, current plan. Persist exactly one approved issue scope per linked Project: fixed issue numbers, or a query matching all specified labels and an optional milestone title. An empty query covers all open issues.
-4. New WorkItems inside approved scope are added automatically. Scope expansion, new Project, unregistered Project, splitting an issue → structural Decision.
-5. Rejected structural change → affected WorkItems Blocked, wait for freeform direction.
+Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly; startup opens and reconciles it without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
 
-Goal or scope change: log it, reconcile. Query membership is current, not additive: an open issue losing a required label or milestone leaves that Objective. Detach shared work and recompute its priority; obsolete exclusive unfinished work. An active Task finishes before detachment is finalized, with no successor unless another active Objective owns the WorkItem. Re-entry before Task completion restores ownership. Failed scope checks gate scheduling for affected work.
-Done: freshly enumerate the persisted GitHub scope, add newly matching WorkItems, then require all attached work to be terminal. A failed scope check keeps the Objective Active; never use a cached discovery result to complete it. Older Objectives without persisted scopes, or with scopes missing linked Projects, recover those Projects' attached issue numbers as fixed selections, not a query inferred from the goal. A Project without attached issues gets an empty fixed selection; existing approved scopes stay unchanged. Blocked work keeps it Active. Externally closed issues count as satisfied. Reopened issue under an active Objective → new generation.
-Stop is soft only: active Tasks finish, exclusive unfinished WorkItems → Obsolete, shared ones continue.
-Multiple Objectives share one backlog. Shared WorkItem uses the highest active Objective priority.
+Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; replacement or restart expires it. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
 
-## WorkItem transitions
+Default delivery combines the selected issues within each Project into one ChangeSet. Cross-Project Objectives have separate changes. An issue already owned by another active selection cannot be silently regrouped. Separate delivery is explicit, not a second execution model: each delivery unit is still a ChangeSet.
+
+Combined query results become fixed selections on approval so future matches cannot silently enlarge a running change. Separate delivery may retain a live query of labels and optional milestone. Newly matching issues enter approved query scope; scope expansion or new Projects require user direction. Query removal detaches ownership, obsoletes exclusive unfinished work once idle, and preserves shared work. Failed scope refresh gates scheduling and completion, never falls back to cached membership.
+
+An Objective completes only after fresh scope verification and terminal attached work. Externally closed issues may satisfy work. A terminal source reopened under an active Objective creates new history rather than mutating the old generation. Stopping is soft: current Tasks finish; exclusive unowned work becomes Obsolete; other owners continue.
+
+## ChangeSet flow
 
 ```text
 Planned -> Ready -> Implementing -> Reviewing -> AwaitingMerge -> Done
                          ^             | reject
-                         +-------------+   (fresh implement Task, up to max_review_rounds)
-any active state -> Blocked -> (user continue / auto-resume) -> previous flow
-Planned|Ready|Blocked -> Obsolete | Cancelled
+                         +-------------+  fresh implementer, then fresh reviewer
+any non-terminal state -> Blocked -> prior flow after resolution
+idle unfinished work -> Obsolete | Cancelled
 ```
 
-Review cap reached → Blocked(review_cap). "continue" grants another full round.
-Dependents of a Blocked WorkItem stay Planned; they are listed in the failure report.
+Successful implementation requires at least one reported verification command, all with zero exit codes, before review. Main validates result and commit integrity; it does not independently rerun repository CI. Manual-only results cannot unlock review.
 
-## Relations
+Review receives all issue contents and acceptance criteria, complete base-to-head diff, latest successful implementation summary/verification, prior findings, guidance and repository instructions. No implementer conversation history. Rejection is not a Task failure; its findings go to a fresh implementer on the same branch. `max_review_rounds` defaults to 3. At the cap, Blocked(review_cap); explicit continuation grants a new round.
 
-- `Requires`: explicit always blocks; inferred blocks only if high confidence. Waits for completion (merge).
-- `Conflicts`: high confidence only. No concurrent execution; Main orders by priority, then downstream unblock count, then repo context. Follower may start when predecessor finishes implement+review, before merge. Predecessor rework does not interrupt a running follower.
-- Requires > Conflicts on order.
-- Any cycle → involved WorkItems Blocked(cycle), Main asks user. No auto cycle-breaking in v0.1.
-- Relation stores evidence, rationale, confidence, history of effective changes. Rebuild automatic relations before every scheduling pass, including startup and discovery. Newly created WorkItems remain Planned until scope and relation checks succeed. Infer high-confidence affirmative `requires`, `depends on`, `blocked by`, and `conflicts with` statements referencing `#n` or `<project-slug>#n` in issue titles/bodies; quoted, negated, and speculative examples are not evidence. Unresolved references gate scheduling, never expand scope. Main supplies other explicit/high-confidence relations with `merro_update_relations`; automatic rebuilds preserve these and retire only superseded automatic evidence. Automatic Conflicts touching an active Task remain effective until it finalizes, including after scope detachment. Conflicts touching an orphan remain effective until it exits; fresh evidence may add relations while that endpoint is occupied.
-- Auto-combining issues is deferred past v0.1.
+Changed requirements require stopping the exact owned Worker, confirming exit, cancelling its Task and restoring the attempt base before launching a fresh implementer. Never send steering input to a running Worker. Finalized Task commits/history remain immutable.
 
-## Scheduling
+## Relations and scheduling
 
-Slot = active Task (implement or review). Default 3, user-settable, `unlimited` allowed.
-Order of Ready items: priority (highest linked Objective or WorkItem level), transitive downstream unblock count (explicit + high-confidence Requires), oldest Ready, canonical ID. High may starve low. Ready never demotes to Planned for lack of a slot.
-Loop: reconcile → consume terminal results → derive states → schedule up to capacity. Driven by an in-process timer while Main is open (adaptive cadence, idle when nothing runs) and by a headless `pi -p` pass (cron or notify hook) that runs one loop under the lock.
+- `Requires` waits for actual completion, normally merge. Internal references among issues in one ChangeSet are satisfied within its implementation scope.
+- `Conflicts` serializes execution. A follower may run after predecessor implementation/review finishes, before merge. Rework does not interrupt a follower already running.
+- Requires takes precedence; cycles block involved changes until user resolution.
+- Relations need explicit or high-confidence evidence. Automatic analysis recognizes affirmative issue references; quoted, negated and speculative text is not evidence. Unresolved references gate scheduling, never expand scope.
+- Automatic rebuilds preserve explicit relations and conflict occupancy held by active or orphan Workers.
 
-## Failure policy
+A slot is one active Task, implementation or review. Default global capacity is 3; at most one Task per ChangeSet regardless of its issue count. Order: highest active-owner priority, downstream unblock count, oldest Ready, stable private tie-breaker. Ready changes without a slot remain Ready.
 
-- Task failed → WorkItem Blocked(task_failed). Main reports summary, reason, next action, direct dependents.
-- Infra-class (container/process gone, no valid result): one automatic fresh Task. Second occurrence blocks.
-- Real failure, wrong `task_id`, commit mismatch, missing verification → no retry.
-- "continue" after user fix: fresh Task on same WorkItem, same clone if safe. Old Task stays immutable.
-- Idle or wall-clock limit exceeded → report to user, no auto kill.
-- Clone lost or corrupt during an active Task → Blocked(clone_lost). No recovery machinery in v0.1: user decides.
+Main reconciles before scheduling, on startup and periodically while open. `/merro-run` requests a pass. Serialized access lets status/export wait behind an active pass without competing for the writer lock.
 
-## Branches, clones, PRs
+## Failures and recovery
 
-- Branch prefix by intent (`feat/`, `fix/`, ...), semantic kebab name, collision suffix `-<issue>`, immutable after creation. Never adopt an unrelated external branch.
-- Create: fetch base_remote, branch from `base_remote/<default>`. Fetch fails → no new work for that Project.
-- Base moved after start: persist the target base commit and schedule an implementer Task to merge it into the branch, verify, and make one final commit, then a fresh review (no rebase, no force-push). Main may fetch the base, but never makes the merge commit. GitHub-reported conflicts → Decision(merge_conflict); resolving it authorizes this implementer Task, not a Main merge or a reviewer-only pass.
-- External commits/rebase: compare effective diff. Unchanged → review stays valid. Changed → fresh review; reviewer verification becomes the PR verification source.
-- PR only after review pass. Never draft. Head `push_owner:branch`, base `base_owner:default`, from persisted Project remotes. Existing PR reused, never duplicated.
-- Body: `## Summary`, `## Verification` (final successful commands, deduped, grouped by implementer/reviewer if mixed, fallback noted), `## Issues` with `Closes #n`. Main validates structure only.
-- User edits title/body → stop regenerating; Main restores only missing `Closes` and `## Verification`.
-- One canonical comment marked `<!-- merro:review-notes -->`: passes, verification commands, non-blocking findings, notes. Updated on later passes, recreated if deleted, new one if update fails. Rejected findings stay internal.
+A real failure blocks once with a semantic change name, reason and retry guidance. A missing/dead Worker with no valid result gets one infrastructure retry; the next disappearance blocks. Invalid/stale results, commit mismatch and missing verification are not infrastructure retries.
 
-## External review and CI
+`/merro-continue <change>` resumes after its cause is fixed, with a fresh Task. Externally fixable causes such as GitHub unavailability auto-resume only after fresh reconciliation. User-owned causes such as rejected merge, closed PR, explicit cycle and review cap need continuation. Idle/wall limits warn without automatically killing work.
 
-Change-request review or CI failure after PR → fresh implement Task → fresh review → push. No user prompt. Non-blocking external comments leave AwaitingMerge. Required checks come from GitHub policy; undeterminable → Blocked(policy_unknown). Optional check failures warn.
+A live unreadable or mismatched identity remains occupied and pauses scheduling. Orphans are reported, never adopted or automatically killed. Unknown ownership gates the workspace; known orphan ownership gates its Project. Inventory failures gate the affected Project. Healthy independent Projects continue.
 
-## Merge
+Valid result after exit is consumed. Result submission alone does not prove exit: refresh inventory before successors, clone mutation or cleanup. Defer finalized artifact cleanup while ownership is unsafe; retry it across Main restarts, without changing immutable Task history or deleting a successor's input.
 
-Ready when: valid review covers latest diff, PR open and mergeable, required checks and reviews satisfied, policy known, no blocker. Then one Decision per PR, surfaced immediately, never batched, may wait forever.
-Decision shows PR, final summary, verification, non-blocking findings, warnings.
-- Approved → Main squash-merges. Squash disabled → Blocked. GitHub rejects → Blocked, fresh approval later.
-- Rejected → Blocked, keep PR/branch/clone.
-- Success → Done (even if issue stays open; warn if `Closes` didn't fire). Write immutable final summary (diff, PR metadata, implementer summaries, reviewer outcomes). Unblock dependents. Cleanup best-effort afterward.
+## Git and PRs
 
-## External mutations
+Each change uses `.wt/<slug>` and an intent-prefixed branch (`feat/`, `fix/`, `chore/`). Names are immutable; collisions use numeric semantic suffixes. Existing persisted paths remain authoritative during migration, particularly while workers live. Never adopt an unrelated branch or expose private keys in public names/text.
 
-Manual push/PR creation → adopt if identity matches. PR closed unmerged → Blocked, reopen needs explicit resume. Manual merge → Done, any method. Remote branch deleted before merge → Blocked, no silent repush; after merge → normal cleanup. Local clone or branch deleted with PR head present → rebuild from authoritative head, review stays valid only if diff unchanged. External reality wins.
+Create from the canonical base remote's current default branch. Base movement schedules an implementer to merge the exact fetched commit, verify and commit, followed by fresh review. No rebase, force-push or Main-authored merge commit. Merge conflicts require a Decision authorizing implementation, not direct merge by Main.
 
-## Cancel
+Review pass opens/reuses one non-draft PR. Main supplies a semantic title and Summary, Verification and Issues sections, including every `Closes #n`. User edits stop wholesale body regeneration; required verification/closures are repaired. One canonical `<!-- merro:review-notes -->` comment holds passing review, verification and non-blocking findings. Private IDs are removed from titles, bodies, comments, notifications and merge prompts.
 
-WorkItem cancel needs confirmation showing Task, dependents, PR/branch state. Task cancelled, WorkItem Cancelled, PR left open until user separately confirms closing. Remote branch deletion always separate confirmation.
+External requested changes or required-check failure schedule fresh implementation and review. Optional failures warn. Unknown GitHub policy blocks rather than assuming no requirements. Effective diff changes invalidate review; unchanged rewrites may preserve it.
 
-## Reconciliation
+## Merge and external authority
 
-Full pass at every Main start, before scheduling: Projects, remotes, default branches, WorkItems, relations, branches, clones, containers, tmux windows, process identity, active Tasks, PR/merge state. One Project failing blocks only that Project.
-Active Task with no process: valid matching result → consume; else failed (infra retry rules apply). Identity mismatch → failed. Orphan worker (live, no Task record) → report, never adopt or kill. Enumerate owned tmux panes and running Docker containers before reconciling Tasks and before explicit merge or conflict approval. Unsafe approval leaves the Decision pending without restoring a clone, merging, or queuing a base update. After Task finalization, refresh inventory before scheduling, clone mutation, or artifact cleanup; a submitted result does not prove process exit. Gate new scheduling, obsoletion, and unsafe cleanup for its Project until it exits; keep scope, issue, relation, and authoritative PR-state reconciliation running. Preserve conflict occupancy and infer new conflicts, including for scope-detached or terminal orphan WorkItems against currently approved work. Unknown WorkItem identity gates the workspace. Apply these gates to live workers whose Task has finalized, too. An incomplete worker inventory gates that Project without making GitHub unavailable. Use stored active or finalized runtime identity to count a legacy pane and its Docker container as one worker. Orphan clones never auto-deleted. Safe stale clones of terminal WorkItems removed only when Git proves it safe.
-GitHub op failing after `gh` fails → Blocked(github_unavailable), auto-resume after a fresh reconcile succeeds. No blind retry of stale operations.
+Main asks per PR only when review covers the latest diff, the PR is open/mergeable, policy is known and required checks/reviews pass. Approval rechecks external state and worker safety before squash merge. Rejection keeps the PR/branch/clone and blocks. GitHub merge rejection needs fresh approval, not blind retry. An external merge completes the change regardless of merge method.
 
-## Remotes and Projects
+Completion writes immutable final history and unblocks dependents. Cleanup is best-effort afterward. PR closed unmerged or branch deleted before merge blocks; a lost clone may be restored from the authoritative reviewed remote head. Unsafe live-worker occupancy prohibits restoration/deletion.
 
-base_remote/push_remote inferred from `origin`/`upstream`, user confirms. Transport-equivalent URLs and remote renames adopted automatically; ownership transfer and fork switch need confirmation. Default-branch change applies to future WorkItems; existing PRs keep their base. Moved path: update in place after validation; different repo identity → Project Blocked until confirmed.
-Project guidance persists only on clear future intent ("from now on ..."), stores current text only.
-Project removal is not in v0.1.
+Project repository identity changes require confirmation. Transport-equivalent URLs, remote renames and validated checkout moves may be adopted. New default branches apply to future changes; existing PR bases remain intact. Project removal is outside v0.1.

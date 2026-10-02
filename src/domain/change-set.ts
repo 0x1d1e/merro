@@ -1,0 +1,42 @@
+import type { FlowChangeSetState, ChangeSetState } from "./model.js";
+import { FLOW_CHANGE_SET_STATES, TERMINAL_CHANGE_SET_STATES } from "./model.js";
+
+const allowedTransitions: Readonly<Record<FlowChangeSetState, ReadonlySet<ChangeSetState>>> = {
+  Planned: new Set(["Ready", "Blocked", "Obsolete", "Cancelled"]),
+  Ready: new Set(["Planned", "Implementing", "Blocked", "Obsolete", "Cancelled"]),
+  Implementing: new Set(["Reviewing", "Blocked", "Obsolete"]),
+  Reviewing: new Set(["Implementing", "AwaitingMerge", "Blocked", "Obsolete"]),
+  AwaitingMerge: new Set(["Implementing", "Reviewing", "Done", "Blocked", "Obsolete"]),
+};
+
+function isFlowChangeSetState(state: ChangeSetState): state is FlowChangeSetState {
+  return FLOW_CHANGE_SET_STATES.has(state as FlowChangeSetState);
+}
+
+export class InvalidChangeSetTransitionError extends Error {
+  constructor(from: ChangeSetState, to: ChangeSetState) {
+    super(`invalid ChangeSet transition: ${from} -> ${to}`);
+    this.name = "InvalidChangeSetTransitionError";
+  }
+}
+
+export function assertChangeSetTransition(
+  from: ChangeSetState,
+  to: ChangeSetState,
+  blockedResumeState: FlowChangeSetState | null = null,
+): void {
+  if (from === to) return;
+  if (TERMINAL_CHANGE_SET_STATES.has(from)) {
+    throw new InvalidChangeSetTransitionError(from, to);
+  }
+
+  if (from === "Blocked") {
+    if (to === "Obsolete" || to === "Cancelled") return;
+    if (blockedResumeState !== null && to === blockedResumeState) return;
+    throw new InvalidChangeSetTransitionError(from, to);
+  }
+
+  if (!isFlowChangeSetState(from) || !allowedTransitions[from].has(to)) {
+    throw new InvalidChangeSetTransitionError(from, to);
+  }
+}

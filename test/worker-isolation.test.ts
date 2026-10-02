@@ -44,7 +44,7 @@ for (const sandbox of ["docker", "none"] as const) {
       }
       if (file === "tmux") {
         if (args[0] === "has-session") throw new Error("no such session");
-        if (args[0] === "display-message") return { stdout: "123", stderr: "" };
+        if (args[0] === "display-message") return { stdout: args.at(-1) === "#{window_id}" ? "@1" : "123", stderr: "" };
         if (args[0] === "new-session") {
           const command = args[args.indexOf("-c") + 2]!;
           if (sandbox === "docker") {
@@ -55,7 +55,7 @@ for (const sandbox of ["docker", "none"] as const) {
             await writeFile(tokens[tokens.indexOf("--cidfile") + 1]!, "a".repeat(64));
             assert.ok(!tokens.some((value) => value.includes("state.db")));
           } else {
-            const script = await readFile(command.slice(1, -1), "utf8");
+            const script = await readFile(command.slice(6, -1), "utf8");
             workerEnvironment = Object.fromEntries([...script.matchAll(/^export (\w+)='([^']*)'$/gm)].map((match) => [match[1]!, match[2]!]));
           }
           assert.equal(workerEnvironment.MERRO_RUNTIME, "worker");
@@ -64,10 +64,10 @@ for (const sandbox of ["docker", "none"] as const) {
       }
       throw new Error(`unexpected ${file} ${args.join(" ")}`);
     } };
-    const runtime = new WorkerRuntime({ workspacePath: runtimePath, config: { ...DEFAULT_CONFIG, sandbox, pi_config: "copy", worker_github: "off" }, piConfigPath: config, commands });
-    const record = await runtime.launch({ taskId: "task", workItemId: "p:issue-1:g1", role: "implement", project: { slug: "p", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, clonePath: clone, taskFile: "Implement", expectedCommit: base, projectSettings: null });
+    const runtime = new WorkerRuntime({ workspacePath: runtimePath, config: { ...DEFAULT_CONFIG, sandbox, worker_github: "off" }, piConfigPath: config, commands });
+    const record = await runtime.launch({ taskId: "task", changeSetId: "p:issue-1:g1", changeSlug: "implement", taskName: "implement-change", role: "implement", project: { slug: "p", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, clonePath: clone, taskFile: "Implement", expectedCommit: base, projectSettings: null });
     const scratch = dirname(record.resultPath);
-    const copied = join(scratch, "pi-config");
+    const copied = sandbox === "docker" ? join(scratch, "pi-config") : config;
     assert.equal(await readFile(join(copied, "settings.json"), "utf8"), settings);
     assert.equal(await readFile(join(copied, "models.json"), "utf8"), '{"providers":{}}');
     assert.equal(await readFile(join(copied, "auth.json"), "utf8"), '{"test":"private"}');
@@ -86,7 +86,7 @@ for (const sandbox of ["docker", "none"] as const) {
       let tool; merroWorker({registerTool(value){tool=value}});
       const result = await tool.execute('submit', {task_id:'task',status:'success',summary:'done',commit:${JSON.stringify(head)},verification:[]});
       if(!result.terminate) throw Error('not finalized');`;
-    await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", submit], { cwd: clone, env: { MERRO_RUNTIME: "worker", MERRO_TASK_ROLE: "implement", MERRO_TASK_ID: "task", MERRO_RESULT_PATH: record.resultPath, PI_CODING_AGENT_DIR: copied } });
+    await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", submit], { cwd: clone, env: { MERRO_RUNTIME: "worker", MERRO_TASK_ROLE: "implement", MERRO_TASK_ID: "task", MERRO_RESULT_PATH: record.resultPath, MERRO_TASK_SCRATCH: scratch, PI_CODING_AGENT_DIR: copied } });
     assert.equal(await git("status", "--short"), "");
     const result = JSON.parse(await readFile(record.resultPath, "utf8"));
     assert.equal(await new GitClient().validateTaskCommit(clone, base, result.commit), head);
@@ -109,5 +109,5 @@ test("Main entrypoint registers orchestration normally without the worker marker
     await merro({registerCommand(name){commands.push(name)},registerTool(tool){tools.push(tool.name)},on(event){events.push(event)}});
     if(!commands.includes('merro-approve') || !tools.includes('merro_start_objective') || !events.includes('session_start')) throw Error('Main not initialized');`;
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
-  assert.ok(JSON.parse(await readFile(join(cwd, ".merro", "config.json"), "utf8")));
+  await assert.rejects(readFile(join(cwd, ".merro", "config.json")), { code: "ENOENT" });
 });

@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { MainLock } from "../src/runtime/main-lock.js";
+import { initializedState } from "./fixtures.js";
 import { type PiExtensionLike, registerCommands } from "../src/tools/commands.js";
 
 type CommandConfig = Parameters<PiExtensionLike["registerCommand"]>[1];
 
 async function tempDirectory(): Promise<string> {
-  return mkdtemp(join(tmpdir(), "merro-commands-"));
+  const cwd = await mkdtemp(join(tmpdir(), "merro-commands-"));
+  await initializedState(cwd);
+  return cwd;
 }
 
 function commandRegistry(cwd: string): Map<string, CommandConfig> {
@@ -33,7 +36,7 @@ test("commands serialize state access and show workspace status", async (t) => {
 
   await status.handler("", { ui: { notify: (message) => messages.push(message) } });
 
-  assert.match(messages[0] ?? "", /0 active objective/);
+  assert.match(messages[0] ?? "", /no work planned/);
   assert.ok(commands.has("unlock"));
 });
 
@@ -49,7 +52,7 @@ test("state export uses a namespaced command without shadowing Pi's built-in exp
   const path = join(cwd, ".merro", "export.json");
   const snapshot = JSON.parse(await readFile(path, "utf8"));
   assert.deepEqual(snapshot.projects, []);
-  assert.ok(messages[0]?.includes(path));
+  assert.ok(messages[0]?.includes(".merro/export.json"));
 });
 
 test("unlock does not release a live Main lock", async (t) => {

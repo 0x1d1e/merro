@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { GitClient } from "../src/vcs/git.js";
@@ -29,7 +29,7 @@ async function createProject(root: string): Promise<{ path: string; bare: string
   return { path, bare };
 }
 
-test("Git client creates per-WorkItem clone, validates one commit, and pushes without force", async (t) => {
+test("Git client creates per-ChangeSet clone, validates one commit, and pushes without force", async (t) => {
   const root = await tempDirectory();
   t.after(() => rm(root, { recursive: true, force: true }));
   const project = await createProject(root);
@@ -44,7 +44,7 @@ test("Git client creates per-WorkItem clone, validates one commit, and pushes wi
   };
   const gitClient = new GitClient();
 
-  const clone = await gitClient.createWorkItemClone(input, clonePath, "merro/issue-1-example");
+  const clone = await gitClient.createChangeSetClone(input, clonePath, "merro/issue-1-example");
   assert.equal(await git(clonePath, "config", "user.name"), "Merro Test");
   await writeFile(join(clonePath, "change.txt"), "change\n");
   await git(clonePath, "add", "change.txt");
@@ -73,19 +73,19 @@ test("Git client creates per-WorkItem clone, validates one commit, and pushes wi
 
   await git(clonePath, "switch", "main");
   await git(clonePath, "branch", "-D", clone.branchName);
-  await gitClient.ensureWorkItemClone(input, clonePath, clone.branchName, externalCommit);
+  await gitClient.ensureChangeSetClone(input, clonePath, clone.branchName, externalCommit);
   assert.equal(await git(clonePath, "branch", "--show-current"), clone.branchName);
   assert.equal(await gitClient.currentCommit(clonePath), externalCommit);
 
   await gitClient.deleteClone(workRoot, clonePath);
-  await gitClient.ensureWorkItemClone(input, clonePath, clone.branchName, externalCommit);
+  await gitClient.ensureChangeSetClone(input, clonePath, clone.branchName, externalCommit);
   assert.equal(await gitClient.currentCommit(clonePath), externalCommit);
 
   await gitClient.deleteClone(workRoot, clonePath);
   await assert.rejects(gitClient.deleteClone(workRoot, project.path), /outside work root/);
 });
 
-test("WorkItem creation clones the registered local repository and fetches only the authoritative base", async (t) => {
+test("ChangeSet creation clones the registered local repository and fetches only the authoritative base", async (t) => {
   const root = await tempDirectory();
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = await createProject(root);
@@ -96,7 +96,7 @@ test("WorkItem creation clones the registered local repository and fetches only 
   } };
   const project = { slug: "p", path: source.path, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" };
   await git(source.path, "switch", "--create", "unrelated-current-branch");
-  const clone = await new GitClient(commands).createWorkItemClone(project, join(root, "clone"), "feat/local");
+  const clone = await new GitClient(commands).createChangeSetClone(project, join(root, "clone"), "feat/local");
   const cloneArgs = calls.find((args) => args[0] === "clone")!;
   assert.ok(cloneArgs.includes("--local"));
   assert.equal(cloneArgs.at(-2), source.path);
@@ -117,7 +117,7 @@ test("effective diff fingerprint survives commit rewrites but detects changed co
     defaultBranch: "main",
   };
   const gitClient = new GitClient();
-  const clone = await gitClient.createWorkItemClone(project, join(root, "work"), "merro/issue-1-example");
+  const clone = await gitClient.createChangeSetClone(project, join(root, "work"), "merro/issue-1-example");
   await writeFile(join(clone.path, "change.txt"), "same patch\n");
   await git(clone.path, "add", "change.txt");
   await git(clone.path, "commit", "-m", "first implementation");
@@ -178,7 +178,7 @@ test("updated base is fetched without changing the branch and only its verified 
   const project = await createProject(root);
   const clonePath = join(root, "work", "p-issue-1-g1");
   const client = new GitClient();
-  const clone = await client.createWorkItemClone({
+  const clone = await client.createChangeSetClone({
     slug: "p", path: project.path, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main",
   }, clonePath, "feat/issue-1");
   await writeFile(join(clonePath, "feature.txt"), "feature\n");
@@ -223,7 +223,7 @@ test("Git client rejects Task commits that contain more than one commit", async 
   const project = await createProject(root);
   const clonePath = join(root, "work", "p-issue-1-g1");
   const gitClient = new GitClient();
-  const clone = await gitClient.createWorkItemClone({
+  const clone = await gitClient.createChangeSetClone({
     slug: "p",
     path: project.path,
     baseRemote: "origin",
@@ -241,4 +241,41 @@ test("Git client rejects Task commits that contain more than one commit", async 
     gitClient.validateTaskCommit(clonePath, clone.baseCommit, await gitClient.currentCommit(clonePath)),
     /one commit directly/,
   );
+});
+
+test("review gets the complete committed base...HEAD diff, not working-tree changes", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = await createProject(root);
+  const base = await git(project.path, "rev-parse", "HEAD");
+  for (const name of ["permissions", "marketplace", "dependencies"]) {
+    await writeFile(join(project.path, `${name}.txt`), `${name} lifecycle safety\n`);
+    await git(project.path, "add", `${name}.txt`);
+    await git(project.path, "commit", "-m", `Harden ${name}`);
+  }
+  await writeFile(join(project.path, "permissions.txt"), "uncommitted change\n");
+  const client = new GitClient();
+  const diff = await client.fullDiff(project.path, base);
+  for (const name of ["permissions", "marketplace", "dependencies"]) assert.match(diff, new RegExp(`\\+${name} lifecycle safety`));
+  assert.doesNotMatch(diff, /uncommitted change/);
+  await assert.rejects(client.fullDiff(project.path, "--output=outside"), /invalid/);
+});
+
+test("discarding a stopped attempt restores its base and removes unfinished files without deleting Pi config", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = await createProject(root);
+  const base = await git(project.path, "rev-parse", "HEAD");
+  await writeFile(join(project.path, "README.md"), "attempt commit\n");
+  await git(project.path, "commit", "-am", "unfinished attempt");
+  await writeFile(join(project.path, "README.md"), "dirty attempt\n");
+  await writeFile(join(project.path, "unfinished.txt"), "unfinished\n");
+  await mkdir(join(project.path, ".pi"));
+  await writeFile(join(project.path, ".pi", "settings.json"), "{}\n");
+  const client = new GitClient();
+  await client.discardAttempt(project.path, base);
+  assert.equal(await client.currentCommit(project.path), base);
+  assert.equal(await git(project.path, "show", "HEAD:README.md"), "initial");
+  assert.equal(await git(project.path, "status", "--porcelain"), "?? .pi/");
+  await assert.rejects(client.discardAttempt(project.path, "--hard"), /invalid/);
 });

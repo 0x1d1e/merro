@@ -1,8 +1,8 @@
 export type Priority = "high" | "normal" | "low";
 export type ObjectiveState = "Active" | "Done" | "Stopped";
-export type FlowWorkItemState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "AwaitingMerge";
-export type WorkItemState =
-  | FlowWorkItemState
+export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "AwaitingMerge";
+export type ChangeSetState =
+  | FlowChangeSetState
   | "Blocked"
   | "Done"
   | "Obsolete"
@@ -59,23 +59,28 @@ export interface Objective {
   issueScopes?: ObjectiveIssueScope[];
 }
 
-export interface WorkItem {
-  id: string;
+export interface SourceRef {
   projectSlug: string;
-  sourceType: "issue" | "local";
-  sourceRef: string;
+  number: number;
+}
+
+export interface ChangeSet {
+  id: string;
+  slug: string;
+  projectSlug: string;
+  issues: SourceRef[];
   generation: number;
-  state: WorkItemState;
+  state: ChangeSetState;
   priority: Priority;
   readySince: string | null;
   blockedReason: BlockReason | null;
-  blockedResumeState: FlowWorkItemState | null;
+  blockedResumeState: FlowChangeSetState | null;
   guidance?: string;
 }
 
 export interface Task {
   id: string;
-  workItemId: string;
+  changeSetId: string;
   role: TaskRole;
   attempt: number;
   status: "active" | "finalized";
@@ -109,14 +114,14 @@ export interface Relation {
 }
 
 export interface SchedulingInput {
-  workItems: readonly WorkItem[];
+  changeSets: readonly ChangeSet[];
   relations: readonly Relation[];
   activeTaskCount: number;
   maxConcurrentTasks: number | "unlimited";
-  activeWorkItemIds?: readonly string[];
+  activeChangeSetIds?: readonly string[];
 }
 
-export const FLOW_WORK_ITEM_STATES = new Set<FlowWorkItemState>([
+export const FLOW_CHANGE_SET_STATES = new Set<FlowChangeSetState>([
   "Planned",
   "Ready",
   "Implementing",
@@ -124,7 +129,7 @@ export const FLOW_WORK_ITEM_STATES = new Set<FlowWorkItemState>([
   "AwaitingMerge",
 ]);
 
-export const TERMINAL_WORK_ITEM_STATES = new Set<WorkItemState>([
+export const TERMINAL_CHANGE_SET_STATES = new Set<ChangeSetState>([
   "Done",
   "Obsolete",
   "Cancelled",

@@ -3,59 +3,57 @@
 ## Terms
 
 ### Main
-The single Pi session the user talks to. Plans, infers relations, schedules, launches workers, reconciles, opens PRs, asks approval, merges.
-- **Invariant:** one Main per workspace (lockfile + PID + start time). Only Main writes the store.
-- **Avoid:** orchestrator, supervisor
+The Pi session the user talks to. Plans, schedules, reconciles, opens PRs and asks permission to merge.
+- **Invariant:** one writer per workspace. Only Main writes orchestration state and talks to the user.
+- **Avoid:** supervisor, generic harness
 
 ### Worker
-Disposable Pi process running one Task in a container. Never schedules, merges, creates Tasks, writes the store, or talks to the user.
-- **Avoid:** agent, subagent
+Disposable Pi process executing one Task. Runs visibly in tmux, on the host by default.
+- **Invariant:** never schedules, writes Main's store, pushes branches, opens PRs or merges. Receives one task; changed requirements require a fresh attempt.
+- **Avoid:** subagent
 
 ### Project
-One registered repository. Identity is its immutable slug.
-- **Relates to:** base_remote (canonical, PR base), push_remote (branch and PR head).
+Registered GitHub repository, identified publicly by its immutable slug. Has a canonical base remote and a push remote, which may be a fork.
 
 ### Objective
-User goal with an explicit Project set and priority (high/normal/low). States: Active, Done, Stopped.
-- **Invariant:** ID is immutable once execution starts. Goal and scope may change; changes are logged.
+User goal with an approved Project set, issue scope and priority. States: Active, Done, Stopped.
+- **Invariant:** multiple Objectives may share the same ChangeSet. Effective priority is the highest active owner's priority.
 
-### WorkItem
-Unit of work in exactly one Project. Backed by one GitHub issue, or `local` (no issue).
-- **Identity:** `<project>:issue-<n>` or `<project>:local:<slug>`, plus a generation counter. Authoritative IDs are never rewritten; filesystem namespace names are deterministic derived identities.
-- **Invariant:** at most one non-terminal generation per source; terminal generations are immutable and never reactivated.
-- **Avoid:** ticket, job, "task" for WorkItem
+### ChangeSet
+Delivery unit in exactly one Project. Owns `issues[]`, one working copy, one branch, implementation/review flow and one PR. May be local, with no issues.
+- **Identity:** immutable semantic slug, such as `plugin-lifecycle-safety`. Issue numbers, branch and PR number provide external references; database keys are private.
+- **Invariant:** an issue belongs to at most one non-terminal ChangeSet in its Project. At most one active Task per ChangeSet. Terminal records never reactivate.
+- **Avoid:** WorkItem, ticket, job, issue-owned execution, task for the delivery unit
+
+### SourceRef
+Reference to an issue by Project slug and issue number. Several SourceRefs may belong to one ChangeSet; they do not own execution.
 
 ### Task
-One execution attempt on a WorkItem. Role `implement` or `review`. Runs in one container.
-- **Invariant:** at most one active Task per WorkItem. Implement and review never overlap. Finalized Tasks are immutable.
-- **Outcomes:** implement: success, failed, cancelled. review: pass, reject, failed, cancelled. `reject` is not failure.
+One implementation or review attempt on a ChangeSet, executed by a fresh Worker.
+- **Invariant:** implement and review never overlap on the same change. Finalized Tasks are immutable.
+- **Outcomes:** implementation: success, failed, cancelled. Review: pass, reject, failed, cancelled. Reject is not execution failure.
 
 ### Relation
-Directed `Requires` or symmetric `Conflicts` between WorkItems. Cross-project work exists only through Relations.
-- **Invariant:** persisted only if explicit or high-confidence. Requires beats Conflicts.
+Directed `Requires` or symmetric `Conflicts` between ChangeSets. Cross-Project dependencies use Relations, never a cross-Project ChangeSet.
+- **Invariant:** only explicit or high-confidence evidence is effective. Requires takes precedence. References among issues inside one ChangeSet are internal scope, not scheduling edges.
 
 ### Decision
-Pending question to the user (merge approval, structural approval, blocker resolution). One per subject.
-- **Invariant:** only affected WorkItems and dependents wait.
+Pending user approval, selected publicly by change name, never by a database key. Only affected changes and their dependents wait.
 
 ### Blocked
-Exceptional state requiring user resolution or explicit "continue". Always carries a typed `BlockReason`. Reasons fixable externally (gh auth restored, network back) auto-resume after reconciliation; user-owned reasons (merge rejected, PR closed, review cap, explicit-cycle) need "continue".
+Exceptional ChangeSet state carrying a typed reason and its prior flow state. Externally fixable causes may auto-resume after fresh reconciliation; user-owned causes need explicit continuation.
 
 ### Generation
-Counter for repeated work on one source. Never reused.
+Private counter preserving history when a terminal source needs new work. Never reused for the same source selection.
 
-## WorkItem states
+## Durable invariants
 
-`Planned` waiting on relation/condition. `Ready` runnable, may wait for a slot. `Implementing` / `Reviewing` active Task. `AwaitingMerge` PR open, review valid. `Blocked`. Terminal: `Done` (merged), `Obsolete`, `Cancelled`.
-There is no `Failed`: Task failed → WorkItem Blocked.
+1. Workspace authority is exactly `cwd/.merro`. Initialization is explicit; no parent search or startup creation.
+2. Public identity is semantic. Internal IDs never appear in status, plans, errors, Task text, worker/path/branch names, PRs, comments, notifications or normal exports.
+3. Review follows green reported command verification and uses a fresh Worker. Rejection leads to a fresh implementer and fresh reviewer on the same change/branch.
+4. Merge needs explicit per-PR approval unless the user merged externally. Main never force-pushes or rewrites finalized Task commits.
+5. GitHub owns issue/PR/policy/merge truth; Git owns commits and working copies; tmux/process identity owns worker liveness. Merro owns orchestration metadata.
+6. Requires unblocks only on actual completion, normally merge. Merro never auto-splits or auto-creates issues.
+7. Guidance precedence: current user instruction, ChangeSet guidance, Project guidance, repository instructions.
 
-## Global invariants
-
-1. Only Main talks to the user and writes the store.
-2. Main never force-pushes. Finalized Task commits are never rewritten.
-3. Merge needs explicit per-PR approval, except when the user merged externally.
-4. External state wins on reconciliation: GitHub for issues/PRs/reviews/checks/policy/merge, Git for branches/commits/clones, Docker/tmux for live workers, Merro store for orchestration metadata, decisions, guidance.
-5. A Task execution failure is reported once; only infra-class failure (worker died with no result) gets one automatic retry.
-6. `Requires` dependents unblock only on actual completion (merge for PR-backed work).
-7. Merro never auto-splits an issue and never auto-creates issues.
-8. Guidance precedence: current user instruction, WorkItem guidance, Project guidance, repo instructions.
+For transitions and operational policy, read [lifecycle.md](docs/lifecycle.md). For worker contracts, read [worker-protocol.md](docs/worker-protocol.md).

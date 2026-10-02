@@ -13,9 +13,9 @@ import { taskWindowName, WorkerRuntime } from "../src/runtime/worker-runtime.js"
 const exists = async (path: string): Promise<boolean> => access(path).then(() => true, () => false);
 const execFileAsync = promisify(execFile);
 
-test("Task tmux names use readable WorkItem references", () => {
-  assert.equal(taskWindowName("implement", "kinetix:issue-188:g1"), "impl-188");
-  assert.equal(taskWindowName("review", "kinetix:local:refresh-cli:g2"), "rev-local-refresh-cli");
+test("Task tmux names use readable ChangeSet references", () => {
+  assert.equal(taskWindowName("implement", "plugin-lifecycle-safety"), "impl-plugin-lifecycle-safety");
+  assert.equal(taskWindowName("review", "refresh-cli"), "rev-refresh-cli");
   assert.equal(taskWindowName("implement", "legacy-work"), "impl-legacy-work");
 });
 
@@ -26,7 +26,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   const clonePath = join(root, 'worker: clone,"quoted",it\'s');
   const workspacePath = join(root, 'runtime: workspace,"quoted"');
   const piConfigPath = join(root, "pi-config");
-  const dependencyPath = join(workspacePath, "tasks", "task-1", "dependencies", "dependency: checkout");
+  const dependencyPath = join(workspacePath, "tasks", "review-safety", "dependencies", "dependency: checkout");
   await Promise.all([mkdir(projectPath), mkdir(clonePath), mkdir(piConfigPath), mkdir(dependencyPath, { recursive: true })]);
   await writeFile(join(piConfigPath, "settings.json"), '{"theme":"host-theme"}\n');
   await writeFile(join(piConfigPath, "auth.json"), '{"apiKey":"test-secret"}\n');
@@ -73,7 +73,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
           containerArgs = tokens;
           return { stdout: "%1\n", stderr: "" };
         }
-        if (args[0] === "display-message") return { stdout: "123 123 1700000000\n", stderr: "" };
+        if (args[0] === "display-message") return { stdout: "@1\n", stderr: "" };
         return { stdout: "", stderr: "" };
       }
       if (file === "docker") {
@@ -101,13 +101,14 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
 
   const runtime = new WorkerRuntime({
     workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: "none", pi_config: "copy" },
+    config: { ...DEFAULT_CONFIG, sandbox: "none" },
     commands,
     piConfigPath,
   });
   const record = await runtime.launch({
     taskId: "task-1",
-    workItemId: "merro-acceptance:issue-1:g1",
+    changeSetId: "merro-acceptance:issue-1:g1",
+    changeSlug: "safety", taskName: "review-safety",
     role: "review",
     project,
     clonePath,
@@ -126,12 +127,12 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
 
   assert.equal(record.containerId, containerId);
   assert.equal(record.processPid, 1);
-  const stagedConfig = join(workspacePath, "tasks", "task-1", "pi-config");
+  const stagedConfig = join(workspacePath, "tasks", "review-safety", "pi-config");
   assert.equal(await readFile(join(stagedConfig, "settings.json"), "utf8"), '{"theme":"host-theme"}\n');
   assert.equal(await readFile(join(stagedConfig, "auth.json"), "utf8"), '{"apiKey":"test-secret"}\n');
   assert.deepEqual((await readdir(stagedConfig)).sort(), ["auth.json", "settings.json"]);
   assert.equal(await exists(environmentFile), false);
-  const extensionRoot = join(workspacePath, "tasks", "task-1", "merro-runtime");
+  const extensionRoot = join(workspacePath, "tasks", "review-safety", "merro-runtime");
   assert.equal(await exists(join(extensionRoot, "tools", "worker-result.js")), true);
   assert.equal(await exists(join(extensionRoot, "protocol", "result.js")), true);
   assert.equal(await exists(join(extensionRoot, "node_modules", "typebox")), false);
@@ -139,7 +140,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(!containerArgs.includes("--volume"));
   assert.deepEqual(mountArgs, [
     `type=bind,"src=${clonePath.replaceAll('"', '""')}",dst=/work,readonly`,
-    `type=bind,"src=${workspacePath.replaceAll('"', '""')}/tasks/task-1",dst=/merro-task`,
+    `type=bind,"src=${workspacePath.replaceAll('"', '""')}/tasks/review-safety",dst=/merro-task`,
     `type=bind,"src=${dependencyPath.replaceAll('"', '""')}",dst=/merro-dependencies/1,readonly`,
   ]);
   assert.ok(!mountArgs.some((value) => value.includes(projectPath)));
@@ -147,7 +148,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(containerArgs.includes("--cap-drop"));
   const start = calls.find((call) => call.file === "tmux" && call.args[0] === "new-session");
   assert.ok(start);
-  assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-1");
+  assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-safety");
   assert.ok(containerArgs.includes("merro-worker:pi-0.99.1"));
   const imageBuild = calls.find((call) => call.file === "docker" && call.args[0] === "build");
   assert.ok(imageBuild);
@@ -162,19 +163,19 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(containerArgs.includes("merro.work_item_id=merro-acceptance:issue-1:g1"));
   assert.ok(start.args.includes("merro-acceptance:issue-1:g1"));
   assert.ok(calls.some((call) => call.file === "docker" && call.args[0] === "build"));
-  assert.equal(await exists(join(workspacePath, "container-ids", "task-1.cid")), true);
+  assert.equal(await exists(join(workspacePath, "container-ids", "review-safety.cid")), true);
 
   await runtime.cleanup(record);
-  assert.equal(await exists(join(workspacePath, "container-ids", "task-1.cid")), false);
+  assert.equal(await exists(join(workspacePath, "container-ids", "review-safety.cid")), false);
   assert.equal(await exists(record.resultPath), false);
 
   const movedPath = join(root, "moved-project");
   await rename(projectPath, movedPath);
   containerId = "b".repeat(64);
-  const restarted = new WorkerRuntime({ workspacePath, config: DEFAULT_CONFIG, commands, piConfigPath });
+  const restarted = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "docker" }, commands, piConfigPath });
   const legacyClonePath = join(root, "merro-acceptance:issue-1:g1");
   await mkdir(legacyClonePath);
-  const successor = await restarted.launch({ taskId: "task-2", workItemId: "merro-acceptance:issue-1:g1", role: "implement",
+  const successor = await restarted.launch({ taskId: "task-2", changeSetId: "merro-acceptance:issue-1:g1", changeSlug: "safety", taskName: "implement-safety", role: "implement",
     project: { ...project, path: movedPath }, clonePath: legacyClonePath, taskFile: "Implement after Project adoption.",
     expectedCommit: "b".repeat(40), projectSettings: null });
   assert.equal(successor.containerId, containerId);
@@ -236,11 +237,11 @@ test("cleanup preserves mismatched results and active input, removes auth and la
   t.after(() => rm(root, { recursive: true, force: true }));
   const runtime = new WorkerRuntime({ workspacePath: root, config: DEFAULT_CONFIG });
   const record = runtime.plan({
-    taskId: "old-task", workItemId: "work", role: "implement",
+    taskId: "old-task", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement",
     project: { slug: "project", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" },
     clonePath: join(root, "clone"), taskFile: "old input", expectedCommit: "a".repeat(40), projectSettings: null,
   });
-  const scratch = join(root, "tasks", "old-task");
+  const scratch = join(root, "tasks", "implement-safety");
   await mkdir(record.clonePath);
   await mkdir(join(scratch, "pi-config"), { recursive: true });
   await mkdir(join(scratch, "merro-runtime"));
@@ -252,9 +253,9 @@ test("cleanup preserves mismatched results and active input, removes auth and la
   await writeFile(join(scratch, "pi-config", "auth.json"), "private auth");
   await writeFile(join(scratch, "merro-runtime", "worker-result.js"), "staged extension");
   await chmod(join(scratch, "pi-config"), 0o500);
-  await writeFile(join(root, "launch-secrets", "old-task.env"), "GH_TOKEN=secret");
-  await writeFile(join(root, "launch-secrets", "old-task.sh"), "export GITHUB_TOKEN=secret");
-  await writeFile(join(root, "container-ids", "old-task.cid"), "container");
+  await writeFile(join(root, "launch-secrets", "implement-safety.env"), "GH_TOKEN=secret");
+  await writeFile(join(root, "launch-secrets", "implement-safety.sh"), "export GITHUB_TOKEN=secret");
+  await writeFile(join(root, "container-ids", "implement-safety.cid"), "container");
   const options = { preserveResult: true, preserveTaskInput: true };
   await runtime.cleanup(record, options);
   await runtime.cleanup(record, options);
@@ -301,14 +302,15 @@ for (const sandbox of ["docker", "none"] as const) {
     };
     const runtime = new WorkerRuntime({
       workspacePath,
-      config: { ...DEFAULT_CONFIG, sandbox, worker_github: "on", pi_config: "clean" },
+      config: { ...DEFAULT_CONFIG, sandbox, worker_github: "on" },
       commands,
       piConfigPath: join(root, "missing-pi-config"),
     });
 
     await assert.rejects(runtime.launch({
       taskId: `failed-${sandbox}`,
-      workItemId: "work-1",
+      changeSetId: "work-1",
+      changeSlug: "safety", taskName: "implement-safety",
       role: "implement",
       project,
       clonePath,
@@ -333,7 +335,7 @@ test("partial host launch rolls back the owned tmux window before removing Task 
   t.after(() => rm(root, { recursive: true, force: true }));
   let windowExists = false;
   let stopped = false;
-  const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
+  const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off" }, piConfigPath: join(root, "missing"), commands: {
     async run(file, args) {
       assert.equal(file, "tmux");
       if (args[0] === "has-session") throw new Error("missing session");
@@ -343,7 +345,7 @@ test("partial host launch rolls back the owned tmux window before removing Task 
       return { stdout: "", stderr: "" };
     },
   } });
-  const input = { taskId: "partial", workItemId: "work", role: "implement" as const, project: { slug: "partial", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, clonePath: root, taskFile: "implement", expectedCommit: "a".repeat(40), projectSettings: null };
+  const input = { taskId: "partial", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement" as const, project: { slug: "partial", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, clonePath: root, taskFile: "implement", expectedCommit: "a".repeat(40), projectSettings: null };
   await assert.rejects(runtime.launch(input), /process identity lookup failed/);
   assert.equal(stopped, true);
   assert.equal(await exists(runtime.plan(input).resultPath), false);
@@ -356,12 +358,12 @@ for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"
     t.after(() => rm(root, { recursive: true, force: true }));
     const workspacePath = join(root, "runtime");
     const taskId = "failed-docker";
-    const cidPath = join(workspacePath, "container-ids", `${taskId}.cid`);
+    const cidPath = join(workspacePath, "container-ids", "implement-safety.cid");
     const original = new Error("Docker launch failed before recording worker identity");
     let containerAlive = scenario === "unrecorded container";
     let stops = 0;
     const runtime = new WorkerRuntime({ workspacePath,
-      config: { ...DEFAULT_CONFIG, worker_github: "on", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
+      config: { ...DEFAULT_CONFIG, sandbox: "docker", worker_github: "on" }, piConfigPath: join(root, "missing"), commands: {
         async run(file, args) {
           if (file === "gh") return { stdout: "launch-secret\n", stderr: "" };
           if (file === "pi") return { stdout: "1.0.0\n", stderr: "" };
@@ -372,6 +374,7 @@ for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"
               if (containerAlive) await writeFile(cidPath, "a".repeat(64));
               throw original;
             }
+            if (args[0] === "display-message" && args.at(-1) === "#{window_id}") return { stdout: "@5", stderr: "" };
             if (args[0] === "kill-window" || args[0] === "display-message") {
               const detail = "could not find pane";
               throw new CommandError(file, args, Object.assign(new Error(detail), { code: 1 }), detail);
@@ -380,8 +383,8 @@ for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"
           if (file === "docker") {
             if (args[0] === "image") return { stdout: "[]", stderr: "" };
             if (args[0] === "inspect") {
-              if (!containerAlive) throw new Error("No such container");
-              assert.equal(args[1], `merro-${taskId}`);
+              if (!containerAlive) throw new CommandError(file, args, new Error("No such container"), "No such container");
+              assert.equal(args[1], "merro-implement-safety");
               return { stdout: JSON.stringify([{ Id: "a".repeat(64), State: { Running: true }, Config: { Labels: { "merro.task_id": taskId } } }]), stderr: "" };
             }
             if (args[0] === "exec") return { stdout: "pi --print", stderr: "" };
@@ -391,7 +394,7 @@ for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"
         },
       },
     });
-    const input = { taskId, workItemId: "merro-acceptance:issue-1:g1", role: "implement" as const,
+    const input = { taskId, changeSetId: "merro-acceptance:issue-1:g1", changeSlug: "safety", taskName: "implement-safety", role: "implement" as const,
       project: { slug: "rollback", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" },
       clonePath: root, taskFile: "implement", expectedCommit: "a".repeat(40), projectSettings: null };
     await assert.rejects(runtime.launch(input), (error: unknown) => {
@@ -403,7 +406,7 @@ for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"
     assert.equal(containerAlive, false);
     assert.equal(stops, scenario === "unrecorded container" ? 1 : 0);
     assert.equal(await exists(cidPath), false);
-    assert.equal(await exists(join(workspacePath, "tasks", taskId)), false);
+    assert.equal(await exists(join(workspacePath, "tasks", "implement-safety")), false);
     assert.equal(await exists(join(root, ".merro-task.md")), false);
     assert.deepEqual(await readdir(join(workspacePath, "launch-secrets")), []);
   });
@@ -416,7 +419,7 @@ test("Docker launch rollback reports real tmux cleanup failures alongside the or
   const killError = new Error("tmux permission denied");
   const lookupError = new Error("tmux connection lost");
   const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"),
-    config: { ...DEFAULT_CONFIG, worker_github: "off", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
+    config: { ...DEFAULT_CONFIG, sandbox: "docker", worker_github: "off" }, piConfigPath: join(root, "missing"), commands: {
       async run(file, args) {
         if (file === "docker" && args[0] === "image") return { stdout: "[]", stderr: "" };
         if (file === "pi") return { stdout: "1.0.0\n", stderr: "" };
@@ -430,7 +433,7 @@ test("Docker launch rollback reports real tmux cleanup failures alongside the or
       },
     },
   });
-  await assert.rejects(runtime.launch({ taskId: "failed", workItemId: "work", role: "implement",
+  await assert.rejects(runtime.launch({ taskId: "failed", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement",
     project: { slug: "rollback", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" },
     clonePath: root, taskFile: "implement", expectedCommit: "a".repeat(40), projectSettings: null }), (error: unknown) => {
     assert.ok(error instanceof AggregateError);
@@ -441,7 +444,7 @@ test("Docker launch rollback reports real tmux cleanup failures alongside the or
   });
   assert.deepEqual(await readdir(join(root, "runtime", "launch-secrets")), []);
   // Keep Task artifacts when process cleanup cannot be confirmed.
-  assert.equal(await exists(join(root, "runtime", "tasks", "failed")), true);
+  assert.equal(await exists(join(root, "runtime", "tasks", "implement-safety")), true);
 });
 
 test("host network isolation is rejected before any setup command runs", async (t) => {
@@ -511,30 +514,31 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
           return { stdout: "", stderr: "" };
         }
         if (args[0] === "show-option") {
-          return { stdout: args.at(-1) === "@merro_project" ? "sandbox-none\n" : await readFile(join(workspacePath, "workspace-owner"), "utf8"), stderr: "" };
+          return { stdout: args.at(-1) === "@merro_task_id" ? "host-task" : args.at(-1) === "@merro_project" ? "sandbox-none\n" : await readFile(join(workspacePath, "workspace-owner"), "utf8"), stderr: "" };
         }
         if (args[0] === "new-window" || args[0] === "new-session") {
           sessionExists = true;
           const command = String(args[args.indexOf("-c") + 2]);
-          workerScript = command.slice(1, -1);
+          workerScript = command.slice(6, -1);
           return { stdout: "%7\n", stderr: "" };
         }
-        if (args[0] === "display-message") return { stdout: args.at(-1) === "#{pane_pid}" ? "123\n" : "%7 123 0 node\n", stderr: "" };
+        if (args[0] === "display-message") return { stdout: args.at(-1) === "#{window_id}" ? "@7" : args.at(-1) === "#{pane_pid}" ? "123\n" : "%7 123 0 node merro-sandbox-none impl-safety @7 1\n", stderr: "" };
         return { stdout: "", stderr: "" };
       }
-      if (file === "ps") return { stdout: `${processStart}\n`, stderr: "" };
+      if (file === "ps") return { stdout: args.at(-1) === "tpgid=" ? "123" : args[0] === "-eo" ? "123 123 node /usr/bin/node /opt/pi-coding-agent/dist/cli.js" : `${processStart}\n`, stderr: "" };
       throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
     },
   };
   const runtime = new WorkerRuntime({
     workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off", pi_config: "clean" },
+    config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off" },
     commands,
     piConfigPath,
   });
   const record = await runtime.launch({
     taskId: "host-task",
-    workItemId: "work-1",
+    changeSetId: "work-1",
+    changeSlug: "safety", taskName: "implement-safety",
     role: "implement",
     project,
     clonePath,
@@ -557,16 +561,12 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   assert.equal((await runtime.inspect(record, "host-task")).identityMatches, false);
   await assert.rejects(runtime.stop(record, "host-task"), /identity does not match/);
   assert.ok(workerScript);
-  const taskRoot = join(workspacePath, "tasks", "host-task");
-  const stagedConfig = join(taskRoot, "pi-config");
-  assert.deepEqual(await readdir(stagedConfig), ["auth.json"]);
-  assert.equal(await readFile(join(stagedConfig, "auth.json"), "utf8"), '{"apiKey":"test-secret"}\n');
-  assert.equal(await exists(join(stagedConfig, "settings.json")), false);
-  assert.equal(await exists(join(stagedConfig, "sessions")), false);
+  const taskRoot = join(workspacePath, "tasks", "implement-safety");
+  assert.equal(await exists(join(taskRoot, "pi-config")), false);
   const script = await readFile(workerScript, "utf8");
   assert.ok(script.includes("export MERRO_RUNTIME='worker'"));
-  assert.ok(script.includes(`export HOME='${join(taskRoot, "home")}'`));
-  assert.ok(script.includes(`export PI_CODING_AGENT_DIR='${join(taskRoot, "pi-config")}'`));
+  assert.ok(script.includes(`export HOME='${process.env.HOME}'`));
+  assert.ok(!script.includes(`export PI_CODING_AGENT_DIR='${join(taskRoot, "pi-config")}'`));
   assert.ok(script.includes(`'${join(taskRoot, "merro-runtime", "tools", "worker-result.js")}'`));
   assert.ok(script.includes(`@${join(clonePath, ".merro-task.md")}`));
   assert.ok(!script.includes("/merro-task/"));
@@ -578,6 +578,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   await mkdir(binPath);
   // biome-ignore lint/suspicious/noTemplateCurlyInString: These are literal shell parameter expansions.
   await writeFile(fakePi, "#!/bin/sh\n[ -z \"${GH_TOKEN+x}\" ] && [ -z \"${GITHUB_TOKEN+x}\" ] || exit 91\nprintf '%s\\n' \"$HOME\" \"$PI_CODING_AGENT_DIR\" \"$MERRO_RESULT_PATH\" \"$@\" > \"$MERRO_TEST_CAPTURE\"\n", { mode: 0o700 });
+  await writeFile(workerScript, script.replace(/^export PATH=.*$/m, `export PATH='${binPath}:${process.env.PATH ?? ""}'`));
   await execFileAsync("bash", [workerScript], {
     env: {
       ...process.env,
@@ -588,10 +589,11 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
     },
   });
   const invocation = (await readFile(capturePath, "utf8")).trimEnd().split("\n");
-  assert.deepEqual(invocation.slice(0, 3), [join(taskRoot, "home"), join(taskRoot, "pi-config"), join(taskRoot, ".merro-result.json")]);
+  assert.deepEqual(invocation.slice(0, 3), [process.env.HOME, process.env.PI_CODING_AGENT_DIR ?? "", join(taskRoot, ".merro-result.json")]);
   assert.deepEqual(invocation.slice(3), [
-    "--no-session", "--print", "--extension",
+    "--no-session", "--tui-mode", "regular", "--approve", "--extension",
     join(taskRoot, "merro-runtime", "tools", "worker-result.js"),
+    "--extension", join(taskRoot, "merro-runtime", "tools", "worker-lifecycle.js"),
     "--", `@${join(clonePath, ".merro-task.md")}`,
   ]);
   assert.equal(await exists(workerScript), false);

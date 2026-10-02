@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import type { MerroConfig } from "../config.js";
-import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type WorkItem } from "../domain/model.js";
+import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type ChangeSet } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle } from "../domain/relations.js";
@@ -10,16 +10,18 @@ import { schedule } from "../domain/scheduler.js";
 import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
 import { GitHubClient, GitHubMergeError, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
 import { MerroStore } from "../store/store.js";
-import type { TaskRuntimeRecord, WorkItemRuntimeRecord } from "../store/model.js";
+import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
 import { MainLock } from "./main-lock.js";
-import { workItemPathName } from "./filesystem-identity.js";
+import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
+import { requireWorkspace } from "./workspace.js";
+import { presentWorkspace, publicText, workerName } from "./presentation.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
 
-type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint">
-  & Partial<Pick<GitClient, "remoteBranchCommit" | "ensureWorkItemClone" | "createReadOnlyCheckout" | "deleteClone">>;
+type GitAdapter = Pick<GitClient, "discoverProject" | "createChangeSetClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint" | "fullDiff">
+  & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone">>;
 type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup" | "listOwnedWorkers">
@@ -37,9 +39,10 @@ export interface MainOptions {
 
 export interface ObjectiveProposal {
   id: string;
-  workItems: WorkItem[];
+  changeSets: ChangeSet[];
+  branches: Record<string, string>;
   relations: Relation[];
-  unresolved: Array<{ workItemId: string; references: string[] }>;
+  unresolved: Array<{ changeSetId: string; references: string[] }>;
   cycle: string[] | null;
 }
 
@@ -49,10 +52,12 @@ export interface ObjectiveStartInput {
   issues: ObjectiveIssueScope[];
   priority?: Priority;
   maxReviewRounds?: number | "unlimited";
+  changeSlug?: string;
+  delivery?: "together" | "separate";
 }
 
-const emptyRuntime = (workItemId: string): WorkItemRuntimeRecord => ({
-  workItemId, branchName: null, clonePath: null, baseCommit: null,
+const emptyRuntime = (changeSetId: string): ChangeSetRuntimeRecord => ({
+  changeSetId, branchName: null, clonePath: null, baseCommit: null,
   pullRequestNumber: null, pullRequestUrl: null, pullRequestState: null,
   pullRequestHeadSha: null, pullRequestBaseSha: null, mergedCommitSha: null,
   lastIssueState: null, reviewedDiffHash: null, reviewRound: 0,
@@ -60,7 +65,7 @@ const emptyRuntime = (workItemId: string): WorkItemRuntimeRecord => ({
 });
 
 function proposalFingerprint(graph: Omit<ObjectiveProposal, "id">): string {
-  return JSON.stringify({ workItems: graph.workItems.map((item) => item.id), relations: graph.relations,
+  return JSON.stringify({ changeSets: graph.changeSets.map((item) => item.id), branches: graph.branches, relations: graph.relations,
     unresolved: graph.unresolved, cycle: graph.cycle });
 }
 
@@ -68,11 +73,10 @@ function sourceId(projectSlug: string, number: number, generation: number): stri
   return `${projectSlug}:issue-${number}:g${generation}`;
 }
 
-function branchName(issue: GitHubIssue, generation: number): string {
+function branchName(issue: GitHubIssue, slug: string): string {
   const kind = issue.labels.some((label) => /bug|defect/i.test(label)) ? "fix"
     : issue.labels.some((label) => /feature|enhancement/i.test(label)) ? "feat" : "chore";
-  const slug = issue.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 44) || "work";
-  return `${kind}/${slug}-${issue.number}-g${generation}`;
+  return `${kind}/${slug}`;
 }
 
 function verificationText(entries: readonly Verification[]): string {
@@ -82,9 +86,9 @@ function verificationText(entries: readonly Verification[]): string {
   return [...commands, ...manuals].join("\n") || "- No verification recorded.";
 }
 
-function issueBody(item: WorkItem, summary: string, verification: string): string {
-  const closes = item.sourceType === "issue" ? `\n\n## Issues\n\nCloses #${item.sourceRef}` : "";
-  return `## Summary\n\n${summary}\n\n## Verification\n\n${verification}${closes}`;
+function issueBody(item: ChangeSet, summary: string, verification: string): string {
+  const closes = issueNumbers(item).length ? `\n\n## Issues\n\n${issueNumbers(item).map((number) => `Closes #${number}`).join("\n")}` : "";
+  return publicText(`## Summary\n\n${summary}\n\n## Verification\n\n${verification}${closes}`);
 }
 
 function ensureMarkdownSection(body: string, title: string, content: string): string {
@@ -93,9 +97,9 @@ function ensureMarkdownSection(body: string, title: string, content: string): st
   return `${body.trim()}\n\n${heading}\n\n${content}`.trim();
 }
 
-function reconcilePullRequestBody(body: string, item: WorkItem, verification: string): string {
-  let updated = ensureMarkdownSection(body, "Verification", verification);
-  if (item.sourceType !== "issue") return updated;
+function reconcilePullRequestBody(body: string, item: ChangeSet, verification: string): string {
+  const updated = ensureMarkdownSection(body, "Verification", verification);
+  if (!item.issues.length) return updated;
   const lines = updated.split(/\r?\n/);
   let issuesStart = lines.findIndex((line) => line.trim() === "## Issues");
   if (issuesStart < 0) {
@@ -104,14 +108,13 @@ function reconcilePullRequestBody(body: string, item: WorkItem, verification: st
   }
   let issuesEnd = issuesStart + 1;
   while (issuesEnd < lines.length && !/^##\s/.test(lines[issuesEnd] ?? "")) issuesEnd += 1;
-  if (lines.slice(issuesStart + 1, issuesEnd).some((line) => new RegExp(`^Closes\\s+#${item.sourceRef}\\s*$`, "i").test(line.trim()))) {
-    return lines.join("\n").trim();
-  }
-  lines.splice(issuesEnd, 0, "", `Closes #${item.sourceRef}`);
-  return lines.join("\n").trim();
+  const missing = issueNumbers(item).filter((number) => !lines.slice(issuesStart + 1, issuesEnd)
+    .some((line) => new RegExp(`^Closes\\s+#${number}\\s*$`, "i").test(line.trim())));
+  if (missing.length) lines.splice(issuesEnd, 0, "", ...missing.map((number) => `Closes #${number}`));
+  return publicText(lines.join("\n").trim());
 }
 
-function finalVerification(store: MerroStore, item: WorkItem, review: ReviewResult): string {
+function finalVerification(store: MerroStore, item: ChangeSet, review: ReviewResult): string {
   const implementation = store.listTasks(item.id).reverse().find((task) =>
     task.role === "implement" && task.outcome === "success" && task.resultJson !== null,
   );
@@ -130,17 +133,17 @@ function finalVerification(store: MerroStore, item: WorkItem, review: ReviewResu
 
 function finalMergeSummary(
   store: MerroStore,
-  item: WorkItem,
-  runtime: WorkItemRuntimeRecord,
+  item: ChangeSet,
+  runtime: ChangeSetRuntimeRecord,
   pullRequest: GitHubPullRequest,
 ): Record<string, unknown> {
   const tasks = store.listTasks(item.id);
   return {
-    workItem: {
+    changeSet: {
       id: item.id,
       projectSlug: item.projectSlug,
-      sourceType: item.sourceType,
-      sourceRef: item.sourceRef,
+      slug: item.slug,
+      issues: item.issues,
       generation: item.generation,
     },
     diff: {
@@ -171,10 +174,10 @@ function reviewNotes(review: ReviewResult): string {
   const notes = findings.length > 0
     ? findings.map((finding) => `- **${finding.severity}**: ${finding.summary}`).join("\n")
     : "- None.";
-  return `<!-- merro:review-notes -->\n\n## Review\n\n${review.summary}\n\n## Verification\n\n${verificationText(review.verification)}\n\n## Non-blocking findings and notes\n\n${notes}`;
+  return publicText(`<!-- merro:review-notes -->\n\n## Review\n\n${review.summary}\n\n## Verification\n\n${verificationText(review.verification)}\n\n## Non-blocking findings and notes\n\n${notes}`);
 }
 
-function terminal(item: WorkItem): boolean {
+function terminal(item: ChangeSet): boolean {
   return item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled";
 }
 
@@ -289,13 +292,15 @@ export class MainOrchestrator {
   #storeQueue: Promise<unknown> = Promise.resolve();
   readonly #proposals = new Map<string, { input: string; graph: string }>();
   readonly #pendingNotifications: Array<{ event: string; subjectId: string; message: string }> = [];
+  readonly #names = new Map<string, string>();
 
   constructor(options: MainOptions) {
     this.#workspacePath = resolve(options.workspacePath);
     this.#stateDirectory = join(this.#workspacePath, ".merro");
-    this.#workRoot = resolve(options.config.work_root ?? `${this.#workspacePath}-work`);
+    this.#workRoot = join(this.#workspacePath, ".wt");
     this.#config = options.config;
-    this.#notify = options.notify ?? ((message) => console.log(message));
+    const notify = options.notify ?? ((message: string) => console.log(message));
+    this.#notify = (message, level) => notify(publicText(message, this.#names), level);
     const commands = options.commands ?? systemCommandRunner;
     this.#commands = commands;
     this.#git = options.git ?? new GitClient(commands);
@@ -316,14 +321,34 @@ export class MainOrchestrator {
     return this.#github.listOpenIssues(project);
   }
 
-  async statusSnapshot(): Promise<{ projects: Project[]; objectives: Objective[]; workItems: WorkItem[]; tasks: Task[]; decisions: ReturnType<MerroStore["pendingDecisions"]> }> {
+  async statusSnapshot(): Promise<{ projects: Project[]; objectives: Objective[]; changeSets: ChangeSet[]; tasks: Task[]; decisions: ReturnType<MerroStore["pendingDecisions"]> }> {
     return this.#withStore((store) => ({
       projects: store.listProjects(),
       objectives: store.listObjectives(),
-      workItems: store.listWorkItems(),
+      changeSets: store.listChangeSets(),
       tasks: store.listTasks(),
       decisions: store.pendingDecisions(),
     }));
+  }
+
+  async publicSnapshot(): Promise<ReturnType<typeof presentWorkspace>> {
+    return this.#withStore(async (store) => {
+      const snapshot = presentWorkspace(store);
+      for (const item of store.listChangeSets()) {
+        const task = store.activeTask(item.id);
+        const runtime = task && store.getTaskRuntime(task.id);
+        const change = snapshot.changes.find((change) => change.name === changeName(item));
+        if (!runtime || !change) continue;
+        try {
+          const state: unknown = JSON.parse(await readFile(join(dirname(runtime.resultPath), "worker-state.json"), "utf8"));
+          if (typeof state === "object" && state !== null && "state" in state && ["busy", "idle", "finished"].includes(String(state.state))) {
+            change.workerState = String(state.state);
+            if ("lastActivity" in state) change.lastActivity = publicText(String(state.lastActivity), this.#names);
+          }
+        } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") change.lastActivity = "Worker state unreadable; reconciliation will verify identity."; }
+      }
+      return snapshot;
+    });
   }
 
   async statusSummary(): Promise<ReturnType<MerroStore["statusSummary"]>> {
@@ -337,8 +362,8 @@ export class MainOrchestrator {
   async updateRelations(relations: readonly Relation[]): Promise<void> {
     await this.#withStore((store) => {
       for (const relation of relations) {
-        if (!store.getWorkItem(relation.from)) throw new Error(`unknown WorkItem in relation: ${relation.from}`);
-        if (!store.getWorkItem(relation.to)) throw new Error(`unknown WorkItem in relation: ${relation.to}`);
+        if (!store.getChangeSet(relation.from)) throw new Error(`unknown ChangeSet in relation: ${relation.from}`);
+        if (!store.getChangeSet(relation.to)) throw new Error(`unknown ChangeSet in relation: ${relation.to}`);
       }
       store.replaceRelations(relations);
     });
@@ -346,6 +371,7 @@ export class MainOrchestrator {
   }
 
   async addProject(path: string, slug: string): Promise<Project> {
+    await requireWorkspace(this.#workspacePath);
     assertProjectSlug(slug);
     const projectPath = resolve(path);
     const gitProject = await this.#git.discoverProject(projectPath, slug);
@@ -395,40 +421,60 @@ export class MainOrchestrator {
       }
       for (const issue of selected.sort((a, b) => a.number - b.number)) issueRows.set(`${project.slug}\0${issue.number}`, issue);
     }
-    const workItems = [...issueRows].map(([key, issue]): WorkItem => {
-      const projectSlug = key.split("\0")[0]!;
-      const existing = store.findNonTerminalWorkItem(projectSlug, "issue", String(issue.number));
+    const groups: Array<{ projectSlug: string; issues: GitHubIssue[] }> = [];
+    for (const project of projects) {
+      const issues = [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue);
+      if (input.delivery === "separate") groups.push(...issues.map((issue) => ({ projectSlug: project.slug, issues: [issue] })));
+      else if (issues.length) groups.push({ projectSlug: project.slug, issues });
+    }
+    const plannedNames = new Set<string>();
+    const changeSets = groups.map(({ projectSlug, issues }): ChangeSet => {
+      const numbers = issues.map((issue) => issue.number);
+      const existing = store.findNonTerminalChangeSet(projectSlug, numbers);
       if (existing) return existing;
-      const generation = store.nextGeneration(projectSlug, "issue", String(issue.number));
-      return { id: sourceId(projectSlug, issue.number, generation), projectSlug, sourceType: "issue",
-        sourceRef: String(issue.number), generation, state: "Planned", priority: input.priority ?? "normal",
-        readySince: null, blockedReason: null, blockedResumeState: null };
+      const overlaps = store.listChangeSets().filter((item) => item.projectSlug === projectSlug && !terminal(item)
+        && issueNumbers(item).some((number) => issues.some((issue) => issue.number === number)));
+      if (overlaps.length) throw new Error(`Issues already belong to ${overlaps.map(changeName).join(", ")}. Stop that change before regrouping its issues.`);
+      const generation = store.nextGeneration(projectSlug, numbers);
+      const baseName = semanticSlug(input.changeSlug ?? (issues.length === 1 ? issues[0]!.title : input.goal));
+      const slug = store.availableChangeName(baseName, plannedNames);
+      plannedNames.add(slug);
+      const id = issues.length === 1 ? sourceId(projectSlug, issues[0]!.number, generation) : `${projectSlug}:change:${slug}:g${generation}`;
+      this.#names.set(id, slug);
+      return { id, slug, projectSlug, issues: numbers.map((number) => ({ projectSlug, number })), generation,
+        state: "Planned", priority: input.priority ?? "normal", readySince: null, blockedReason: null, blockedResumeState: null };
     });
-    // Shared WorkItems retain relations to work already approved by another active Objective.
+    // Shared ChangeSets retain relations to work already approved by another active Objective.
     const objectives = store.listObjectives().filter((candidate) => candidate.state === "Active");
     const relations: Relation[] = [];
     const unresolved: ObjectiveProposal["unresolved"] = [];
-    for (const item of workItems) {
-      const issue = issueRows.get(`${item.projectSlug}\0${item.sourceRef}`)!;
-      const approved = new Map(workItems.map((candidate) => [candidate.id, candidate]));
+    for (const item of changeSets) {
+      const approved = new Map(changeSets.map((candidate) => [candidate.id, candidate]));
       for (const objective of objectives) {
-        const attached = store.listWorkItems(objective.id, true);
+        const attached = store.listChangeSets(objective.id, true);
         if (attached.some((candidate) => candidate.id === item.id)) {
           for (const candidate of attached) approved.set(candidate.id, candidate);
         }
       }
-      const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
-      relations.push(...analysis.relations);
-      if (analysis.unresolved.length) unresolved.push({ workItemId: item.id, references: analysis.unresolved });
+      const references = new Set<string>();
+      for (const number of issueNumbers(item)) {
+        const issue = issueRows.get(`${item.projectSlug}\0${number}`)!;
+        const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
+        relations.push(...analysis.relations);
+        for (const reference of analysis.unresolved) references.add(reference);
+      }
+      if (references.size) unresolved.push({ changeSetId: item.id, references: [...references] });
     }
-    const ids = new Set(workItems.map((item) => item.id));
+    const ids = new Set(changeSets.map((item) => item.id));
     const effective = store.previewAutomaticRelations([...ids], relations)
       .filter((relation) => ids.has(relation.from) || ids.has(relation.to));
     return { projects, issueScopes, issueRows, automaticRelations: relations,
-      graph: { workItems, relations: effective, unresolved, cycle: findRequiresCycle(effective) } };
+      graph: { changeSets, branches: Object.fromEntries(changeSets.map((item) => [item.id,
+        store.getChangeSetRuntime(item.id)?.branchName ?? branchName(issueRows.get(`${item.projectSlug}\0${issueNumbers(item)[0]}`)!, item.slug)])),
+        relations: effective, unresolved, cycle: findRequiresCycle(effective) } };
   }
 
-  async startObjective(input: ObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; workItems: WorkItem[] }> {
+  async startObjective(input: ObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
     if (!input.goal.trim()) throw new Error("Objective goal must not be empty");
     if (input.projectSlugs.length === 0) throw new Error("Objective requires at least one Project");
     return this.#withStore(async (store) => {
@@ -443,37 +489,114 @@ export class MainOrchestrator {
 
       const objective: Objective = {
         id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
-        projectSlugs: projects.map((project) => project.slug), issueScopes,
+        projectSlugs: projects.map((project) => project.slug),
+        issueScopes: input.delivery === "separate" ? issueScopes : projects.map((project) => ({ projectSlug: project.slug,
+          numbers: [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue.number) })),
         ...(input.maxReviewRounds === undefined ? {} : { maxReviewRounds: input.maxReviewRounds }),
       };
       store.createObjective(objective);
-      const items: WorkItem[] = [];
-      for (const [key, issue] of issueRows) {
-        const projectSlug = key.split("\0")[0] ?? "";
-        items.push(this.#attachIssue(store, objective, projectSlug, issue));
+      this.#names.set(objective.id, objective.goal);
+      const items: ChangeSet[] = [];
+      for (const planned of graph.changeSets) {
+        if (!store.getChangeSet(planned.id)) store.createChangeSet(planned);
+        store.attachChangeSet(objective.id, planned.id);
+        const item = store.getChangeSet(planned.id)!;
+        this.#names.set(item.id, changeName(item));
+        if (priorityRank(objective.priority) < priorityRank(item.priority)) store.setChangeSetPriority(item.id, objective.priority);
+        items.push(store.getChangeSet(item.id)!);
       }
       store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations);
-      this.#notify(`Objective ${objective.id} approved with ${items.length} WorkItem(s).`);
-      return { objective, workItems: items };
+      this.#notify(`Started ${items.map(changeName).join(", ")}.`);
+      return { objective, changeSets: items };
+    });
+  }
+
+  async approveObjective(name?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
+    const [entry] = this.#proposals;
+    if (!entry) throw new Error("No pending plan. Propose a plan and obtain approval first.");
+    const [id, proposal] = entry;
+    const input = JSON.parse(proposal.input) as ObjectiveStartInput;
+    if (name && semanticSlug(name) !== semanticSlug(input.changeSlug ?? input.goal)) throw new Error("That name does not match the pending plan.");
+    return this.startObjective(input, id);
+  }
+
+  async restartChange(name: string, requirements: string): Promise<void> {
+    if (!requirements.trim()) throw new Error("Describe the changed requirements for the fresh attempt.");
+    await this.#withStore(async (store) => {
+      let item = store.listChangeSets().find((item) => item.slug === semanticSlug(name));
+      if (!item || terminal(item)) throw new Error("No active change matches that name.");
+      if (!store.hasActiveObjectiveForChangeSet(item.id)) throw new Error("The objective is stopped. Approve a new plan first.");
+      const { projectSlug, slug } = item;
+      const assertWorkerSafety = async () => {
+        const { unsafeProjects } = await this.#workerSafetyPreflight(store);
+        if (unsafeProjects.has(projectSlug)) throw new Error(`Cannot restart ${slug}: worker safety is unverified. Inspect owned workers and retry.`);
+      };
+      await assertWorkerSafety();
+      const task = store.activeTask(item.id);
+      const runtime = task && store.getTaskRuntime(task.id);
+      if (task && !runtime) throw new Error("Worker identity is missing; inspect the worker before restarting.");
+      if (task && runtime) {
+        if (!this.#git.discardAttempt || !this.#workers.stop) throw new Error("Cannot safely stop and discard the previous attempt.");
+        await this.#workers.stop(runtime, task.id);
+        if ((await this.#workers.inspect(runtime, task.id)).alive) throw new Error("Worker is still alive. Retry after it exits.");
+        await assertWorkerSafety();
+        store.finalizeTask({ id: task.id, outcome: "cancelled", summary: "Stopped for changed requirements", resultJson: "{}" });
+        try { await this.#git.discardAttempt(runtime.clonePath, runtime.expectedCommit); }
+        catch (error) { this.#block(store, item, "task_failed", `Stopped worker, but could not restore the attempt base: ${errorText(error)}`); throw error; }
+      }
+      store.saveChangeSetGuidance(item.id, `${item.guidance ?? ""}\n\nChanged requirements:\n${requirements}`.trim());
+      this.#resolvePullRequestDecisions(store, item.id);
+      if (item.state === "Blocked") {
+        store.transitionChangeSet(item.id, item.blockedResumeState!);
+        item = store.getChangeSet(item.id)!;
+      }
+      if (item.state === "Reviewing" || item.state === "AwaitingMerge") store.transitionChangeSet(item.id, "Implementing");
+      const workRuntime = store.getChangeSetRuntime(item.id);
+      if (workRuntime) { workRuntime.infrastructureRetries = 0; store.saveChangeSetRuntime(workRuntime); }
+      this.#notify(`Stopped the previous attempt for ${item.slug}. Starting a fresh implementation with the changed requirements.`);
+    });
+    await this.runPass();
+  }
+
+  async resolveDecisionForChange(name: string, approved: boolean): Promise<void> {
+    const id = await this.decisionForChange(name);
+    const kind = await this.#withStore((store) => store.getDecision(id)?.kind);
+    if (kind === "merge_conflict") await this.resolveMergeConflictDecision(id, approved ? "resolved" : "abandon");
+    else await this.resolveMergeDecision(id, approved);
+  }
+
+  async decisionForChange(name = ""): Promise<string> {
+    return this.#withStore((store) => {
+      const matches = store.pendingDecisions().filter((decision) => {
+        const item = store.getChangeSet(decision.subjectId);
+        return !name || item && changeName(item) === semanticSlug(name);
+      });
+      if (matches.length !== 1) throw new Error(matches.length ? "Which change? Name the change you want to approve." : "No pending decision for that change.");
+      return matches[0]!.id;
     });
   }
 
   async stopObjectives(objectiveId?: string): Promise<number> {
-    const stopped = await this.#withStore((store) => store.stopActiveObjectives(objectiveId));
+    const stopped = await this.#withStore((store) => {
+      const objective = objectiveId ? store.listObjectives().find((entry) => entry.id === objectiveId || entry.goal === objectiveId
+        || store.listChangeSets(entry.id).some((item) => changeName(item) === objectiveId)) : undefined;
+      if (objectiveId && !objective) throw new Error("No active objective matches that name.");
+      return store.stopActiveObjectives(objective?.id);
+    });
     await this.runPass();
     return stopped;
   }
 
-  async continueWorkItem(workItemId: string): Promise<void> {
+  async continueChangeSet(changeSetId: string): Promise<void> {
     await this.#withStore((store) => {
-      const item = store.getWorkItem(workItemId);
-      if (!item || item.state !== "Blocked" || !item.blockedResumeState) throw new Error(`WorkItem ${workItemId} is not Blocked`);
-      store.transitionWorkItem(item.id, item.blockedResumeState);
-      const runtime = store.getWorkItemRuntime(item.id) ?? emptyRuntime(item.id);
+      const item = store.getChangeSet(changeSetId) ?? store.listChangeSets().find((item) => changeName(item) === semanticSlug(changeSetId));
+      if (!item || item.state !== "Blocked" || !item.blockedResumeState) throw new Error(`ChangeSet ${changeSetId} is not Blocked`);
+      store.transitionChangeSet(item.id, item.blockedResumeState);
+      const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
       if (item.blockedReason === "review_cap" || item.blockedReason === "task_failed") runtime.infrastructureRetries = 0;
       if (item.blockedReason === "review_cap") runtime.reviewRound = 0;
-      store.saveWorkItemRuntime(runtime);
-      this.#notify(`Continued WorkItem ${workItemId}.`);
+      store.saveChangeSetRuntime(runtime);
+      this.#notify(`Continued ${changeName(item)}.`);
     });
     await this.runPass();
   }
@@ -494,11 +617,11 @@ export class MainOrchestrator {
       if (!decision || decision.state !== "pending" || decision.kind !== "merge") {
         throw new Error(`pending merge Decision not found: ${decisionId}`);
       }
-      const item = store.getWorkItem(decision.subjectId);
-      const runtime = item && store.getWorkItemRuntime(item.id);
+      const item = store.getChangeSet(decision.subjectId);
+      const runtime = item && store.getChangeSetRuntime(item.id);
       const project = item && store.getProject(item.projectSlug);
       if (!item || item.state !== "AwaitingMerge" || !runtime?.pullRequestNumber || !project) {
-        throw new Error(`merge Decision ${decisionId} no longer matches an AwaitingMerge WorkItem`);
+        throw new Error(`merge Decision ${decisionId} no longer matches an AwaitingMerge ChangeSet`);
       }
 
       const { unsafeProjects } = await this.#workerSafetyPreflight(store);
@@ -517,7 +640,7 @@ export class MainOrchestrator {
             this.#block(store, item, "github_unavailable", "Merged pull request has no valid merge commit SHA");
             return;
           }
-          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
+          await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
           store.resolveDecision(decisionId, "resolved");
           await this.#finishObjectives(store, new Set(), unsafeProjects);
           return;
@@ -538,7 +661,7 @@ export class MainOrchestrator {
           : {};
         const expectedDiff = typeof payload.diffHash === "string" ? payload.diffHash : null;
         if (runtime.clonePath && runtime.branchName) {
-          await this.#git.ensureWorkItemClone?.(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
+          await this.#git.ensureChangeSetClone?.(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
         }
         const currentDiff = runtime.clonePath
           ? await this.#git.effectiveDiffFingerprint(project, runtime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid)
@@ -562,13 +685,13 @@ export class MainOrchestrator {
           || !await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
           store.resolveDecision(decisionId, "resolved");
           runtime.reviewedDiffHash = null;
-          store.saveWorkItemRuntime(runtime);
-          this.#notify(`Merge approval for WorkItem ${item.id} expired because the pull request diff changed or is no longer merge-ready.`, "warning");
+          store.saveChangeSetRuntime(runtime);
+          this.#notify(`Merge approval for ChangeSet ${item.id} expired because the pull request diff changed or is no longer merge-ready.`, "warning");
           return;
         }
         if (runtime.reviewedDiffHash === null) {
           runtime.reviewedDiffHash = currentDiff;
-          store.saveWorkItemRuntime(runtime);
+          store.saveChangeSetRuntime(runtime);
         }
 
         mergeAttempted = true;
@@ -577,7 +700,7 @@ export class MainOrchestrator {
         pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
         if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
         if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("GitHub did not report a valid merged commit SHA");
-        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
+        await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
         store.resolveDecision(decisionId, "approved");
       } catch (error) {
         store.resolveDecision(decisionId, "resolved");
@@ -597,12 +720,12 @@ export class MainOrchestrator {
       if (!decision || decision.state !== "pending" || decision.kind !== "merge_conflict") {
         throw new Error(`pending merge_conflict Decision not found: ${decisionId}`);
       }
-      const item = store.getWorkItem(decision.subjectId);
-      const runtime = item && store.getWorkItemRuntime(item.id);
+      const item = store.getChangeSet(decision.subjectId);
+      const runtime = item && store.getChangeSetRuntime(item.id);
       const project = item && store.getProject(item.projectSlug);
       if (!item || item.state !== "AwaitingMerge" || !runtime?.clonePath || !runtime.branchName
         || !runtime.pullRequestNumber || !project) {
-        throw new Error(`merge_conflict Decision ${decisionId} no longer matches an AwaitingMerge WorkItem`);
+        throw new Error(`merge_conflict Decision ${decisionId} no longer matches an AwaitingMerge ChangeSet`);
       }
       const { unsafeProjects } = await this.#workerSafetyPreflight(store);
       if (resolution === "resolved" && unsafeProjects.has(project.slug)) {
@@ -618,7 +741,7 @@ export class MainOrchestrator {
       this.#savePullRequest(store, runtime, pullRequest);
       if (pullRequest.mergedAt) {
         if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("merged pull request has no valid merge commit SHA");
-        await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
+        await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
         store.resolveDecision(decisionId, "resolved");
         return;
       }
@@ -627,8 +750,8 @@ export class MainOrchestrator {
         this.#block(store, item, "pr_closed", "Pull request was closed without merging");
         return;
       }
-      if (!this.#git.ensureWorkItemClone) throw new Error("Git adapter cannot restore the conflict branch");
-      await this.#git.ensureWorkItemClone(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
+      if (!this.#git.ensureChangeSetClone) throw new Error("Git adapter cannot restore the conflict branch");
+      await this.#git.ensureChangeSetClone(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
       const remoteHead = this.#git.remoteBranchCommit
         ? await this.#git.remoteBranchCommit(project, runtime.branchName)
         : pullRequest.headRefOid;
@@ -654,7 +777,7 @@ export class MainOrchestrator {
             await this.#refreshObjectiveScope(store, objective, unavailableProjects, scopeGates, unsafeProjects);
           }
         }
-        await this.#reconcileIssues(store, unavailableProjects, orphans.workItemIds);
+        await this.#reconcileIssues(store, unavailableProjects, orphans.changeSetIds);
         await this.#reconcileTasks(store, unavailableProjects, unsafeProjects, orphans.liveTaskIds);
         // Result submission does not prove exit. Newly finalized live workers still occupy their slots.
         if (finalizedTaskCount() !== inventoriedFinalizedTaskCount) {
@@ -662,28 +785,28 @@ export class MainOrchestrator {
           inventoriedFinalizedTaskCount = finalizedTaskCount();
         }
         store.settleScopeDetachments();
-        for (const item of store.listWorkItems()) {
+        for (const item of store.listChangeSets()) {
           if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
         }
         await this.#reconcilePullRequests(store, unavailableProjects, unsafeProjects);
-        const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.workItemIds);
+        const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds);
         for (const id of scopeGates) relationGates.add(id);
-        this.#deriveReady(store, unavailableProjects, relationGates, unsafeProjects, orphans.workItemIds);
+        this.#deriveReady(store, unavailableProjects, relationGates, unsafeProjects, orphans.changeSetIds);
         const tasks = store.listTasks();
         const active = tasks.filter((task) => task.status === "active");
-        const items = store.listWorkItems();
+        const items = store.listChangeSets();
         const result = schedule({
-          workItems: items.filter((item) => store.hasActiveObjectiveForWorkItem(item.id)
+          changeSets: items.filter((item) => store.hasActiveObjectiveForChangeSet(item.id)
             && !unavailableProjects.has(item.projectSlug) && !unsafeProjects.has(item.projectSlug) && !relationGates.has(item.id)),
           relations: store.listRelations(),
           activeTaskCount: active.length + orphans.count,
-          activeWorkItemIds: [...active.map((task) => task.workItemId), ...orphans.workItemIds],
+          activeChangeSetIds: [...active.map((task) => task.changeSetId), ...orphans.changeSetIds],
           maxConcurrentTasks: this.#config.max_concurrent_tasks,
         });
-        if (result.cycle) this.#blockCycle(store, result.cycle, new Set([...active.map((task) => task.workItemId), ...orphans.workItemIds]));
+        if (result.cycle) this.#blockCycle(store, result.cycle, new Set([...active.map((task) => task.changeSetId), ...orphans.changeSetIds]));
         for (const item of result.selected) {
-          if (item.state === "Ready") store.transitionWorkItem(item.id, "Implementing");
-          await this.#launchTask(store, store.getWorkItem(item.id) ?? item);
+          if (item.state === "Ready") store.transitionChangeSet(item.id, "Implementing");
+          await this.#launchTask(store, store.getChangeSet(item.id) ?? item);
         }
         await this.#finishObjectives(store, unavailableProjects, unsafeProjects);
       } finally {
@@ -714,7 +837,7 @@ export class MainOrchestrator {
         try {
           await this.#commands.run("bash", ["-lc", this.#config.notify_command!], {
             cwd: this.#workspacePath,
-            env: { MERRO_EVENT: notification.event, MERRO_SUBJECT_ID: notification.subjectId, MERRO_MESSAGE: notification.message },
+            env: { MERRO_EVENT: notification.event, MERRO_CHANGE: this.#names.get(notification.subjectId) ?? "change", MERRO_MESSAGE: publicText(notification.message, this.#names) },
           });
         } catch (error) {
           this.#notify(`notify_command failed: ${errorText(error)}`, "warning");
@@ -724,13 +847,23 @@ export class MainOrchestrator {
   }
 
   async #lockedStore<T>(action: (store: MerroStore) => T | Promise<T>): Promise<T> {
-    await mkdir(this.#stateDirectory, { recursive: true, mode: 0o700 });
+    await requireWorkspace(this.#workspacePath);
     const lock = new MainLock(join(this.#stateDirectory, "main.lock.db"));
     await lock.acquire();
     let store: MerroStore | undefined;
     try {
       store = new MerroStore(join(this.#stateDirectory, "state.db"));
-      return await action(store);
+      for (const item of store.listChangeSets()) this.#names.set(item.id, changeName(item));
+      for (const objective of store.listObjectives()) this.#names.set(objective.id, objective.goal);
+      for (const task of store.listTasks()) {
+        const item = store.getChangeSet(task.changeSetId);
+        if (item) this.#names.set(task.id, workerName(item, task));
+      }
+      for (const decision of store.pendingDecisions()) this.#names.set(decision.id, this.#names.get(decision.subjectId) ?? decision.kind);
+      try { return await action(store); } catch (error) {
+        if (error instanceof Error) error.message = publicText(error.message, this.#names);
+        throw error;
+      }
     } finally {
       try {
         store?.close();
@@ -740,45 +873,49 @@ export class MainOrchestrator {
     }
   }
 
-  async #launchTask(store: MerroStore, item: WorkItem): Promise<void> {
+  async #launchTask(store: MerroStore, item: ChangeSet): Promise<void> {
     const role: TaskRole = item.state === "Reviewing" ? "review" : "implement";
     const project = store.getProject(item.projectSlug);
     if (!project) return this.#block(store, item, "project_unavailable", `Project ${item.projectSlug} is not registered`);
-    let runtime = store.getWorkItemRuntime(item.id) ?? emptyRuntime(item.id);
+    let runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
     const taskId = randomUUID();
     let expectedCommit: string;
     let runtimeIntent: TaskRuntimeRecord | null = null;
     let workerLaunchStarted = false;
     try {
       assertProjectSlug(project.slug);
-      const issue = item.sourceType === "issue" ? await this.#github.issue(project, Number(item.sourceRef)) : null;
+      const issues = await Promise.all(issueNumbers(item).map((number) => this.#github.issue(project, number)));
+      const issue = issues[0] ?? null;
+      const slug = changeName(item);
+      this.#names.set(taskId, `${role === "implement" ? "impl" : "rev"}-${slug}`);
+      const attempt = store.listTasks(item.id).filter((task) => task.role === role).reduce((highest, task) => Math.max(highest, task.attempt), 0) + 1;
+      const taskName = `${role === "implement" ? "implement" : "review"}-${slug}-${attempt}`;
       if (!runtime.clonePath || !runtime.branchName) {
-        const localSlug = item.sourceRef.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 44) || "work";
-        const branch = issue ? branchName(issue, item.generation) : `chore/local-${localSlug}-g${item.generation}`;
-        const clonePath = join(this.#workRoot, project.slug, workItemPathName(item.id));
-        const clone = await this.#git.createWorkItemClone(project, clonePath, branch);
+        const branch = runtime.branchName ?? (issue ? branchName(issue, slug) : `chore/${slug}`);
+        const clonePath = join(this.#workRoot, slug);
+        const clone = await this.#git.createChangeSetClone(project, clonePath, branch);
         runtime = { ...runtime, branchName: clone.branchName, clonePath: clone.path, baseCommit: clone.baseCommit };
-        store.saveWorkItemRuntime(runtime);
+        store.saveChangeSetRuntime(runtime);
         await this.#workers.prepareClone(project, clone.path, store.getProjectSettings(project.slug));
       }
       const clonePath = runtime.clonePath;
-      if (!clonePath) throw new Error("WorkItem clone path is unavailable");
+      if (!clonePath) throw new Error("ChangeSet clone path is unavailable");
       const baseUpdate = role === "implement" ? runtime.baseUpdate ?? null : null;
       if (baseUpdate) await this.#git.fetchBaseCommit(clonePath, baseUpdate.baseRefName, baseUpdate.baseCommit);
       expectedCommit = await this.#git.currentCommit(clonePath);
-      const objective = store.listObjectives().find((candidate) => store.listWorkItems(candidate.id).some((workItem) => workItem.id === item.id));
-      if (!objective) throw new Error(`WorkItem ${item.id} is not attached to an Objective`);
+      const objective = store.listObjectives().find((candidate) => store.listChangeSets(candidate.id).some((changeSet) => changeSet.id === item.id));
+      if (!objective) throw new Error(`ChangeSet ${item.id} is not attached to an Objective`);
       const previousReview = store.listTasks(item.id).reverse().find((task) => task.role === "review" && task.resultJson);
       const latestReview = previousReview?.resultJson ? this.#reviewContext(previousReview.resultJson) : null;
       const instructions = await this.#repositoryInstructions(clonePath);
       const directDependencies = store.listRelations().filter((relation) => relation.kind === "Requires" && relation.from === item.id)
         .flatMap((relation) => {
-          const dependency = store.getWorkItem(relation.to);
+          const dependency = store.getChangeSet(relation.to);
           if (!dependency || dependency.state !== "Done") return [];
-          const depRuntime = store.getWorkItemRuntime(dependency.id);
+          const depRuntime = store.getChangeSetRuntime(dependency.id);
           const summary = store.listTasks(dependency.id).reverse().find((task) => task.role === "review" && task.summary)?.summary ?? null;
           return [{
-            workItemId: dependency.id,
+            changeSetId: dependency.id,
             projectSlug: dependency.projectSlug,
             project: store.getProject(dependency.projectSlug),
             pullRequestUrl: depRuntime?.pullRequestUrl ?? null,
@@ -791,7 +928,7 @@ export class MainOrchestrator {
       const dependencyMounts = role === "review" ? directDependencies.map((dependency, index) => {
         if (!dependency.project) throw new Error(`dependency Project ${dependency.projectSlug} is not registered`);
         if (!dependency.commit || !/^[0-9a-f]{40,64}$/i.test(dependency.commit)) {
-          throw new Error(`dependency WorkItem ${dependency.workItemId} has no exact merged commit`);
+          throw new Error(`dependency ChangeSet ${dependency.changeSetId} has no exact merged commit`);
         }
         const mountNumber = index + 1;
         return {
@@ -799,13 +936,13 @@ export class MainOrchestrator {
           commit: dependency.commit,
           mount: {
             projectSlug: dependency.projectSlug,
-            checkoutPath: join(this.#stateDirectory, "runtime", "tasks", taskId, "dependencies", String(mountNumber)),
+            checkoutPath: join(this.#stateDirectory, "runtime", "tasks", taskName, "dependencies", String(mountNumber)),
             mountPath: `/merro-dependencies/${mountNumber}`,
           },
         };
       }) : [];
       const dependencyContext = directDependencies.map((dependency, index) => ({
-        workItemId: dependency.workItemId,
+        change: this.#names.get(dependency.changeSetId) ?? "dependency",
         projectSlug: dependency.projectSlug,
         pullRequestUrl: dependency.pullRequestUrl,
         commit: dependency.commit,
@@ -815,40 +952,40 @@ export class MainOrchestrator {
         } : {}),
       }));
       const taskFile = renderTaskFile({
-        role, taskId, workItemId: item.id, projectSlug: item.projectSlug,
-        sourceType: item.sourceType, sourceRef: item.sourceRef,
-        title: issue?.title ?? item.sourceRef, scope: issue?.body ?? item.guidance ?? objective.goal,
-        objective: { id: objective.id, goal: objective.goal },
+        role, change: slug, projectSlug: item.projectSlug,
+        issues: issueNumbers(item),
+        title: slug, scope: issues.length ? issues.map((issue) => `### #${issue.number}: ${issue.title}\n\n${issue.body}`).join("\n\n") : item.guidance ?? objective.goal,
+        implementation: role === "review" ? store.listTasks(item.id).reverse().find((task) => task.role === "implement" && task.outcome === "success")?.resultJson ?? null : null,
+        diff: role === "review" ? await this.#git.fullDiff(clonePath, runtime.baseCommit ?? expectedCommit) : "",
+        objective: objective.goal,
         userGuidance: item.guidance ?? "",
         projectGuidance: projectSettings?.guidance ?? "",
         repositoryInstructions: instructions,
         dependencies: dependencyContext, latestReview, expectedCommit, baseUpdate,
       });
-      const previousTasks = store.listTasks(item.id).filter((task) => task.role === role);
-      const attempt = previousTasks.reduce((highest, task) => Math.max(highest, task.attempt), 0) + 1;
       const launchInput = {
-        taskId, workItemId: item.id, role, project, clonePath,
-        taskFile, expectedCommit, baseUpdate, projectSettings, dependencies: dependencyMounts.map(({ mount }) => mount),
+        taskId, changeSetId: item.id, changeSlug: slug, taskName, role, project, clonePath,
+        taskFile: publicText(taskFile, this.#names), expectedCommit, baseUpdate, projectSettings, dependencies: dependencyMounts.map(({ mount }) => mount),
       };
       runtimeIntent = this.#workers.plan?.(launchInput) ?? {
         taskId,
         runtimeKind: null,
         tmuxSession: `merro-${project.slug}`,
-        tmuxWindow: taskWindowName(role, item.id),
+        tmuxWindow: taskWindowName(role, slug),
         paneId: null,
         containerId: null,
         processPid: null,
         processStartedAt: null,
         clonePath,
         taskFilePath: join(clonePath, ".merro-task.md"),
-        resultPath: join(this.#stateDirectory, "runtime", "tasks", taskId, ".merro-result.json"),
+        resultPath: join(this.#stateDirectory, "runtime", "tasks", taskName, ".merro-result.json"),
         expectedCommit, ...(baseUpdate ? { baseUpdate } : {}),
         startedAt: new Date().toISOString(),
       } satisfies TaskRuntimeRecord;
-      store.createTask({ id: taskId, workItemId: item.id, role, attempt, runtime: runtimeIntent });
+      store.createTask({ id: taskId, changeSetId: item.id, role, attempt, runtime: runtimeIntent });
       if (role === "implement") {
         runtime.implementationAttempt = attempt;
-        store.saveWorkItemRuntime(runtime);
+        store.saveChangeSetRuntime(runtime);
       }
       for (const dependency of dependencyMounts) {
         if (!this.#git.createReadOnlyCheckout) throw new Error("Git adapter cannot create dependency review checkouts");
@@ -866,7 +1003,7 @@ export class MainOrchestrator {
             await this.#workers.stop(runtimeIntent, taskId);
           }
         } catch (stopError) {
-          this.#block(store, store.getWorkItem(item.id) ?? item, "task_failed", `Worker launch failed; Task remains active until it can be stopped safely: ${errorText(stopError)}`);
+          this.#block(store, store.getChangeSet(item.id) ?? item, "task_failed", `Worker launch failed; Task remains active until it can be stopped safely: ${errorText(stopError)}`);
           return;
         }
       }
@@ -874,7 +1011,7 @@ export class MainOrchestrator {
       if (task?.status === "active") store.finalizeTask({
         id: taskId, outcome: "failed", summary: "Worker launch failed", resultJson: JSON.stringify({ error: errorText(error) }),
       });
-      const current = store.getWorkItem(item.id);
+      const current = store.getChangeSet(item.id);
       if (current) this.#block(store, current, "task_failed", `Could not start ${role} Task: ${errorText(error)}`);
     }
   }
@@ -891,14 +1028,14 @@ export class MainOrchestrator {
         const repository = await this.#github.repository(discovered.baseRemote);
         const reconciled = { ...discovered, defaultBranch: repository.defaultBranch };
         store.updateProject(reconciled);
-        for (const item of store.listWorkItems().filter((candidate) => candidate.projectSlug === current.slug)) {
+        for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === current.slug)) {
           if (item.state === "Blocked" && item.blockedReason === "project_unavailable" && item.blockedResumeState) {
-            store.transitionWorkItem(item.id, item.blockedResumeState);
+            store.transitionChangeSet(item.id, item.blockedResumeState);
           }
         }
       } catch (error) {
         unavailable.add(current.slug);
-        for (const item of store.listWorkItems().filter((candidate) => candidate.projectSlug === current.slug)) {
+        for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === current.slug)) {
           if (!terminal(item) && item.state !== "Blocked") {
             this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${errorText(error)}`);
           }
@@ -909,42 +1046,44 @@ export class MainOrchestrator {
     return unavailable;
   }
 
-  async #reconcileIssues(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedWorkItemIds: ReadonlySet<string> = new Set()): Promise<void> {
-    for (let item of store.listWorkItems()) {
+  async #reconcileIssues(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedChangeSetIds: ReadonlySet<string> = new Set()): Promise<void> {
+    for (let item of store.listChangeSets()) {
       if (unavailableProjects.has(item.projectSlug)
-        || item.sourceType !== "issue" || !store.hasActiveObjectiveForWorkItem(item.id) && !store.activeTask(item.id) && !occupiedWorkItemIds.has(item.id)) continue;
+        || !item.issues.length || !store.hasActiveObjectiveForChangeSet(item.id) && !store.activeTask(item.id) && !occupiedChangeSetIds.has(item.id)) continue;
       const project = store.getProject(item.projectSlug);
       if (!project) continue;
       try {
-        const issue = await this.#github.issue(project, Number(item.sourceRef));
-        const state = issue.state.toUpperCase();
-        if (state !== "OPEN" && state !== "CLOSED") throw new Error(`GitHub returned unsupported issue state '${issue.state}' for #${issue.number}`);
-        const runtime = store.getWorkItemRuntime(item.id) ?? emptyRuntime(item.id);
+        const issues = await Promise.all(issueNumbers(item).map((number) => this.#github.issue(project, number)));
+        if (issues.some((issue) => !["OPEN", "CLOSED"].includes(issue.state.toUpperCase()))) throw new Error("GitHub returned an unsupported issue state.");
+        const state = issues.every((issue) => issue.state.toUpperCase() === "CLOSED") ? "CLOSED" : "OPEN";
+        const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
         const previousState = runtime.lastIssueState;
         runtime.lastIssueState = state;
-        store.saveWorkItemRuntime(runtime);
+        store.saveChangeSetRuntime(runtime);
 
         if (state === "OPEN" && item.state === "Blocked" && item.blockedReason === "github_unavailable" && item.blockedResumeState) {
-          store.transitionWorkItem(item.id, item.blockedResumeState);
-          item = store.getWorkItem(item.id) ?? item;
+          store.transitionChangeSet(item.id, item.blockedResumeState);
+          item = store.getChangeSet(item.id) ?? item;
         }
         if (state === "CLOSED") {
           const activeTask = store.activeTask(item.id);
           if (activeTask) await this.#cancelTaskForClosedIssue(store, item, activeTask);
-          const current = store.getWorkItem(item.id);
+          const current = store.getChangeSet(item.id);
           if (current && !terminal(current) && !runtime.pullRequestNumber && !store.activeTask(item.id)) {
             this.#completeClosedIssue(store, current);
           }
           continue;
         }
-        if (previousState === "CLOSED" && item.state === "Done") this.#createReopenedIssueGeneration(store, item, issue);
+        if (previousState === "CLOSED" && item.state === "Done") {
+          for (const issue of issues.filter((issue) => issue.state.toUpperCase() === "OPEN")) this.#createReopenedIssueGeneration(store, item, issue);
+        }
       } catch (error) {
         this.#blockForGitHubUnavailable(store, item, `Issue reconciliation failed: ${errorText(error)}`);
       }
     }
   }
 
-  async #cancelTaskForClosedIssue(store: MerroStore, item: WorkItem, task: Task): Promise<boolean> {
+  async #cancelTaskForClosedIssue(store: MerroStore, item: ChangeSet, task: Task): Promise<boolean> {
     const runtime = store.getTaskRuntime(task.id);
     if (!runtime) throw new Error(`Task ${task.id} has no runtime identity`);
     const presence = await this.#workers.inspect(runtime, task.id);
@@ -957,39 +1096,39 @@ export class MainOrchestrator {
     store.finalizeTask({
       id: task.id,
       outcome: "cancelled",
-      summary: `GitHub issue #${item.sourceRef} was closed externally`,
+      summary: `GitHub issues ${issueNumbers(item).map((number) => `#${number}`).join(" ")} were closed externally`,
       resultJson: JSON.stringify({ taskId: task.id, reason: "issue_closed_externally" }),
     });
     return true;
   }
 
-  #completeClosedIssue(store: MerroStore, item: WorkItem): void {
+  #completeClosedIssue(store: MerroStore, item: ChangeSet): void {
     if (store.activeTask(item.id)) return;
-    store.completeWorkItemAfterExternalIssueClosure(item.id);
+    store.completeChangeSetAfterExternalIssueClosure(item.id);
     this.#resolvePullRequestDecisions(store, item.id);
   }
 
-  #createReopenedIssueGeneration(store: MerroStore, previous: WorkItem, issue: GitHubIssue): void {
+  #createReopenedIssueGeneration(store: MerroStore, previous: ChangeSet, issue: GitHubIssue): void {
     const owners = store.listObjectives().filter((objective) => objective.state === "Active"
       && objective.projectSlugs.includes(previous.projectSlug)
-      && store.listWorkItems(objective.id, true).some((item) => item.id === previous.id));
+      && store.listChangeSets(objective.id, true).some((item) => item.id === previous.id));
     if (owners.length === 0) return;
-    const existing = store.findNonTerminalWorkItem(previous.projectSlug, "issue", String(issue.number));
+    const existing = store.findNonTerminalChangeSet(previous.projectSlug, [issue.number]);
     if (existing) {
-      for (const owner of owners) store.attachWorkItem(owner.id, existing.id);
+      for (const owner of owners) store.attachChangeSet(owner.id, existing.id);
       const priority = owners.map((owner) => owner.priority).sort((left, right) => priorityRank(left) - priorityRank(right))[0];
-      if (priority && priorityRank(priority) < priorityRank(existing.priority)) store.setWorkItemPriority(existing.id, priority);
-      const runtime = store.getWorkItemRuntime(existing.id) ?? emptyRuntime(existing.id);
+      if (priority && priorityRank(priority) < priorityRank(existing.priority)) store.setChangeSetPriority(existing.id, priority);
+      const runtime = store.getChangeSetRuntime(existing.id) ?? emptyRuntime(existing.id);
       runtime.lastIssueState = "OPEN";
-      store.saveWorkItemRuntime(runtime);
+      store.saveChangeSetRuntime(runtime);
       return;
     }
-    const generation = store.nextGeneration(previous.projectSlug, "issue", String(issue.number));
-    const item: WorkItem = {
+    const generation = store.nextGeneration(previous.projectSlug, [issue.number]);
+    const item: ChangeSet = {
       id: sourceId(previous.projectSlug, issue.number, generation),
       projectSlug: previous.projectSlug,
-      sourceType: "issue",
-      sourceRef: String(issue.number),
+      slug: store.availableChangeName(semanticSlug(issue.title)),
+      issues: [{ projectSlug: previous.projectSlug, number: issue.number }],
       generation,
       state: "Planned",
       priority: owners.map((owner) => owner.priority).sort((left, right) => priorityRank(left) - priorityRank(right))[0] ?? previous.priority,
@@ -997,15 +1136,15 @@ export class MainOrchestrator {
       blockedReason: null,
       blockedResumeState: null,
     };
-    store.createWorkItem(item);
-    for (const owner of owners) store.attachWorkItem(owner.id, item.id);
+    store.createChangeSet(item);
+    for (const owner of owners) store.attachChangeSet(owner.id, item.id);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = "OPEN";
-    store.saveWorkItemRuntime(runtime);
-    this.#notify(`Reopened issue #${issue.number} created WorkItem generation ${generation}.`);
+    store.saveChangeSetRuntime(runtime);
+    this.#notify(`Reopened issue #${issue.number} created ChangeSet generation ${generation}.`);
   }
 
-  async #workerSafetyPreflight(store: MerroStore, unsafeProjects = new Set<string>()): Promise<{ unsafeProjects: Set<string>; count: number; workItemIds: Set<string>; liveTaskIds: Set<string> }> {
+  async #workerSafetyPreflight(store: MerroStore, unsafeProjects = new Set<string>()): Promise<{ unsafeProjects: Set<string>; count: number; changeSetIds: Set<string>; liveTaskIds: Set<string> }> {
     // Finalized runtime identity still links legacy panes and containers, without adopting their workers.
     const runtimes: TaskRuntimeRecord[] = [];
     const runtimesByProject = new Map<string, TaskRuntimeRecord[]>();
@@ -1013,14 +1152,14 @@ export class MainOrchestrator {
       const runtime = store.getTaskRuntime(task.id);
       if (!runtime) continue;
       runtimes.push(runtime);
-      const item = store.getWorkItem(task.workItemId);
+      const item = store.getChangeSet(task.changeSetId);
       if (!item) continue;
       const projectRuntimes = runtimesByProject.get(item.projectSlug) ?? [];
       projectRuntimes.push(runtime);
       runtimesByProject.set(item.projectSlug, projectRuntimes);
     }
     const orphanIds = new Set<string>();
-    const workItemIds = new Set<string>();
+    const changeSetIds = new Set<string>();
     const liveTaskIds = new Set<string>();
     const projects = store.listProjects();
     for (const project of projects) {
@@ -1041,41 +1180,41 @@ export class MainOrchestrator {
           }
           orphanIds.add(taskId !== null ? `task:${taskId}` : worker.containerId !== null
             ? `container:${worker.containerId}` : `pane:${worker.tmuxSession}:${worker.paneId}`);
-          const item = worker.workItemId ? store.getWorkItem(worker.workItemId)
-            : recordedTask ? store.getWorkItem(recordedTask.workItemId) : store.listWorkItems().find((candidate) =>
-              worker.clonePath !== null && store.getWorkItemRuntime(candidate.id)?.clonePath === worker.clonePath);
+          const item = worker.changeSetId ? store.getChangeSet(worker.changeSetId)
+            : recordedTask ? store.getChangeSet(recordedTask.changeSetId) : store.listChangeSets().find((candidate) =>
+              worker.clonePath !== null && store.getChangeSetRuntime(candidate.id)?.clonePath === worker.clonePath);
           // Legacy containers may be returned by every Project scan. Stored identity determines their Project.
           if (item) {
             unsafeProjects.add(item.projectSlug);
-            workItemIds.add(item.id);
+            changeSetIds.add(item.id);
           } else for (const registered of projects) unsafeProjects.add(registered.slug);
-          this.#notify(`${recordedTask ? "Worker for finalized Task" : "Orphan worker"} in Project ${item?.projectSlug ?? project.slug}: Task ${taskId ?? "unknown"}, tmux ${worker.tmuxSession ?? "none"}:${worker.tmuxWindow ?? "none"}, pane ${worker.paneId ?? "none"}, container ${worker.containerId ?? "none"}, clone ${worker.clonePath ?? "unknown"}. Scheduling gated; worker not adopted or stopped.`, "warning");
+          this.#notify(`${recordedTask ? "Worker for finalized Task" : "Orphan worker"} in Project ${item?.projectSlug ?? project.slug}${item ? ` for ${item.slug}` : ""}. Inspect tmux ${worker.tmuxSession ?? "unavailable"} / ${worker.tmuxWindow ?? "unavailable"}${worker.containerId ? " and its Docker worker" : ""}. Scheduling gated; worker not adopted or stopped.`, "warning");
         }
       } catch (error) {
         // An incomplete inventory cannot prove that a clone is unowned.
         unsafeProjects.add(project.slug);
-        for (const item of store.listWorkItems().filter((candidate) => candidate.projectSlug === project.slug)) workItemIds.add(item.id);
+        for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === project.slug)) changeSetIds.add(item.id);
         this.#notify(`Could not enumerate owned workers for Project ${project.slug}; scheduling gated: ${errorText(error)}`, "warning");
       }
     }
-    return { unsafeProjects, count: orphanIds.size, workItemIds, liveTaskIds };
+    return { unsafeProjects, count: orphanIds.size, changeSetIds, liveTaskIds };
   }
 
   async #reconcileTasks(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: Set<string>, liveTaskIds: ReadonlySet<string>): Promise<void> {
     for (const task of store.listTasks().filter((candidate) => candidate.status === "active")) {
-      const item = store.getWorkItem(task.workItemId);
+      const item = store.getChangeSet(task.changeSetId);
       if (item && unavailableProjects.has(item.projectSlug)) continue;
       const runtime = store.getTaskRuntime(task.id);
-      const workRuntime = item && store.getWorkItemRuntime(item.id);
+      const workRuntime = item && store.getChangeSetRuntime(item.id);
       if (!item || !runtime || !workRuntime) continue;
-      if (item.sourceType === "issue" && item.state === "Blocked" && item.blockedReason === "github_unavailable") continue;
+      if (item.issues.length && item.state === "Blocked" && item.blockedReason === "github_unavailable") continue;
       if (workRuntime.lastIssueState === "CLOSED") {
         try {
           if (await this.#cancelTaskForClosedIssue(store, item, task) && !workRuntime.pullRequestNumber) {
-            this.#completeClosedIssue(store, store.getWorkItem(item.id) ?? item);
+            this.#completeClosedIssue(store, store.getChangeSet(item.id) ?? item);
           }
         } catch (error) {
-          this.#blockForGitHubUnavailable(store, item, `Could not stop the worker for closed issue #${item.sourceRef}: ${errorText(error)}`);
+          this.#blockForGitHubUnavailable(store, item, `Could not stop the worker for ${changeName(item)} after its issues closed: ${errorText(error)}`);
         }
         continue;
       }
@@ -1096,12 +1235,18 @@ export class MainOrchestrator {
           presence = await this.#workers.inspect(runtime, task.id);
         } catch (inspectionError) {
           const detail = `Could not inspect active Task ${task.id}; reconciliation will retry: ${errorText(inspectionError)}`;
-          if (item.sourceType === "issue") this.#blockForGitHubUnavailable(store, item, detail);
+          if (item.issues.length) this.#blockForGitHubUnavailable(store, item, detail);
           else this.#notify(detail, "warning");
           continue;
         }
-        if (presence.alive && presence.identityMatches) continue;
-        const reason = presence.reason ?? "worker exited without a result";
+        if (presence.alive) {
+          if (!presence.identityMatches) {
+            unsafeProjects.add(item.projectSlug);
+            this.#notify(`${item.slug}: ${presence.reason ?? "Worker identity is ambiguous"}. Scheduling paused; inspect the worker before retrying.`, "warning");
+          }
+          continue;
+        }
+        const reason = presence.reason ?? "Implementation worker exited without submitting a result";
         if (presence.alive || liveTaskIds.has(task.id)) unsafeProjects.add(item.projectSlug);
         store.finalizeTask({ id: task.id, outcome: "failed", summary: reason, resultJson: JSON.stringify({ taskId: task.id, reason }) });
         if (this.#obsoleteIfUnowned(store, item, unsafeProjects)) continue;
@@ -1111,8 +1256,8 @@ export class MainOrchestrator {
         }
         if (workRuntime.infrastructureRetries < 1) {
           workRuntime.infrastructureRetries += 1;
-          store.saveWorkItemRuntime(workRuntime);
-          this.#notify(`Retrying WorkItem ${item.id} once after worker infrastructure failure.`, "warning");
+          store.saveChangeSetRuntime(workRuntime);
+          this.#notify(`Retrying ChangeSet ${item.id} once after worker infrastructure failure.`, "warning");
         } else {
           this.#block(store, item, "task_failed", `Worker exited without a valid result after one infrastructure retry: ${reason}`);
         }
@@ -1146,7 +1291,7 @@ export class MainOrchestrator {
       }
       await this.#consumeResult(store, item, task, result, runtime, workRuntime, unsafeProjects);
       workRuntime.infrastructureRetries = 0;
-      store.saveWorkItemRuntime(workRuntime);
+      store.saveChangeSetRuntime(workRuntime);
     }
   }
 
@@ -1156,7 +1301,7 @@ export class MainOrchestrator {
     const activeInputs = new Set(store.listActiveTaskInputPaths());
     for (const task of pending) {
       const runtime = store.getTaskRuntime(task.id);
-      const projectSlug = store.getWorkItem(task.workItemId)?.projectSlug;
+      const projectSlug = store.getChangeSet(task.changeSetId)?.projectSlug;
       if (!runtime || !projectSlug || unsafeProjects.has(projectSlug)) continue;
       let preserveResult = false;
       try {
@@ -1175,13 +1320,13 @@ export class MainOrchestrator {
     }
   }
 
-  async #consumeResult(store: MerroStore, item: WorkItem, task: Task, result: WorkerResult, runtime: TaskRuntimeRecord, workRuntime: WorkItemRuntimeRecord, unsafeProjects: ReadonlySet<string>): Promise<void> {
+  async #consumeResult(store: MerroStore, item: ChangeSet, task: Task, result: WorkerResult, runtime: TaskRuntimeRecord, workRuntime: ChangeSetRuntimeRecord, unsafeProjects: ReadonlySet<string>): Promise<void> {
     const flowState = task.role === "implement" ? "Implementing" : "Reviewing";
     if (result.status !== "failed" && item.state === "Blocked" && item.blockedReason === "task_failed"
       && item.blockedResumeState === flowState) {
       // A worker whose failed launch could not be stopped can still finish its owned Task.
-      store.transitionWorkItem(item.id, flowState);
-      item = store.getWorkItem(item.id)!;
+      store.transitionChangeSet(item.id, flowState);
+      item = store.getChangeSet(item.id)!;
     }
     if (task.role === "implement") {
       const implementResult = result as ImplementSuccessResult | ImplementFailedResult;
@@ -1194,12 +1339,17 @@ export class MainOrchestrator {
       }
       const typed = implementResult;
       store.finalizeTask({ id: task.id, outcome: "success", summary: typed.summary, resultJson: JSON.stringify(typed), commitSha: typed.commit });
+      const commands = typed.verification.filter((entry) => entry.kind === "command");
+      if (!commands.length || commands.some((entry) => entry.exit_code !== 0)) {
+        if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) this.#block(store, item, "task_failed", "Local CI is not green. Run repository verification and submit passing command results before review");
+        return;
+      }
       if (runtime.baseUpdate) {
         workRuntime.baseCommit = runtime.baseUpdate.baseCommit;
         workRuntime.baseUpdate = null;
-        store.saveWorkItemRuntime(workRuntime);
+        store.saveChangeSetRuntime(workRuntime);
       }
-      if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) store.transitionWorkItem(item.id, "Reviewing");
+      if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) store.transitionChangeSet(item.id, "Reviewing");
       return;
     }
 
@@ -1214,8 +1364,8 @@ export class MainOrchestrator {
     if (this.#obsoleteIfUnowned(store, item, unsafeProjects)) return;
     if (review.status === "reject") {
       workRuntime.reviewRound += 1;
-      store.saveWorkItemRuntime(workRuntime);
-      store.transitionWorkItem(item.id, "Implementing");
+      store.saveChangeSetRuntime(workRuntime);
+      store.transitionChangeSet(item.id, "Implementing");
       const limit = this.#reviewLimit(store, item);
       if (limit !== "unlimited" && workRuntime.reviewRound >= limit) {
         this.#block(store, item, "review_cap", `Reached review cap. Blocking findings:\n${review.findings.filter((finding) => finding.severity === "blocking").map((finding) => `- ${finding.summary}`).join("\n")}`);
@@ -1223,7 +1373,7 @@ export class MainOrchestrator {
       return;
     }
 
-    store.transitionWorkItem(item.id, "AwaitingMerge");
+    store.transitionChangeSet(item.id, "AwaitingMerge");
     try {
       const project = store.getProject(item.projectSlug);
       if (!project || !workRuntime.clonePath || !workRuntime.branchName) throw new Error("Project branch runtime is incomplete");
@@ -1231,13 +1381,14 @@ export class MainOrchestrator {
       const implementation = store.listTasks(item.id).reverse().find((candidate) => candidate.role === "implement" && candidate.resultJson);
       const parsedImplementation = implementation?.resultJson ? parseImplementResult(JSON.parse(implementation.resultJson)) : null;
       const title = parsedImplementation && "pr" in parsedImplementation ? parsedImplementation.pr?.title : undefined;
-      const body = issueBody(item, review.summary, finalVerification(store, item, review));
-      const pullRequest = await this.#github.createPullRequest(project, workRuntime.branchName, title ?? `Work ${item.sourceRef}: ${parsedImplementation?.summary ?? review.summary}`, body);
+      const body = publicText(issueBody(item, parsedImplementation?.summary ?? review.summary, finalVerification(store, item, review)), this.#names);
+      const pullRequest = await this.#github.createPullRequest(project, workRuntime.branchName,
+        publicText(title ?? parsedImplementation?.summary.split(/\r?\n/)[0] ?? changeName(item).replace(/-/g, " "), this.#names), body);
       await this.#github.syncPullRequestContent(
         project,
         pullRequest,
         reconcilePullRequestBody(pullRequest.body, item, finalVerification(store, item, review)),
-        reviewNotes(review),
+        publicText(reviewNotes(review), this.#names),
       );
       workRuntime.reviewedDiffHash = await this.#git.effectiveDiffFingerprint(
         project, workRuntime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid,
@@ -1248,23 +1399,23 @@ export class MainOrchestrator {
       workRuntime.pullRequestHeadSha = pullRequest.headRefOid;
       workRuntime.pullRequestBaseSha = pullRequest.baseRefOid;
       workRuntime.mergedCommitSha = null;
-      store.saveWorkItemRuntime(workRuntime);
+      store.saveChangeSetRuntime(workRuntime);
     } catch (error) {
-      this.#block(store, store.getWorkItem(item.id) ?? item, "github_unavailable", `Could not publish reviewed branch: ${errorText(error)}`);
+      this.#block(store, store.getChangeSet(item.id) ?? item, "github_unavailable", `Could not publish reviewed branch: ${errorText(error)}`);
     }
   }
 
   async #reconcilePullRequests(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<void> {
-    for (let item of store.listWorkItems()) {
+    for (let item of store.listChangeSets()) {
       if (unavailableProjects.has(item.projectSlug)) continue;
       const recovering = item.state === "Blocked"
         && item.blockedResumeState === "AwaitingMerge"
         && (item.blockedReason === "github_unavailable" || item.blockedReason === "policy_unknown");
-      const runtime = store.getWorkItemRuntime(item.id);
+      const runtime = store.getChangeSetRuntime(item.id);
       const project = store.getProject(item.projectSlug);
       if (!runtime || !project) continue;
       try {
-        if (item.sourceType === "issue" && runtime.lastIssueState === "CLOSED" && !terminal(item)) {
+        if (item.issues.length && runtime.lastIssueState === "CLOSED" && !terminal(item)) {
           if (store.activeTask(item.id)) continue;
           if (runtime.pullRequestNumber !== null) {
             const pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
@@ -1274,12 +1425,12 @@ export class MainOrchestrator {
                 this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
                 continue;
               }
-              await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
+              await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
               this.#resolvePullRequestDecisions(store, item.id);
               continue;
             }
           }
-          this.#completeClosedIssue(store, store.getWorkItem(item.id) ?? item);
+          this.#completeClosedIssue(store, store.getChangeSet(item.id) ?? item);
           continue;
         }
         const hasPullRequestIdentity = runtime.pullRequestNumber !== null || runtime.branchName !== null;
@@ -1293,7 +1444,7 @@ export class MainOrchestrator {
           if (pullRequest) {
             runtime.pullRequestNumber = pullRequest.number;
             runtime.pullRequestUrl = pullRequest.url;
-            store.saveWorkItemRuntime(runtime);
+            store.saveChangeSetRuntime(runtime);
             pullRequest = await this.#github.pullRequest(project, pullRequest.number);
           }
         }
@@ -1304,7 +1455,7 @@ export class MainOrchestrator {
             this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
             continue;
           }
-          await this.#completeMergedWorkItem(store, item, runtime, project, pullRequest, unsafeProjects);
+          await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
           this.#resolvePullRequestDecisions(store, item.id);
           continue;
         }
@@ -1327,7 +1478,7 @@ export class MainOrchestrator {
           : null;
         if (pullRequest.state === "OPEN" && latestReview?.status === "pass") {
           const body = reconcilePullRequestBody(pullRequest.body, item, finalVerification(store, item, latestReview));
-          await this.#github.syncPullRequestContent(project, pullRequest, body, reviewNotes(latestReview));
+          await this.#github.syncPullRequestContent(project, pullRequest, publicText(body, this.#names), publicText(reviewNotes(latestReview), this.#names));
           pullRequest = { ...pullRequest, body };
         }
         // Reconcile external PR state, but never restore or synchronize a clone an orphan may still use.
@@ -1337,8 +1488,8 @@ export class MainOrchestrator {
           const remoteHead = await this.#git.remoteBranchCommit(project, runtime.branchName);
           if (!remoteHead) {
             if (recovering) {
-              store.transitionWorkItem(item.id, item.blockedResumeState!);
-              item = store.getWorkItem(item.id) ?? item;
+              store.transitionChangeSet(item.id, item.blockedResumeState!);
+              item = store.getChangeSet(item.id) ?? item;
             }
             this.#resolveMergeDecisions(store, item.id);
             this.#block(store, item, "remote_branch_deleted", `Remote branch ${runtime.branchName} was deleted`);
@@ -1350,43 +1501,43 @@ export class MainOrchestrator {
             continue;
           }
         }
-        if (runtime.branchName && runtime.clonePath && this.#git.ensureWorkItemClone) {
+        if (runtime.branchName && runtime.clonePath && this.#git.ensureChangeSetClone) {
           try {
-            await this.#git.ensureWorkItemClone(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
+            await this.#git.ensureChangeSetClone(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
           } catch (error) {
             if (recovering) {
-              store.transitionWorkItem(item.id, item.blockedResumeState!);
-              item = store.getWorkItem(item.id) ?? item;
+              store.transitionChangeSet(item.id, item.blockedResumeState!);
+              item = store.getChangeSet(item.id) ?? item;
             }
-            this.#block(store, item, "clone_lost", `Could not restore the local WorkItem clone: ${errorText(error)}`);
+            this.#block(store, item, "clone_lost", `Could not restore the local ChangeSet clone: ${errorText(error)}`);
             continue;
           }
         }
         const policy = await this.#github.branchProtection(project, pullRequest.baseRefName);
         if (!policy.known) {
           if (recovering && item.blockedReason !== "policy_unknown") {
-            store.transitionWorkItem(item.id, item.blockedResumeState!);
-            item = store.getWorkItem(item.id) ?? item;
+            store.transitionChangeSet(item.id, item.blockedResumeState!);
+            item = store.getChangeSet(item.id) ?? item;
           }
           this.#block(store, item, "policy_unknown", policy.reason);
           continue;
         }
         if (recovering) {
-          store.transitionWorkItem(item.id, item.blockedResumeState!);
-          item = store.getWorkItem(item.id) ?? item;
+          store.transitionChangeSet(item.id, item.blockedResumeState!);
+          item = store.getChangeSet(item.id) ?? item;
         }
 
         if (pullRequest.mergeable === "CONFLICTING") {
           this.#resolveMergeDecisions(store, item.id);
-          const decision = store.createDecision({
-            id: randomUUID(), subjectType: "WorkItem", subjectId: item.id, kind: "merge_conflict",
+          store.createDecision({
+            id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "merge_conflict",
             payload: {
               pullRequest: pullRequest.number, url: pullRequest.url,
               baseRefName: pullRequest.baseRefName, baseCommit: pullRequest.baseRefOid,
               detail: "GitHub reports conflicts with the updated base; an implementer must resolve and verify them.",
             },
           });
-          this.#notify(`Base merge conflict requires a decision for ${pullRequest.url} (Decision ${decision.id}).`, "warning");
+          this.#notify(`${changeName(item)} has a base merge conflict: ${pullRequest.url}. Approve a fresh implementation attempt to resolve it?`, "warning");
           continue;
         }
         if (runtime.baseCommit !== null && pullRequest.baseRefOid !== runtime.baseCommit) {
@@ -1399,19 +1550,19 @@ export class MainOrchestrator {
         if (newChangeRequest || requiredCheckFailed(pullRequest, policy)) {
           this.#resolveMergeDecisions(store, item.id);
           if (!runtime.clonePath || !runtime.branchName || !this.#git.syncBranchHead) {
-            throw new Error("cannot rework pull request: WorkItem branch runtime is incomplete");
+            throw new Error("cannot rework pull request: ChangeSet branch runtime is incomplete");
           }
           await this.#git.syncBranchHead(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
           if (newChangeRequest && reviewTrigger) {
             runtime.lastReworkTrigger = reviewTrigger;
             store.markPullRequestRework(runtime);
           } else {
-            store.transitionWorkItem(item.id, "Implementing");
+            store.transitionChangeSet(item.id, "Implementing");
           }
           this.#notify(`Pull request ${pullRequest.url} has a failed required check or a new change-request review; scheduling fresh implementation and review.`, "warning");
           continue;
         }
-        if (!runtime.clonePath) throw new Error("cannot compare the pull request diff without a WorkItem clone");
+        if (!runtime.clonePath) throw new Error("cannot compare the pull request diff without a ChangeSet clone");
         const currentDiffHash = await this.#git.effectiveDiffFingerprint(
           project, runtime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid,
         );
@@ -1420,18 +1571,18 @@ export class MainOrchestrator {
         if (!latestReview || latestReview.status !== "pass" || reviewedDiffHash !== currentDiffHash) {
           this.#resolveMergeDecisions(store, item.id);
           runtime.reviewedDiffHash = null;
-          store.saveWorkItemRuntime(runtime);
+          store.saveChangeSetRuntime(runtime);
           if (!runtime.clonePath || !runtime.branchName || !this.#git.syncBranchHead) {
-            throw new Error("cannot re-review pull request head: WorkItem branch runtime is incomplete");
+            throw new Error("cannot re-review pull request head: ChangeSet branch runtime is incomplete");
           }
           await this.#git.syncBranchHead(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
-          store.transitionWorkItem(item.id, "Reviewing");
+          store.transitionChangeSet(item.id, "Reviewing");
           this.#notify(`Pull request ${pullRequest.url} changed since its last reviewed diff; scheduling a fresh review.`, "warning");
           continue;
         }
         if (runtime.reviewedDiffHash === null) {
           runtime.reviewedDiffHash = currentDiffHash;
-          store.saveWorkItemRuntime(runtime);
+          store.saveChangeSetRuntime(runtime);
         }
         if (!await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
           this.#resolveMergeDecisions(store, item.id);
@@ -1446,8 +1597,8 @@ export class MainOrchestrator {
             && payload.title === pullRequest.title && payload.headRefOid === pullRequest.headRefOid) continue;
           store.resolveDecision(pendingDecision.id, "resolved");
         }
-        const decision = store.createDecision({
-          id: randomUUID(), subjectType: "WorkItem", subjectId: item.id, kind: "merge",
+        store.createDecision({
+          id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "merge",
           payload: {
             pullRequest: pullRequest.number,
             url: pullRequest.url,
@@ -1457,7 +1608,7 @@ export class MainOrchestrator {
             summary: store.listTasks(item.id).filter((task) => task.role === "implement" || task.role === "review").map((task) => task.summary).filter(Boolean),
           },
         });
-        const message = `Merge approval required for ${pullRequest.url} (Decision ${decision.id}).`;
+        const message = `${changeName(item)} is ready to merge: ${pullRequest.url}. Approve?`;
         this.#notify(message);
         this.#queueNotification("merge_ready", item.id, message);
       } catch (error) {
@@ -1466,39 +1617,39 @@ export class MainOrchestrator {
     }
   }
 
-  #blockForGitHubUnavailable(store: MerroStore, item: WorkItem, detail: string): void {
-    let current = store.getWorkItem(item.id) ?? item;
+  #blockForGitHubUnavailable(store: MerroStore, item: ChangeSet, detail: string): void {
+    let current = store.getChangeSet(item.id) ?? item;
     this.#resolveMergeDecisions(store, current.id);
     if (terminal(current)) return;
     if (current.state === "Blocked") {
       if (current.blockedReason !== "github_unavailable" || !current.blockedResumeState) {
-        this.#notify(`WorkItem ${current.id} remains blocked (${current.blockedReason ?? "unknown"}) after: ${detail}`, "warning");
+        this.#notify(`ChangeSet ${current.id} remains blocked (${current.blockedReason ?? "unknown"}) after: ${detail}`, "warning");
         return;
       }
-      store.transitionWorkItem(current.id, current.blockedResumeState);
-      current = store.getWorkItem(current.id) ?? current;
+      store.transitionChangeSet(current.id, current.blockedResumeState);
+      current = store.getChangeSet(current.id) ?? current;
     }
     this.#block(store, current, "github_unavailable", detail);
   }
 
-  #resolveMergeDecisions(store: MerroStore, workItemId: string): void {
+  #resolveMergeDecisions(store: MerroStore, changeSetId: string): void {
     for (const decision of store.pendingDecisions()) {
-      if (decision.kind === "merge" && decision.subjectId === workItemId) {
+      if (decision.kind === "merge" && decision.subjectId === changeSetId) {
         store.resolveDecision(decision.id, "resolved");
       }
     }
   }
 
-  #resolvePullRequestDecisions(store: MerroStore, workItemId: string): void {
+  #resolvePullRequestDecisions(store: MerroStore, changeSetId: string): void {
     for (const decision of store.pendingDecisions()) {
-      if (decision.subjectId === workItemId) store.resolveDecision(decision.id, "resolved");
+      if (decision.subjectId === changeSetId) store.resolveDecision(decision.id, "resolved");
     }
   }
 
-  async #completeMergedWorkItem(
+  async #completeMergedChangeSet(
     store: MerroStore,
-    item: WorkItem,
-    runtime: WorkItemRuntimeRecord,
+    item: ChangeSet,
+    runtime: ChangeSetRuntimeRecord,
     project: Project,
     pullRequest: GitHubPullRequest,
     unsafeProjects: ReadonlySet<string>,
@@ -1509,21 +1660,21 @@ export class MainOrchestrator {
     this.#savePullRequest(store, runtime, pullRequest);
     runtime.pullRequestState = "MERGED";
     runtime.mergedCommitSha = pullRequest.mergeCommitSha;
-    store.saveWorkItemRuntime(runtime);
-    const newlyCompleted = store.completeWorkItemAfterMerge(
+    store.saveChangeSetRuntime(runtime);
+    const newlyCompleted = store.completeChangeSetAfterMerge(
       item.id,
       finalMergeSummary(store, item, runtime, pullRequest),
     );
-    if (newlyCompleted) this.#notify(`WorkItem ${item.id} merged and Done.`);
+    if (newlyCompleted) this.#notify(`ChangeSet ${item.id} merged and Done.`);
 
-    if (item.sourceType === "issue") {
+    if (item.issues.length) {
       try {
-        const issue = await this.#github.issue(project, Number(item.sourceRef));
-        if (issue.state.toUpperCase() !== "CLOSED") {
-          this.#notify(`GitHub issue #${item.sourceRef} remains open after merging ${pullRequest.url}; verify its Closes directive.`, "warning");
+        for (const number of issueNumbers(item)) {
+          const issue = await this.#github.issue(project, number);
+          if (issue.state.toUpperCase() !== "CLOSED") this.#notify(`GitHub issue #${number} remains open after merging ${pullRequest.url}; verify its Closes directive.`, "warning");
         }
       } catch (error) {
-        this.#notify(`Could not verify whether GitHub issue #${item.sourceRef} closed after merging ${pullRequest.url}: ${errorText(error)}`, "warning");
+        this.#notify(`Could not verify issue closures for ${changeName(item)} after merging ${pullRequest.url}: ${errorText(error)}`, "warning");
       }
     }
 
@@ -1531,124 +1682,126 @@ export class MainOrchestrator {
       try {
         await this.#git.deleteClone(this.#workRoot, runtime.clonePath);
       } catch (error) {
-        this.#notify(`Could not clean up terminal WorkItem clone ${runtime.clonePath}: ${errorText(error)}`, "warning");
+        this.#notify(`Could not clean up terminal ChangeSet clone ${runtime.clonePath}: ${errorText(error)}`, "warning");
       }
     }
   }
 
-  #savePullRequest(store: MerroStore, runtime: WorkItemRuntimeRecord, pr: GitHubPullRequest): void {
+  #savePullRequest(store: MerroStore, runtime: ChangeSetRuntimeRecord, pr: GitHubPullRequest): void {
     runtime.pullRequestNumber = pr.number;
     runtime.pullRequestUrl = pr.url;
     runtime.pullRequestState = pr.state;
     runtime.pullRequestHeadSha = pr.headRefOid;
     runtime.pullRequestBaseSha = pr.baseRefOid;
     if (pr.mergedAt && isCommitSha(pr.mergeCommitSha)) runtime.mergedCommitSha = pr.mergeCommitSha;
-    store.saveWorkItemRuntime(runtime);
+    store.saveChangeSetRuntime(runtime);
   }
 
-  #obsoleteIfUnowned(store: MerroStore, item: WorkItem, unsafeProjects: ReadonlySet<string> = new Set()): boolean {
-    if (store.hasActiveObjectiveForWorkItem(item.id)) return false;
+  #obsoleteIfUnowned(store: MerroStore, item: ChangeSet, unsafeProjects: ReadonlySet<string> = new Set()): boolean {
+    if (store.hasActiveObjectiveForChangeSet(item.id)) return false;
     if (unsafeProjects.has(item.projectSlug)) return true;
-    const current = store.getWorkItem(item.id);
+    const current = store.getChangeSet(item.id);
     if (current && !terminal(current) && !store.activeTask(item.id)) {
-      store.transitionWorkItem(item.id, "Obsolete");
+      store.transitionChangeSet(item.id, "Obsolete");
       this.#resolvePullRequestDecisions(store, item.id);
-      this.#notify(`WorkItem ${item.id} is obsolete because no active Objective owns it.`);
+      this.#notify(`ChangeSet ${item.id} is obsolete because no active Objective owns it.`);
     }
     return true;
   }
 
-  async #rebuildRelations(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedWorkItemIds: ReadonlySet<string>): Promise<Set<string>> {
+  async #rebuildRelations(store: MerroStore, unavailableProjects: ReadonlySet<string>, occupiedChangeSetIds: ReadonlySet<string>): Promise<Set<string>> {
     const gated = new Set<string>();
     const analyzed: string[] = [];
     const relations: Relation[] = [];
     const objectives = store.listObjectives().filter((objective) => objective.state === "Active");
-    for (const item of store.listWorkItems()) {
+    for (const item of store.listChangeSets()) {
       if (unavailableProjects.has(item.projectSlug)) { gated.add(item.id); continue; }
-      if ((terminal(item) || !store.hasActiveObjectiveForWorkItem(item.id)) && !occupiedWorkItemIds.has(item.id)) {
+      if ((terminal(item) || !store.hasActiveObjectiveForChangeSet(item.id)) && !occupiedChangeSetIds.has(item.id)) {
         if (!store.activeTask(item.id)) analyzed.push(item.id);
         continue;
       }
-      if (item.sourceType !== "issue") { analyzed.push(item.id); continue; }
+      if (!item.issues.length) { analyzed.push(item.id); continue; }
       try {
         const project = store.getProject(item.projectSlug)!;
-        const issue = await this.#github.issue(project, Number(item.sourceRef));
-        const approved = new Map<string, WorkItem>();
+        const issues = await Promise.all(issueNumbers(item).map((number) => this.#github.issue(project, number)));
+        const approved = new Map<string, ChangeSet>();
         for (const objective of objectives) {
-          const attached = store.listWorkItems(objective.id, true);
-          if (!occupiedWorkItemIds.has(item.id) && !attached.some((candidate) => candidate.id === item.id)) continue;
+          const attached = store.listChangeSets(objective.id, true);
+          if (!occupiedChangeSetIds.has(item.id) && !attached.some((candidate) => candidate.id === item.id)) continue;
           for (const candidate of attached) approved.set(candidate.id, candidate);
         }
-        const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
         analyzed.push(item.id);
-        relations.push(...analysis.relations);
-        if (analysis.unresolved.length > 0) {
-          gated.add(item.id);
-          this.#notify(`WorkItem ${item.id} awaits relation analysis: unresolved references ${analysis.unresolved.join(", ")} outside approved work.`, "warning");
+        for (const issue of issues) {
+          const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
+          relations.push(...analysis.relations);
+          if (analysis.unresolved.length > 0) {
+            gated.add(item.id);
+            this.#notify(`${changeName(item)} awaits relation analysis: unresolved references ${analysis.unresolved.join(", ")} outside approved work.`, "warning");
+          }
         }
       } catch (error) {
         gated.add(item.id);
-        this.#notify(`WorkItem ${item.id} awaits relation analysis: ${errorText(error)}`, "warning");
+        this.#notify(`ChangeSet ${item.id} awaits relation analysis: ${errorText(error)}`, "warning");
       }
     }
-    store.rebuildAutomaticRelations(analyzed, relations, [...occupiedWorkItemIds]);
+    store.rebuildAutomaticRelations(analyzed, relations, [...occupiedChangeSetIds]);
     return gated;
   }
 
-  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>, relationGates: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>, occupiedWorkItemIds: ReadonlySet<string>): void {
-    const items = store.listWorkItems();
+  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>, relationGates: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>, occupiedChangeSetIds: ReadonlySet<string>): void {
+    const items = store.listChangeSets();
     const byId = new Map(items.map((item) => [item.id, item]));
     const relations = store.listRelations();
     const active = new Set([
-      ...store.listTasks().filter((task) => task.status === "active").map((task) => task.workItemId),
+      ...store.listTasks().filter((task) => task.status === "active").map((task) => task.changeSetId),
       ...items.filter((item) => unavailableProjects.has(item.projectSlug)).map((item) => item.id),
-      ...occupiedWorkItemIds,
+      ...occupiedChangeSetIds,
     ]);
     const cycle = findRequiresCycle(relations);
     if (cycle) this.#blockCycle(store, cycle, active);
-    for (const item of store.listWorkItems()) {
+    for (const item of store.listChangeSets()) {
       if (unavailableProjects.has(item.projectSlug)
         || (item.state !== "Planned" && item.state !== "Ready") || active.has(item.id)) continue;
-      if (!store.hasActiveObjectiveForWorkItem(item.id)) {
+      if (!store.hasActiveObjectiveForChangeSet(item.id)) {
         if (unsafeProjects.has(item.projectSlug)) continue;
-        store.transitionWorkItem(item.id, "Obsolete");
+        store.transitionChangeSet(item.id, "Obsolete");
         continue;
       }
       const requirements = relations.filter((relation) => relation.kind === "Requires" && relation.from === item.id);
       const ready = !relationGates.has(item.id) && requirements.every((relation) => byId.get(relation.to)?.state === "Done");
-      if (item.state === "Planned" && ready) store.transitionWorkItem(item.id, "Ready");
-      else if (item.state === "Ready" && !ready) store.transitionWorkItem(item.id, "Planned");
+      if (item.state === "Planned" && ready) store.transitionChangeSet(item.id, "Ready");
+      else if (item.state === "Ready" && !ready) store.transitionChangeSet(item.id, "Planned");
     }
   }
 
   #blockCycle(store: MerroStore, cycle: readonly string[], active: ReadonlySet<string>): void {
     for (const id of new Set(cycle)) {
-      const item = store.getWorkItem(id);
+      const item = store.getChangeSet(id);
       if (!item || active.has(id) || item.state === "Blocked" || terminal(item)) continue;
       this.#block(store, item, "cycle", `Requires cycle: ${cycle.join(" -> ")}`);
     }
   }
 
-  #block(store: MerroStore, item: WorkItem, reason: WorkItem["blockedReason"] & string, detail: string): void {
-    const current = store.getWorkItem(item.id) ?? item;
+  #block(store: MerroStore, item: ChangeSet, reason: ChangeSet["blockedReason"] & string, detail: string): void {
+    const current = store.getChangeSet(item.id) ?? item;
     const changed = current.state !== "Blocked" || current.blockedReason !== reason;
-    if (changed) store.transitionWorkItem(item.id, "Blocked", reason);
-    store.appendEvent("WorkItem", item.id, "blocked", { reason, detail });
+    if (changed) store.transitionChangeSet(item.id, "Blocked", reason);
+    store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail });
     const dependents = store.listRelations()
       .filter((relation) => relation.kind === "Requires" && relation.to === item.id)
-      .map((relation) => store.getWorkItem(relation.from))
-      .filter((dependent): dependent is WorkItem => dependent !== null)
-      .map((dependent) => `${dependent.id} (${dependent.state})`);
+      .map((relation) => store.getChangeSet(relation.from))
+      .filter((dependent): dependent is ChangeSet => dependent !== null)
+      .map((dependent) => `${changeName(dependent)} (${dependent.state})`);
     const dependentsNote = dependents.length > 0 ? ` Direct dependents: ${dependents.join(", ")}.` : "";
-    const message = `WorkItem ${item.id} blocked (${reason}): ${detail}.${dependentsNote}`;
+    const message = `${changeName(item)} blocked\n\n${publicText(detail, this.#names)}.${dependentsNote}\nRetry available after fixing the cause: /merro-continue ${changeName(item)}`;
     this.#notify(message, "warning");
     if (changed) this.#queueNotification("blocked", item.id, message);
   }
 
-  #reviewLimit(store: MerroStore, item: WorkItem): number | "unlimited" {
+  #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" {
     const limits = store.listObjectives()
       .filter((objective) => objective.state === "Active"
-        && store.listWorkItems(objective.id, true).some((workItem) => workItem.id === item.id))
+        && store.listChangeSets(objective.id, true).some((changeSet) => changeSet.id === item.id))
       .map((objective) => objective.maxReviewRounds ?? this.#config.max_review_rounds);
     if (limits.length === 0 || limits.every((limit) => limit === "unlimited")) return "unlimited";
     return Math.min(...limits.filter((limit): limit is number => limit !== "unlimited"));
@@ -1657,7 +1810,7 @@ export class MainOrchestrator {
   #reviewContext(json: string): string {
     try {
       const result = parseReviewResult(JSON.parse(json));
-      return [result.summary, ...result.findings.map((finding) => `${finding.severity}: ${finding.summary}`)].join("\n");
+      return [result.summary, ...result.findings.map((finding) => `${finding.severity}: ${finding.summary}`), verificationText(result.verification)].join("\n");
     } catch {
       return "Prior review result could not be parsed.";
     }
@@ -1679,34 +1832,34 @@ export class MainOrchestrator {
     if (this.#config.notify_command?.trim()) this.#pendingNotifications.push({ event, subjectId, message });
   }
 
-  #queueBaseUpdate(store: MerroStore, item: WorkItem, runtime: WorkItemRuntimeRecord, pullRequest: GitHubPullRequest): void {
-    if (!runtime.clonePath || !runtime.branchName || !isCommitSha(pullRequest.baseRefOid)) throw new Error("cannot schedule updated base: WorkItem runtime or base commit is invalid");
+  #queueBaseUpdate(store: MerroStore, item: ChangeSet, runtime: ChangeSetRuntimeRecord, pullRequest: GitHubPullRequest): void {
+    if (!runtime.clonePath || !runtime.branchName || !isCommitSha(pullRequest.baseRefOid)) throw new Error("cannot schedule updated base: ChangeSet runtime or base commit is invalid");
     this.#resolveMergeDecisions(store, item.id);
     runtime.baseUpdate = { baseRefName: pullRequest.baseRefName, baseCommit: pullRequest.baseRefOid };
     runtime.reviewedDiffHash = null;
-    store.saveWorkItemRuntime(runtime);
-    store.transitionWorkItem(item.id, "Implementing");
+    store.saveChangeSetRuntime(runtime);
+    store.transitionChangeSet(item.id, "Implementing");
     this.#notify(`Scheduling an implementer to merge and verify the updated base for ${pullRequest.url}, then a fresh review.`, "warning");
   }
 
-  #attachIssue(store: MerroStore, objective: Objective, projectSlug: string, issue: GitHubIssue): WorkItem {
-    const existing = store.findNonTerminalWorkItem(projectSlug, "issue", String(issue.number));
+  #attachIssue(store: MerroStore, objective: Objective, projectSlug: string, issue: GitHubIssue): ChangeSet {
+    const existing = store.findNonTerminalChangeSet(projectSlug, [issue.number]);
     if (existing) {
-      store.attachWorkItem(objective.id, existing.id);
-      if (priorityRank(objective.priority) < priorityRank(existing.priority)) store.setWorkItemPriority(existing.id, objective.priority);
-      return store.getWorkItem(existing.id)!;
+      store.attachChangeSet(objective.id, existing.id);
+      if (priorityRank(objective.priority) < priorityRank(existing.priority)) store.setChangeSetPriority(existing.id, objective.priority);
+      return store.getChangeSet(existing.id)!;
     }
-    const generation = store.nextGeneration(projectSlug, "issue", String(issue.number));
-    const item: WorkItem = {
-      id: sourceId(projectSlug, issue.number, generation), projectSlug, sourceType: "issue",
-      sourceRef: String(issue.number), generation, state: "Planned", priority: objective.priority,
+    const generation = store.nextGeneration(projectSlug, [issue.number]);
+    const item: ChangeSet = {
+      id: sourceId(projectSlug, issue.number, generation), projectSlug,
+      slug: store.availableChangeName(semanticSlug(issue.title)), issues: [{ projectSlug, number: issue.number }], generation, state: "Planned", priority: objective.priority,
       readySince: null, blockedReason: null, blockedResumeState: null,
     };
-    store.createWorkItem(item);
-    store.attachWorkItem(objective.id, item.id);
+    store.createChangeSet(item);
+    store.attachChangeSet(objective.id, item.id);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = issue.state.toUpperCase();
-    store.saveWorkItemRuntime(runtime);
+    store.saveChangeSetRuntime(runtime);
     return item;
   }
 
@@ -1714,12 +1867,12 @@ export class MainOrchestrator {
     try {
       let scopes = objective.issueScopes;
       if (scopes === undefined) {
-        // Older databases record selections only through attached WorkItems. Never infer a broader query from the goal.
+        // Older databases record selections only through attached ChangeSets. Never infer a broader query from the goal.
         const numbers = new Map<string, number[]>(objective.projectSlugs.map((slug) => [slug, []]));
-        for (const item of store.listWorkItems(objective.id)) {
-          if (item.sourceType !== "issue") continue;
+        for (const item of store.listChangeSets(objective.id)) {
+          if (!item.issues.length) continue;
           const selected = numbers.get(item.projectSlug) ?? [];
-          selected.push(Number(item.sourceRef));
+          selected.push(...issueNumbers(item));
           numbers.set(item.projectSlug, selected);
         }
         scopes = parseObjectiveIssueScopes([...numbers].map(([projectSlug, selected]) => ({ projectSlug, numbers: selected })), objective.projectSlugs, { allowEmptyFixedSelections: true });
@@ -1740,22 +1893,22 @@ export class MainOrchestrator {
           for (const issue of matching) discovered.push({ projectSlug: project.slug, issue });
         } catch (error) {
           refreshed = false;
-          for (const item of store.listWorkItems(objective.id)) {
+          for (const item of store.listChangeSets(objective.id)) {
             if (item.projectSlug === scope.projectSlug) schedulingGates.add(item.id);
           }
           this.#notify(`Objective ${objective.id} remains Active: approved scope for Project '${scope.projectSlug}' could not be refreshed: ${errorText(error)}`, "warning");
         }
       }
-      for (const item of store.listWorkItems(objective.id)) {
-        if (item.sourceType !== "issue" || !queryResults.has(item.projectSlug)
-          || queryResults.get(item.projectSlug)!.has(Number(item.sourceRef))) continue;
+      for (const item of store.listChangeSets(objective.id)) {
+        if (!item.issues.length || !queryResults.has(item.projectSlug)
+          || issueNumbers(item).some((number) => queryResults.get(item.projectSlug)!.has(number))) continue;
         try {
-          const issue = await this.#github.issue(store.getProject(item.projectSlug)!, Number(item.sourceRef));
+          const issue = await this.#github.issue(store.getProject(item.projectSlug)!, issueNumbers(item)[0]!);
           // Closure is authoritative satisfaction, not scope removal. Issue reconciliation handles it.
           if (issue.state.toUpperCase() === "CLOSED") continue;
           const scope = scopes.find((entry) => entry.projectSlug === item.projectSlug)!;
           if (matchesIssueScope(scope, issue)) throw new Error(`issue #${issue.number} changed during scope enumeration`);
-          store.detachWorkItem(objective.id, item.id);
+          store.detachChangeSet(objective.id, item.id);
           this.#obsoleteIfUnowned(store, item, unsafeProjects);
         } catch (error) {
           refreshed = false;
@@ -1763,22 +1916,24 @@ export class MainOrchestrator {
           this.#notify(`Objective ${objective.id} scope removal for ${item.id} could not be checked: ${errorText(error)}`, "warning");
         }
       }
-      const attached = new Map<string, WorkItem>();
-      for (const item of store.listWorkItems(objective.id)) {
-        if (item.sourceType !== "issue") continue;
-        const key = `${item.projectSlug}\0${item.sourceRef}`;
-        if ((attached.get(key)?.generation ?? 0) < item.generation) attached.set(key, item);
+      const attached = new Map<string, ChangeSet>();
+      for (const item of store.listChangeSets(objective.id)) {
+        if (!item.issues.length) continue;
+        for (const number of issueNumbers(item)) {
+          const key = `${item.projectSlug}\0${number}`;
+          if ((attached.get(key)?.generation ?? 0) < item.generation) attached.set(key, item);
+        }
       }
       for (const { projectSlug, issue } of discovered) {
         const key = `${projectSlug}\0${issue.number}`;
         const existing = attached.get(key);
         if (existing) {
-          store.attachWorkItem(objective.id, existing.id);
+          store.attachChangeSet(objective.id, existing.id);
           if (!terminal(existing) && priorityRank(objective.priority) < priorityRank(existing.priority)) {
-            store.setWorkItemPriority(existing.id, objective.priority);
+            store.setChangeSetPriority(existing.id, objective.priority);
           }
           if ((existing.state === "Done" || existing.state === "Obsolete")
-            && store.getWorkItemRuntime(existing.id)?.lastIssueState === "CLOSED") {
+            && store.getChangeSetRuntime(existing.id)?.lastIssueState === "CLOSED") {
             this.#createReopenedIssueGeneration(store, existing, issue);
           }
           continue;
@@ -1787,7 +1942,7 @@ export class MainOrchestrator {
       }
       return refreshed;
     } catch (error) {
-      for (const item of store.listWorkItems(objective.id)) schedulingGates.add(item.id);
+      for (const item of store.listChangeSets(objective.id)) schedulingGates.add(item.id);
       this.#notify(`Objective ${objective.id} remains Active: approved GitHub scope could not be refreshed: ${errorText(error)}`, "warning");
       return false;
     }
@@ -1796,12 +1951,12 @@ export class MainOrchestrator {
   async #finishObjectives(store: MerroStore, unavailableProjects: ReadonlySet<string> = new Set(), unsafeProjects: ReadonlySet<string> = new Set()): Promise<void> {
     for (const objective of store.listObjectives()) {
       if (objective.state !== "Active") continue;
-      const items = store.listWorkItems(objective.id);
+      const items = store.listChangeSets(objective.id);
       if (!items.every(terminal)) continue;
       if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects, new Set(), unsafeProjects)) continue;
-      if (!store.listWorkItems(objective.id).every(terminal)) continue;
+      if (!store.listChangeSets(objective.id).every(terminal)) continue;
       store.setObjectiveState(objective.id, "Done");
-      const message = `Objective ${objective.id} is Done.`;
+      const message = `${objective.goal} is Done.`;
       this.#notify(message);
       this.#queueNotification("objective_done", objective.id, message);
     }

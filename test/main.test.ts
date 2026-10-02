@@ -9,15 +9,160 @@ import { DEFAULT_CONFIG } from "../src/config.js";
 import { MerroStore } from "../src/store/store.js";
 import type { Project, Relation } from "../src/domain/model.js";
 import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../src/github/client.js";
-import { MainOrchestrator } from "../src/runtime/main.js";
+import { MainOrchestrator, type ObjectiveStartInput } from "../src/runtime/main.js";
+import { initializedState } from "./fixtures.js";
+
+// These reconciliation scenarios intentionally deliver each issue as a separate change.
+class SeparateChangesMain extends MainOrchestrator {
+  override proposeObjective(input: ObjectiveStartInput) { return super.proposeObjective({ delivery: "separate", ...input }); }
+  override startObjective(input: ObjectiveStartInput, proposal?: string) { return super.startObjective({ delivery: "separate", ...input }, proposal); }
+}
 import { registerCommands, type PiExtensionLike } from "../src/tools/commands.js";
 import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import { taskWindowName, WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
 async function approveProposal(tools: Map<string, Parameters<MainToolAPI["registerTool"]>[0]>, args: Record<string, unknown>) {
-  const proposal = await tools.get("merro_propose_objective")!.execute("propose", args);
-  return tools.get("merro_start_objective")!.execute("approve", { ...args, proposal_id: (proposal.details as { id: string }).id });
+  const input = { change: "test-change", delivery: "separate", ...args };
+  await tools.get("merro_propose_objective")!.execute("propose", input);
+  return tools.get("merro_start_objective")!.execute("approve", input);
+}
+
+test("combined plan delivers three issues as one change, branch, worker flow and PR without public identifiers", async (t) => {
+  const uuid = "04393352-bcf7-4e9b-8f81-ad10d7f60123";
+  let rejected = false;
+  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [96, 97, 100] }],
+    result(input, _number, result) {
+      if (input.role === "implement") return { ...result, summary: `Harden plugin lifecycle safety (${input.changeSetId}, ${input.taskId}, ${uuid})`, pr: { title: `Harden plugin lifecycle safety ${uuid}`, body: "untrusted body" } };
+      if (!rejected) { rejected = true; return { ...result, status: "reject", findings: [{ severity: "blocking", summary: "Fix unsafe removal" }] }; }
+      return { ...result, summary: `Reviewed ${input.taskId} ${uuid}`, findings: [{ severity: "note", summary: `Safe removal ${input.changeSetId} ${uuid}` }] };
+    } });
+  harness.issues.get("kinetix:96")!.labels = ["chore"];
+  harness.issues.get("kinetix:96")!.body = "Permission-diff approval. Acceptance: approval precedes mutation.";
+  harness.issues.get("kinetix:97")!.body = "Marketplace lifecycle controls. Requires #96.";
+  harness.issues.get("kinetix:100")!.body = "Dependency-safe removal. Requires #97.";
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  const visible: string[] = [];
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { visible.push(JSON.stringify(message)); } }, harness.main);
+  const proposed = await tools.get("merro_propose_objective")!.execute("plan", { goal: "Harden plugin lifecycle safety", change: "plugin-lifecycle-safety", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [96, 97, 100] }] });
+  visible.push(JSON.stringify(proposed));
+  assert.match(proposed.content[0]!.text, /Branch: chore\/plugin-lifecycle-safety/);
+  assert.match(proposed.content[0]!.text, /PRs: 1/);
+  assert.deepEqual((proposed.details as { relations: unknown[] }).relations, []);
+  visible.push(JSON.stringify(await tools.get("merro_start_objective")!.execute("approve", {})));
+  assert.equal(harness.launches.length, 1);
+  assert.equal(harness.launches[0]!.clonePath, join(harness.workspacePath, ".wt", "plugin-lifecycle-safety"));
+  const restarted = harness.restartMain();
+  for (let pass = 0; pass < 5; pass++) await restarted.runPass();
+  assert.deepEqual(harness.launches.map((input) => input.role), ["implement", "review", "implement", "review"]);
+  assert.equal(new Set(harness.launches.map((input) => input.taskId)).size, 4);
+  assert.equal(new Set(harness.launches.map((input) => input.changeSetId)).size, 1);
+  assert.equal(new Set(harness.launches.map((input) => input.clonePath)).size, 1);
+  const snapshot = await restarted.statusSnapshot();
+  assert.equal(snapshot.changeSets.length, 1);
+  assert.equal(snapshot.changeSets[0]!.state, "AwaitingMerge");
+  assert.equal(snapshot.tasks.filter((task) => task.status === "active").length, 0);
+  assert.equal(harness.pullRequests.size, 1);
+  const pr = [...harness.pullRequests.values()][0]!;
+  assert.equal(pr.headRefName, "chore/plugin-lifecycle-safety");
+  for (const number of [96, 97, 100]) assert.match(pr.body, new RegExp(`Closes #${number}\\b`));
+  for (const input of harness.launches.filter((input) => input.role === "review")) {
+    assert.match(input.taskFile, /Issues: #96 #97 #100/);
+    assert.match(input.taskFile, /Acceptance: approval precedes mutation/);
+    assert.match(input.taskFile, /Marketplace lifecycle controls/);
+    assert.match(input.taskFile, /Dependency-safe removal/);
+    assert.match(input.taskFile, /Full base\.\.\.HEAD diff/);
+    assert.match(input.taskFile, /safe lifecycle/);
+    assert.match(input.taskFile, /scripts\/run-ci.sh/);
+    assert.match(input.taskFile, /Implementation summary and verification/);
+  }
+  assert.match(harness.launches[2]!.taskFile, /Fix unsafe removal/);
+  visible.push(JSON.stringify(await restarted.publicSnapshot()), JSON.stringify(pr), ...harness.reviewComments.values(), ...harness.notifications, ...harness.launches.map((input) => input.taskFile));
+  await restarted.resolveDecisionForChange("plugin-lifecycle-safety", true);
+  visible.push(JSON.stringify(await restarted.publicSnapshot()), ...harness.notifications);
+  assert.equal((await restarted.statusSnapshot()).changeSets[0]!.state, "Done");
+  const output = visible.join("\n");
+  assert.doesNotMatch(output, /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
+  for (const id of [...snapshot.tasks.map((task) => task.id), ...snapshot.changeSets.map((item) => item.id), ...snapshot.objectives.map((objective) => objective.id), ...snapshot.decisions.map((decision) => decision.id)]) assert.ok(!output.includes(id), `Private identity leaked: ${id}`);
+});
+
+test("combined worker lifecycle state survives Main restart without duplicate workers", async (t) => {
+  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [96, 97, 100] }], result: () => null, inspect: async () => ({ alive: true, identityMatches: true, reason: null }) });
+  await harness.main.startObjective({ goal: "Lifecycle safety", changeSlug: "plugin-lifecycle-safety", projectSlugs: ["kinetix"], issues: [{ projectSlug: "kinetix", numbers: [96, 97, 100] }] });
+  await harness.main.runPass();
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  const runtime = store.getTaskRuntime(harness.launches[0]!.taskId)!;
+  store.close();
+  await writeFile(join(dirname(runtime.resultPath), "worker-state.json"), JSON.stringify({ state: "busy", lastActivity: "Editing plugin lifecycle", updatedAt: new Date().toISOString() }));
+  const before = await harness.main.publicSnapshot();
+  const restarted = harness.restartMain();
+  await restarted.runPass();
+  assert.deepEqual(await restarted.publicSnapshot(), before);
+  assert.equal(before.changes[0]!.workerState, "busy");
+  assert.equal(before.changes[0]!.lastActivity, "Editing plugin lifecycle");
+  assert.equal(harness.launches.length, 1);
+  assert.equal((await restarted.statusSnapshot()).tasks.filter((task) => task.status === "active").length, 1);
+});
+
+for (const verification of [[], [{ kind: "command", project: "example", cwd: ".", command: "scripts/run-ci.sh", exit_code: 1 }]]) {
+  test(`review never starts before green command verification: ${JSON.stringify(verification)}`, async (t) => {
+    const harness = await createHarness(t, { together: true, result: (_input, _number, result) => ({ ...result, verification }) });
+    await startDefaultObjective(harness.main);
+    await harness.main.runPass();
+    await harness.main.runPass();
+    assert.equal(harness.launches.length, 1);
+    assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, "Blocked");
+    assert.ok(harness.notifications.some((message) => /Local CI is not green|failing verification/.test(message)));
+  });
+}
+
+test("changed requirements stop and replace the active attempt rather than steering it", async (t) => {
+  let alive = true;
+  let stops = 0;
+  const harness = await createHarness(t, { together: true, result: () => null,
+    inspect: async () => ({ alive, identityMatches: alive, reason: alive ? null : "stopped" }), stop: async () => { alive = false; stops++; } });
+  await harness.main.startObjective({ goal: "Lifecycle safety", changeSlug: "plugin-lifecycle-safety", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+  await harness.main.runPass();
+  const first = harness.launches[0]!;
+  await harness.main.restartChange("plugin-lifecycle-safety", "Require approval before removal.");
+  assert.equal(stops, 1);
+  assert.equal(harness.launches.length, 2);
+  assert.notEqual(harness.launches[1]!.taskId, first.taskId);
+  assert.equal(harness.launches[1]!.clonePath, first.clonePath);
+  assert.equal(harness.launches[1]!.expectedCommit, first.expectedCommit);
+  assert.match(harness.launches[1]!.taskFile, /Require approval before removal/);
+  const tasks = (await harness.main.statusSnapshot()).tasks;
+  assert.equal(tasks[0]!.outcome, "cancelled");
+  assert.equal(tasks.filter((task) => task.status === "active").length, 1);
+});
+
+for (const hazard of ["orphan", "inventory_failure", "orphan_after_stop"] as const) {
+  test(`changed requirements fail closed on ${hazard} before discarding the attempt`, async (t) => {
+    let unsafe = false;
+    let alive = true;
+    let stops = 0;
+    let current: WorkerLaunchInput | undefined;
+    const harness = await createHarness(t, { together: true, result: () => null,
+      inspect: async () => ({ alive, identityMatches: alive, reason: null }),
+      stop: async () => { alive = false; stops++; if (hazard === "orphan_after_stop") unsafe = true; },
+      ownedWorkers: async (project) => {
+        if (!unsafe) return [];
+        if (hazard === "inventory_failure") throw new Error("Inventory unavailable");
+        return [{ taskId: "04393352-bcf7-4e9b-8f81-ad10d7f60123", projectSlug: project.slug,
+          changeSetId: current?.changeSetId ?? null, clonePath: current?.clonePath ?? null,
+          tmuxSession: "merro-example", tmuxWindow: "impl-plugin-lifecycle-safety", paneId: "%99", containerId: "a".repeat(64) }];
+      } });
+    await harness.main.startObjective({ goal: "Lifecycle safety", changeSlug: "plugin-lifecycle-safety", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+    await harness.main.runPass();
+    current = harness.launches[0];
+    assert.ok(current);
+    unsafe = hazard !== "orphan_after_stop";
+    await assert.rejects(harness.main.restartChange("plugin-lifecycle-safety", "Require approval."), /worker safety/i);
+    assert.equal(stops, hazard === "orphan_after_stop" ? 1 : 0);
+    assert.equal(harness.launches.length, 1);
+    assert.equal((await harness.main.statusSnapshot()).tasks[0]?.status, "active");
+    assert.doesNotMatch(harness.notifications.join("\n"), /04393352-bcf7|aaaaaaaa|%99/);
+  });
 }
 
 test("live status and export queue behind reconciliation without competing for ownership", async (t) => {
@@ -36,11 +181,11 @@ test("live status and export queue behind reconciliation without competing for o
   const messages: string[] = [];
   const ctx = { ui: { notify(message: string) { messages.push(message); } } };
   await commands.get("status")!.handler("", ctx);
-  assert.match(messages.pop()!, /0 active objective.*0 active WorkItem.*0 active Task.*0 blocked/);
+  assert.equal(messages.pop(), "example");
   await harness.main.startObjective({ goal: "test", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] });
   await harness.main.runPass();
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-  store.transitionWorkItem("example:issue-2:g1", "Blocked", "task_failed");
+  store.transitionChangeSet("example:issue-2:g1", "Blocked", "task_failed");
   store.close();
   hold = true;
   const pass = harness.main.runPass();
@@ -51,10 +196,10 @@ test("live status and export queue behind reconciliation without competing for o
   assert.match(messages.pop()!, /already holds the workspace lock/);
   release();
   await Promise.all([pass, status, exported]);
-  assert.ok(messages.some((message) => /1 active objective.*2 active WorkItem.*2 active Task.*1 blocked/.test(message)));
+  assert.ok(messages.some((message) => message.includes("State: Blocked") && message.includes("impl-issue-1-for-example")));
   const before = await harness.main.exportSnapshot();
   const snapshot = JSON.parse(await readFile(join(harness.workspacePath, ".merro", "export.json"), "utf8"));
-  assert.deepEqual(snapshot, JSON.parse(JSON.stringify(before)));
+  assert.deepEqual(snapshot, JSON.parse(JSON.stringify(await harness.main.publicSnapshot())));
   await commands.get("merro-export")!.handler("", ctx);
   assert.deepEqual(await harness.main.exportSnapshot(), before);
   await rm(join(harness.workspacePath, ".merro", "export.json"));
@@ -69,19 +214,18 @@ test("authoritative proposal and approval persist exactly the acceptance graph",
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   const displayed: string[] = [];
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { displayed.push(message.content); } }, harness.main);
-  const args = { goal: "acceptance", project_slugs: ["example"], issues: [{ project_slug: "example", numbers: [1, 2, 3, 4] }] };
-  await assert.rejects(tools.get("merro_start_objective")!.execute("no-proposal", args), /proposal_id/);
+  const args = { goal: "acceptance", change: "acceptance", delivery: "separate", project_slugs: ["example"], issues: [{ project_slug: "example", numbers: [1, 2, 3, 4] }] };
+  await assert.rejects(tools.get("merro_start_objective")!.execute("no-proposal", {}), /No pending plan/);
   const proposed = await tools.get("merro_propose_objective")!.execute("proposal", args);
-  const proposal = proposed.details as import("../src/runtime/main.js").ObjectiveProposal;
-  const edges = proposal.relations.map((edge) => [edge.from, edge.to]);
-  assert.deepEqual(edges, [["example:issue-2:g1", "example:issue-1:g1"], ["example:issue-4:g1", "example:issue-2:g1"]]);
-  assert.ok(displayed[0]?.includes("example:issue-4:g1 Requires example:issue-2:g1"));
-  assert.ok(!displayed[0]?.includes("example:issue-4:g1 Requires example:issue-3:g1"));
+  const proposal = proposed.details as { relations: Array<{ from: string; to: string }> };
+  assert.deepEqual(proposal.relations.map((edge) => [edge.from, edge.to]), [["acceptance-2", "acceptance"], ["acceptance-4", "acceptance-2"]]);
+  assert.ok(displayed[0]?.includes("Approve?"));
+  assert.ok(!displayed[0]?.includes(":issue-"));
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
-  await tools.get("merro_start_objective")!.execute("approved", { ...args, proposal_id: proposal.id });
+  await tools.get("merro_start_objective")!.execute("approved", {});
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-  try { assert.deepEqual(store.listRelations(), proposal.relations); } finally { store.close(); }
-  assert.deepEqual(harness.launches.map((input) => input.workItemId).sort(), ["example:issue-1:g1", "example:issue-3:g1"]);
+  try { assert.equal(store.listRelations().length, proposal.relations.length); } finally { store.close(); }
+  assert.deepEqual(harness.launches.map((input) => input.changeSetId).sort(), ["example:issue-1:g1", "example:issue-3:g1"]);
 });
 
 test("changed relation graphs require fresh proposal approval and unresolved references stay gated", async (t) => {
@@ -92,14 +236,14 @@ test("changed relation graphs require fresh proposal approval and unresolved ref
   await assert.rejects(harness.main.startObjective(input, proposal.id), /proposal changed/);
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
   const updated = await harness.main.proposeObjective(input);
-  assert.deepEqual(updated.unresolved, [{ workItemId: "example:issue-2:g1", references: ["#99"] }]);
+  assert.deepEqual(updated.unresolved, [{ changeSetId: "example:issue-2:g1", references: ["#99"] }]);
   await harness.main.startObjective(input, updated.id);
   await harness.main.runPass();
   assert.equal(harness.launches.length, 1);
-  assert.equal(harness.launches[0]?.workItemId, "example:issue-1:g1");
+  assert.equal(harness.launches[0]?.changeSetId, "example:issue-1:g1");
 });
 
-test("proposal includes preserved incoming relations on shared active WorkItems", async (t) => {
+test("proposal includes preserved incoming relations on shared active ChangeSets", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }], result: () => null });
   harness.issues.get("example:2")!.body = "Conflicts with #1.";
   await harness.main.startObjective({ goal: "existing", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] });
@@ -123,7 +267,7 @@ test("proposal surfaces cycles without changing cycle safety semantics", async (
   await harness.main.startObjective(input, proposal.id);
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
-  assert.ok((await harness.main.statusSnapshot()).workItems.every((item) => item.blockedReason === "cycle"));
+  assert.ok((await harness.main.statusSnapshot()).changeSets.every((item) => item.blockedReason === "cycle"));
 });
 
 interface FixtureProject {
@@ -132,6 +276,7 @@ interface FixtureProject {
 }
 
 interface HarnessOptions {
+  together?: boolean;
   projects?: FixtureProject[];
   maxConcurrentTasks?: number;
   requireExternalApproval?: boolean;
@@ -189,6 +334,7 @@ interface MainHarness {
 async function createHarness(t: test.TestContext, options: HarnessOptions = {}): Promise<MainHarness> {
   const workspacePath = await mkdtemp(join(tmpdir(), "merro-main-"));
   t.after(() => rm(workspacePath, { recursive: true, force: true }));
+  await initializedState(workspacePath);
   const fixtures = options.projects ?? [{ slug: "example", issueNumbers: [7] }];
   const projects = new Map<string, Project>();
   const issues = new Map<string, GitHubIssue>();
@@ -347,12 +493,14 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       if (project.path !== path) throw new Error(`Project moved from ${path}`);
       return { ...project, path };
     },
-    async createWorkItemClone(project: Project, path: string, branchName: string) {
+    async createChangeSetClone(project: Project, path: string, branchName: string) {
       cloneBaseBranches.push(project.defaultBranch);
       cloneBranches.set(path, { projectSlug: project.slug, branchName });
       heads.set(path, "base-sha");
       return { path, branchName, baseCommit: "base-sha" };
     },
+    async fullDiff() { return "diff --git a/lifecycle.ts b/lifecycle.ts\n+safe lifecycle\n"; },
+    async discardAttempt(path: string, commit: string) { heads.set(path, commit); },
     async currentCommit(path: string) {
       return heads.get(path) ?? "base-sha";
     },
@@ -389,7 +537,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       await mkdir(path, { recursive: true });
       await writeFile(join(path, "MERRO_COMMIT"), `${commit}\n`);
     },
-    async ensureWorkItemClone(project: Project, _path: string, branchName: string, headCommit: string) {
+    async ensureChangeSetClone(project: Project, _path: string, branchName: string, headCommit: string) {
       if (options.localCloneMissing) restoredClones.push({ projectSlug: project.slug, branchName, headCommit });
     },
     async effectiveDiffFingerprint(_project: Project, _path: string, _baseRefName: string, _baseCommit: string, headCommit: string) {
@@ -432,9 +580,9 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         ? {
           task_id: input.taskId,
           status: "success",
-          summary: `Implemented ${input.workItemId}.`,
+          summary: `Implemented ${input.changeSetId}.`,
           commit,
-          verification: [{ kind: "manual", project: input.project.slug, summary: "Checked the change." }],
+          verification: [{ kind: "command", project: input.project.slug, cwd: input.clonePath, command: "scripts/run-ci.sh", exit_code: 0 }, { kind: "manual", project: input.project.slug, summary: "Checked the change." }],
         }
         : {
           task_id: input.taskId,
@@ -450,7 +598,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         taskId: input.taskId,
         runtimeKind: "host",
         tmuxSession: `merro-${input.project.slug}`,
-        tmuxWindow: taskWindowName(input.role, input.workItemId),
+        tmuxWindow: taskWindowName(input.role, input.changeSlug),
         paneId: "%1",
         containerId: null,
         processPid: 1,
@@ -476,9 +624,10 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     },
   };
 
-  const createMain = () => new MainOrchestrator({
+  const Main = options.together ? MainOrchestrator : SeparateChangesMain;
+  const createMain = () => new Main({
     workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: options.realWorkerPlan ? "docker" : "none", max_concurrent_tasks: options.maxConcurrentTasks ?? 3, work_root: join(workspacePath, "workers"), notify_command: options.notifyCommand ?? null },
+    config: { ...DEFAULT_CONFIG, sandbox: options.realWorkerPlan ? "docker" : "none", max_concurrent_tasks: options.maxConcurrentTasks ?? 3, notify_command: options.notifyCommand ?? null },
     ...(options.commands ? { commands: options.commands } : {}),
     notify: (message) => { notifications.push(message); },
     git,
@@ -540,33 +689,33 @@ async function startDefaultObjective(main: MainOrchestrator): Promise<string> {
     projectSlugs: ["example"],
     issues: [{ projectSlug: "example", numbers: [7] }],
   });
-  const workItemId = started.workItems[0]?.id;
-  assert.ok(workItemId);
-  return workItemId;
+  const changeSetId = started.changeSets[0]?.id;
+  assert.ok(changeSetId);
+  return changeSetId;
 }
 
-test("Main derives a safe clone path without rewriting the acceptance WorkItem identity", async (t) => {
+test("Main derives a safe clone path without rewriting the acceptance ChangeSet identity", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "merro-acceptance", issueNumbers: [1] }] });
   const started = await harness.main.startObjective({
     goal: "Launch the acceptance worker", projectSlugs: ["merro-acceptance"],
     issues: [{ projectSlug: "merro-acceptance", numbers: [1] }],
   });
   const id = "merro-acceptance:issue-1:g1";
-  assert.equal(started.workItems[0]?.id, id);
+  assert.equal(started.changeSets[0]?.id, id);
   await harness.main.runPass();
   const input = harness.launches[0];
   assert.ok(input);
-  assert.equal(input.workItemId, id);
-  const component = relative(join(harness.workspacePath, "workers", "merro-acceptance"), input.clonePath);
-  assert.match(component, /^[a-z0-9-]+-[a-f0-9]{16}$/);
-  assert.ok(component.length <= 65);
-  assert.match(input.taskFile, /merro-acceptance:issue-1:g1/);
+  assert.equal(input.changeSetId, id);
+  const component = relative(join(harness.workspacePath, ".wt"), input.clonePath);
+  assert.equal(component, "issue-1-for-merro-acceptance");
+  assert.match(input.taskFile, /Change: issue-1-for-merro-acceptance/);
+  assert.ok(!input.taskFile.includes(id));
   const snapshot = await harness.main.statusSnapshot();
-  assert.equal(snapshot.workItems[0]?.id, id);
-  assert.equal(snapshot.tasks[0]?.workItemId, id);
+  assert.equal(snapshot.changeSets[0]?.id, id);
+  assert.equal(snapshot.tasks[0]?.changeSetId, id);
   await harness.restartMain().runPass();
   assert.equal(harness.launches[1]?.clonePath, input.clonePath);
-  assert.equal(harness.launches[1]?.workItemId, id);
+  assert.equal(harness.launches[1]?.changeSetId, id);
 });
 
 test("Main honors a persisted legacy clone path containing colons after restart", async (t) => {
@@ -576,20 +725,20 @@ test("Main honors a persisted legacy clone path containing colons after restart"
   const legacyPath = join(harness.workspacePath, "workers", "example", id);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    const record = store.getWorkItemRuntime(id);
+    const record = store.getChangeSetRuntime(id);
     assert.ok(record);
-    store.saveWorkItemRuntime({ ...record, clonePath: legacyPath });
+    store.saveChangeSetRuntime({ ...record, clonePath: legacyPath });
   } finally { store.close(); }
   await harness.restartMain().runPass();
   assert.equal(harness.launches[1]?.clonePath, legacyPath);
-  assert.equal(harness.launches[1]?.workItemId, id);
+  assert.equal(harness.launches[1]?.changeSetId, id);
   assert.equal(harness.cloneBaseBranches.length, 1);
 });
 
 test("Main runs one issue through implement, review, PR approval, merge, and Objective completion", async (t) => {
   const harness = await createHarness(t);
   const { main } = harness;
-  const workItemId = await startDefaultObjective(main);
+  const changeSetId = await startDefaultObjective(main);
 
   await main.runPass();
   await main.runPass();
@@ -597,7 +746,7 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
   await main.runPass();
 
   const beforeApproval = await main.statusSnapshot();
-  assert.equal(beforeApproval.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(beforeApproval.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(beforeApproval.tasks.filter((task) => task.status === "finalized").length, 2);
   assert.equal(beforeApproval.decisions.length, 1);
   const decision = beforeApproval.decisions[0];
@@ -606,7 +755,7 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
   await main.resolveMergeDecision(decision.id, true);
 
   const completed = await main.statusSnapshot();
-  assert.equal(completed.workItems[0]?.state, "Done");
+  assert.equal(completed.changeSets[0]?.state, "Done");
   assert.equal(completed.objectives[0]?.state, "Done");
   assert.equal(completed.decisions.length, 0);
   assert.equal(harness.deletedClones.length, 1);
@@ -614,7 +763,7 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
 
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    const finalSummary = store.getFinalSummary(workItemId);
+    const finalSummary = store.getFinalSummary(changeSetId);
     assert.ok(finalSummary);
     const payload = finalSummary.payload as {
       diff: { effectiveFingerprint: string | null };
@@ -652,12 +801,12 @@ test("approved label and milestone scope survives restart and discovers matching
   await restarted.resolveMergeDecision(merge.id, true);
   const snapshot = await restarted.statusSnapshot();
   assert.equal(snapshot.objectives[0]?.state, "Active");
-  assert.deepEqual(snapshot.workItems.map((item) => item.sourceRef).sort(), ["7", "8"]);
+  assert.deepEqual(snapshot.changeSets.map((item) => item.issues.map((issue) => issue.number).join(",")).sort(), ["7", "8"]);
   assert.deepEqual((snapshot.objectives[0] as unknown as Record<string, unknown>).issueScopes,
     [{ projectSlug: "example", query: { labels: ["feature"], milestone: "v1" } }]);
-  assert.ok(harness.launches.some((input) => input.workItemId === "example:issue-8:g1"));
+  assert.ok(harness.launches.some((input) => input.changeSetId === "example:issue-8:g1"));
   await restarted.runPass();
-  assert.equal((await restarted.statusSnapshot()).workItems.filter((item) => item.sourceRef === "8").length, 1);
+  assert.equal((await restarted.statusSnapshot()).changeSets.filter((item) => item.issues.some((issue) => issue.number === 8)).length, 1);
 });
 
 test("query removals obsolete untouched exclusive work before scheduling", async (t) => {
@@ -672,11 +821,11 @@ test("query removals obsolete untouched exclusive work before scheduling", async
     harness.issues.set("example:7", { ...original, milestone: "v1", ...change });
     await harness.restartMain().runPass();
     const snapshot = await harness.main.statusSnapshot();
-    assert.equal(snapshot.workItems[0]?.state, "Obsolete");
+    assert.equal(snapshot.changeSets[0]?.state, "Obsolete");
     assert.equal(snapshot.objectives[0]?.state, "Done");
     assert.equal(harness.launches.length, 0);
     const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-    try { assert.equal(store.listWorkItems(started.objective.id).length, 0); } finally { store.close(); }
+    try { assert.equal(store.listChangeSets(started.objective.id).length, 0); } finally { store.close(); }
   }
 });
 
@@ -693,13 +842,13 @@ test("scope removal detaches only the query Objective and restores shared priori
   harness.issues.get("example:7")!.labels = ["bug"];
   await harness.main.runPass();
   const snapshot = await harness.main.statusSnapshot();
-  assert.equal(snapshot.workItems[0]?.state, "Implementing");
-  assert.equal(snapshot.workItems[0]?.priority, "low");
+  assert.equal(snapshot.changeSets[0]?.state, "Implementing");
+  assert.equal(snapshot.changeSets[0]?.priority, "low");
   assert.equal(snapshot.objectives.find((item) => item.id === query.objective.id)?.state, "Done");
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    assert.equal(store.listWorkItems(query.objective.id).length, 0);
-    assert.equal(store.listWorkItems(fixed.objective.id).length, 1);
+    assert.equal(store.listChangeSets(query.objective.id).length, 0);
+    assert.equal(store.listChangeSets(fixed.objective.id).length, 1);
   } finally { store.close(); }
 });
 
@@ -727,7 +876,7 @@ test("active out-of-scope work finishes its current Task across restart without 
     const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
     let resultPath: string;
     try {
-      assert.equal(store.listWorkItems(started.objective.id).length, 1);
+      assert.equal(store.listChangeSets(started.objective.id).length, 1);
       resultPath = store.getTaskRuntime(task.id)!.resultPath;
     } finally { store.close(); }
     await writeFile(resultPath, JSON.stringify(role === "implement" ? {
@@ -741,7 +890,7 @@ test("active out-of-scope work finishes its current Task across restart without 
     await harness.restartMain().runPass();
     snapshot = await harness.main.statusSnapshot();
     assert.equal(snapshot.tasks.at(-1)?.status, "finalized");
-    assert.equal(snapshot.workItems[0]?.state, "Obsolete");
+    assert.equal(snapshot.changeSets[0]?.state, "Obsolete");
     assert.equal(snapshot.objectives[0]?.state, "Done");
     assert.equal(harness.launches.length, role === "implement" ? 1 : 2);
     assert.equal(harness.pullRequests.size, 0);
@@ -758,7 +907,7 @@ test("auto-discovered Requires is rebuilt before the same pass can launch its de
   harness.issues.set("example:8", { ...original, number: 8, title: "#8 requires #7", url: original.url.replace("/7", "/8") });
   await harness.restartMain().runPass();
   const snapshot = await harness.main.statusSnapshot();
-  assert.equal(snapshot.workItems.find((item) => item.sourceRef === "8")?.state, "Planned");
+  assert.equal(snapshot.changeSets.find((item) => item.issues.some((issue) => issue.number === 8))?.state, "Planned");
   assert.equal(harness.launches.length, 1);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
@@ -776,7 +925,7 @@ for (const body of ["Requires #99 if optional mode is enabled", "Depends on #99 
     });
     await harness.restartMain().runPass();
     assert.equal(harness.launches.length, 1);
-    assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Implementing");
+    assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Implementing");
     assert.equal(harness.notifications.some((message) => message.includes("unresolved references")), false);
   });
 }
@@ -790,8 +939,8 @@ test("apostrophes in affirmative prose preserve Requires and prevent premature s
     goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7, 8] }],
   });
   await harness.restartMain().runPass();
-  assert.deepEqual(harness.launches.map((launch) => launch.workItemId), ["example:issue-7:g1"]);
-  assert.equal((await harness.main.statusSnapshot()).workItems.find((item) => item.sourceRef === "8")?.state, "Planned");
+  assert.deepEqual(harness.launches.map((launch) => launch.changeSetId), ["example:issue-7:g1"]);
+  assert.equal((await harness.main.statusSnapshot()).changeSets.find((item) => item.issues.some((issue) => issue.number === 8))?.state, "Planned");
 });
 
 test("incomplete v11 Objective scopes remain readable and reconcile after upgrade", async (t) => {
@@ -806,15 +955,15 @@ test("incomplete v11 Objective scopes remain readable and reconcile after upgrad
   try {
     database.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?")
       .run(JSON.stringify([{ projectSlug: "api", query: { labels: ["feature"] } }]), objective.id);
-    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; UPDATE schema_meta SET version = 11;");
+    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; ALTER TABLE task_runtime DROP COLUMN window_id; UPDATE schema_meta SET version = 11;");
   } finally { database.close(); }
   const restarted = harness.restartMain();
   assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, [
     { projectSlug: "api", query: { labels: ["feature"] } }, { projectSlug: "web", numbers: [8] },
   ]);
   await restarted.runPass();
-  assert.deepEqual(harness.launches.map((launch) => launch.workItemId).sort(), ["api:issue-7:g1", "web:issue-8:g1"]);
-  assert.equal((await restarted.statusSnapshot()).workItems.some((item) => item.sourceRef === "9"), false);
+  assert.deepEqual(harness.launches.map((launch) => launch.changeSetId).sort(), ["api:issue-7:g1", "web:issue-8:g1"]);
+  assert.equal((await restarted.statusSnapshot()).changeSets.some((item) => item.issues.some((issue) => issue.number === 9)), false);
 });
 
 test("unresolved Requires outside approved scope gates discovery rather than expanding scope", async (t) => {
@@ -825,7 +974,7 @@ test("unresolved Requires outside approved scope gates discovery rather than exp
   });
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Planned");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Planned");
   assert.ok(harness.notifications.some((message) => message.includes("#99")));
 });
 
@@ -846,7 +995,7 @@ test("scope removal retires merge and conflict Decisions without closing the exi
     harness.issues.get("example:7")!.labels = ["bug"];
     await harness.restartMain().runPass();
     const snapshot = await harness.main.statusSnapshot();
-    assert.equal(snapshot.workItems[0]?.state, "Obsolete");
+    assert.equal(snapshot.changeSets[0]?.state, "Obsolete");
     assert.equal(snapshot.decisions.length, 0);
     assert.equal(harness.pullRequests.get(13)?.state, "OPEN");
     assert.equal(harness.launches.length, 2);
@@ -861,7 +1010,7 @@ test("relation analysis failure holds new work until a fresh analysis succeeds",
   });
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Planned");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Planned");
   await harness.restartMain().runPass();
   assert.equal(harness.launches.length, 1);
 });
@@ -879,7 +1028,7 @@ test("query refresh failure gates cached work until current membership can be ch
   assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Active");
   fail = false;
   await harness.restartMain().runPass();
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Obsolete");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Obsolete");
 });
 
 test("active shared work continues for its remaining owner after deferred scope detachment", async (t) => {
@@ -894,7 +1043,7 @@ test("active shared work continues for its remaining owner after deferred scope 
   await harness.restartMain().runPass();
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review"]);
   const snapshot = await harness.main.statusSnapshot();
-  assert.equal(snapshot.workItems[0]?.priority, "normal");
+  assert.equal(snapshot.changeSets[0]?.priority, "normal");
   assert.equal(snapshot.objectives.find((objective) => objective.id === query.objective.id)?.state, "Done");
 });
 
@@ -913,8 +1062,8 @@ test("scope re-entry preserves a running Task and cancels its deferred detachmen
   assert.equal(harness.launches.length, 1);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    assert.equal(store.hasActiveObjectiveForWorkItem(started.workItems[0]!.id), true);
-    assert.equal(store.listWorkItems(started.objective.id, true).length, 1);
+    assert.equal(store.hasActiveObjectiveForChangeSet(started.changeSets[0]!.id), true);
+    assert.equal(store.listChangeSets(started.objective.id, true).length, 1);
   } finally { store.close(); }
 });
 
@@ -927,10 +1076,10 @@ test("automatic Requires waits for merge, then unblocks its dependent", async (t
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
-  assert.ok(harness.launches.every((launch) => launch.workItemId === "example:issue-7:g1"));
+  assert.ok(harness.launches.every((launch) => launch.changeSetId === "example:issue-7:g1"));
   const decision = (await harness.main.statusSnapshot()).decisions[0]!;
   await harness.main.resolveMergeDecision(decision.id, true);
-  assert.ok(harness.launches.some((launch) => launch.workItemId === "example:issue-8:g1"));
+  assert.ok(harness.launches.some((launch) => launch.changeSetId === "example:issue-8:g1"));
 });
 
 test("startup inference catches cycles and serializes high-confidence conflicts", async (t) => {
@@ -945,7 +1094,7 @@ test("startup inference catches cycles and serializes high-confidence conflicts"
     const snapshot = await harness.main.statusSnapshot();
     if (cycle) {
       assert.equal(harness.launches.length, 0);
-      assert.ok(snapshot.workItems.every((item) => item.blockedReason === "cycle"));
+      assert.ok(snapshot.changeSets.every((item) => item.blockedReason === "cycle"));
     } else assert.equal(harness.launches.length, 1);
   }
 });
@@ -960,7 +1109,7 @@ test("scope-detached live worker retains its conflict until its current Task fin
     goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
   });
   await harness.main.runPass();
-  assert.equal(harness.launches[0]?.workItemId, "example:issue-7:g1");
+  assert.equal(harness.launches[0]?.changeSetId, "example:issue-7:g1");
   harness.issues.get("example:7")!.labels = ["bug"];
   await harness.restartMain().runPass();
   assert.equal(harness.launches.length, 1);
@@ -975,7 +1124,7 @@ test("scope-detached live worker retains its conflict until its current Task fin
   }));
   await harness.main.runPass();
   assert.equal(harness.launches.length, 2);
-  assert.equal(harness.launches[1]?.workItemId, "example:issue-8:g1");
+  assert.equal(harness.launches[1]?.changeSetId, "example:issue-8:g1");
 });
 
 test("orphan worker is reported and its Project is gated without adoption or stopping", async (t) => {
@@ -985,7 +1134,7 @@ test("orphan worker is reported and its Project is gated without adoption or sto
     projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
     stop: async () => { stops += 1; },
     ownedWorkers: async (project) => project.slug === "example" && orphan ? [{
-      taskId: "missing-task", projectSlug: project.slug, workItemId: "example:issue-7:g1",
+      taskId: "missing-task", projectSlug: project.slug, changeSetId: "example:issue-7:g1",
       clonePath: "/orphan/clone", tmuxSession: "merro-example", tmuxWindow: "impl-missing-task", paneId: "%9", containerId: null,
     }] : [],
   });
@@ -1009,8 +1158,8 @@ for (const labeled of [true, false]) {
     await harness.main.startObjective({ goal: "Ship", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
     await harness.main.runPass();
     const input = harness.launches[0]!;
-    workers.push({ taskId: labeled ? input.taskId : null, projectSlug: "example", workItemId: input.workItemId,
-      clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("implement", input.workItemId), paneId: "%1", containerId: null });
+    workers.push({ taskId: labeled ? input.taskId : null, projectSlug: "example", changeSetId: input.changeSetId,
+      clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("implement", input.changeSlug), paneId: "%1", containerId: null });
     await harness.restartMain().runPass();
     assert.equal(harness.launches.length, 1);
     assert.equal(harness.notifications.some((message) => /orphan/i.test(message)), false);
@@ -1028,8 +1177,8 @@ test("legacy pane matching does not confuse a current Task with a finalized Task
   await harness.main.runPass();
   await harness.main.runPass();
   const current = harness.launches[1]!;
-  workers.push({ taskId: null, projectSlug: "example", workItemId: current.workItemId,
-    clonePath: current.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("review", current.workItemId), paneId: "%1", containerId: null });
+  workers.push({ taskId: null, projectSlug: "example", changeSetId: current.changeSetId,
+    clonePath: current.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("review", current.changeSlug), paneId: "%1", containerId: null });
   await harness.restartMain().runPass();
   assert.equal(harness.notifications.some((message) => /orphan|Worker for finalized Task/i.test(message)), false);
   assert.equal(harness.launches.length, 2);
@@ -1046,7 +1195,7 @@ for (const kind of ["merge", "merge_conflict"] as const) {
           if (!unsafe) return [];
           if (hazard === "inventory_failure") throw new Error("worker inventory unavailable");
           return [{ taskId: hazard === "finalized_live" ? latest.taskId : hazard === "unknown_orphan" ? null : "orphan",
-            projectSlug: project.slug, workItemId: hazard === "unknown_orphan" ? null : latest.workItemId,
+            projectSlug: project.slug, changeSetId: hazard === "unknown_orphan" ? null : latest.changeSetId,
             clonePath: hazard === "unknown_orphan" ? null : latest.clonePath,
             tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) }];
         },
@@ -1073,14 +1222,14 @@ for (const kind of ["merge", "merge_conflict"] as const) {
       assert.equal(harness.pullRequests.get(13)!.mergedAt, null);
       assert.equal(harness.launches.length, 2);
       const snapshot = await harness.main.statusSnapshot();
-      assert.equal(snapshot.workItems[0]!.state, "AwaitingMerge");
+      assert.equal(snapshot.changeSets[0]!.state, "AwaitingMerge");
       assert.ok(snapshot.decisions.some((candidate) => candidate.id === decision.id && candidate.state === "pending"));
       const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-      assert.equal(store.getWorkItemRuntime(latest.workItemId)!.baseUpdate ?? null, null);
+      assert.equal(store.getChangeSetRuntime(latest.changeSetId)!.baseUpdate ?? null, null);
       store.close();
       unsafe = false;
       await approve();
-      assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, kind === "merge" ? "Done" : "Implementing");
+      assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, kind === "merge" ? "Done" : "Implementing");
     });
   }
 }
@@ -1101,7 +1250,7 @@ for (const role of ["implement", "review"] as const) {
     store.close();
     await harness.main.startObjective({ goal: "Other", projectSlugs: ["other"],
       issues: [{ projectSlug: "other", numbers: [8] }] });
-    workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: input.workItemId,
+    workers.push({ taskId: input.taskId, projectSlug: "example", changeSetId: input.changeSetId,
       clonePath: input.clonePath, tmuxSession: runtime.tmuxSession, tmuxWindow: runtime.tmuxWindow, paneId: runtime.paneId, containerId: null });
     const launches = harness.launches.length;
     await harness.main.runPass();
@@ -1130,7 +1279,7 @@ test("same-pass finalization preserves cross-Project conflict occupancy", async 
   assert.ok(input);
   harness.issues.get("example:7")!.body = "Conflicts with other#8";
   await harness.main.startObjective({ goal: "Other", projectSlugs: ["other"], issues: [{ projectSlug: "other", numbers: [8] }] });
-  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+  workers.push({ taskId: input.taskId, projectSlug: "example", changeSetId: id, clonePath: input.clonePath,
     tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
   await harness.main.runPass();
   assert.equal(harness.launches.length, 1);
@@ -1147,14 +1296,14 @@ test("same-pass finalization defers ownerless obsoletion until the live worker e
   const input = harness.launches[0];
   const objective = (await harness.main.statusSnapshot()).objectives[0];
   assert.ok(input && objective);
-  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+  workers.push({ taskId: input.taskId, projectSlug: "example", changeSetId: id, clonePath: input.clonePath,
     tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
   await harness.main.stopObjectives(objective.id);
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Implementing");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, "Implementing");
   assert.equal(harness.launches.length, 1);
   workers.length = 0;
   await harness.main.runPass();
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Obsolete");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, "Obsolete");
 });
 
 test("an inventory failure after Task finalization defers cleanup and successor launch", async (t) => {
@@ -1189,9 +1338,9 @@ test("exceptional result consumption refreshes worker safety before finalized cl
   const input = harness.launches[0];
   assert.ok(input);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-  store.transitionWorkItem(id, "Blocked", "clone_lost");
+  store.transitionChangeSet(id, "Blocked", "clone_lost");
   store.close();
-  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+  workers.push({ taskId: input.taskId, projectSlug: "example", changeSetId: id, clonePath: input.clonePath,
     tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
   await assert.rejects(harness.main.runPass(), /transition/i);
   assert.equal((await harness.main.statusSnapshot()).tasks[0]!.status, "finalized");
@@ -1212,12 +1361,12 @@ test("merge approval remains available when only an unrelated Project has an orp
   const decision = (await harness.main.statusSnapshot()).decisions[0];
   assert.ok(decision);
   const other = await harness.main.startObjective({ goal: "Other", projectSlugs: ["other"], issues: [{ projectSlug: "other", numbers: [8] }] });
-  const otherItem = other.workItems[0];
+  const otherItem = other.changeSets[0];
   assert.ok(otherItem);
-  workers.push({ taskId: "unrelated-orphan", projectSlug: "other", workItemId: otherItem.id, clonePath: null,
+  workers.push({ taskId: "unrelated-orphan", projectSlug: "other", changeSetId: otherItem.id, clonePath: null,
     tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
   await harness.main.resolveMergeDecision(decision.id, true);
-  assert.equal((await harness.main.statusSnapshot()).workItems.find((item) => item.id === id)!.state, "Done");
+  assert.equal((await harness.main.statusSnapshot()).changeSets.find((item) => item.id === id)!.state, "Done");
   assert.equal(harness.deletedClones.length, 1);
 });
 
@@ -1232,11 +1381,11 @@ test("rejecting an externally merged Decision reconciles without deleting a live
   assert.ok(decision);
   const input = harness.launches[1];
   assert.ok(input);
-  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: id, clonePath: input.clonePath,
+  workers.push({ taskId: input.taskId, projectSlug: "example", changeSetId: id, clonePath: input.clonePath,
     tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
   harness.setPullRequest(13, { state: "CLOSED", mergedAt: "2026-01-02T00:00:00Z", mergeCommitSha: "e".repeat(40) });
   await harness.main.resolveMergeDecision(decision.id, false);
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Done");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, "Done");
   assert.equal(harness.deletedClones.length, 0);
 });
 
@@ -1250,8 +1399,8 @@ test("live workers attached to finalized Tasks gate successors and retain their 
   const runtime = store.getTaskRuntime(input.taskId)!;
   store.finalizeTask({ id: input.taskId, outcome: "failed", summary: "Stopped record", resultJson: "{}" });
   store.close();
-  workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: input.workItemId,
-    clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("implement", input.workItemId), paneId: "%1", containerId: null });
+  workers.push({ taskId: input.taskId, projectSlug: "example", changeSetId: input.changeSetId,
+    clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("implement", input.changeSlug), paneId: "%1", containerId: null });
   await harness.restartMain().runPass();
   assert.equal(harness.launches.length, 1);
   assert.ok(harness.notifications.some((message) => message.includes("Worker for finalized Task")));
@@ -1264,7 +1413,7 @@ test("unsafe Projects still refresh query scopes without obsoleting orphan-owned
   const harness = await createHarness(t, {
     projects: [{ slug: "example", issueNumbers: [7, 8] }],
     ownedWorkers: async (project) => orphan ? [{ taskId: "missing", projectSlug: project.slug,
-      workItemId: "example:issue-7:g1", clonePath: "/clone", tmuxSession: null,
+      changeSetId: "example:issue-7:g1", clonePath: "/clone", tmuxSession: null,
       tmuxWindow: null, paneId: null, containerId: "a".repeat(64) }] : [],
   });
   harness.issues.get("example:8")!.labels = [];
@@ -1275,15 +1424,15 @@ test("unsafe Projects still refresh query scopes without obsoleting orphan-owned
   harness.issues.get("example:7")!.body = "Conflicts with #8";
   await harness.main.runPass();
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-  assert.deepEqual(store.listWorkItems(objective.id).map((item) => item.sourceRef), ["8"]);
-  assert.notEqual(store.getWorkItem("example:issue-7:g1")!.state, "Obsolete");
+  assert.deepEqual(store.listChangeSets(objective.id).map((item) => item.issues.map((issue) => issue.number).join(",")), ["8"]);
+  assert.notEqual(store.getChangeSet("example:issue-7:g1")!.state, "Obsolete");
   assert.equal(store.listRelations().filter((relation) => relation.kind === "Conflicts").length, 1);
   store.close();
   assert.equal(harness.launches.length, 0);
   orphan = false;
   await harness.main.runPass();
-  assert.equal((await harness.main.statusSnapshot()).workItems.find((item) => item.sourceRef === "7")!.state, "Obsolete");
-  assert.deepEqual(harness.launches.map((launch) => launch.workItemId), ["example:issue-8:g1"]);
+  assert.equal((await harness.main.statusSnapshot()).changeSets.find((item) => item.issues.some((issue) => issue.number === 7))!.state, "Obsolete");
+  assert.deepEqual(harness.launches.map((launch) => launch.changeSetId), ["example:issue-8:g1"]);
 });
 
 for (const mutation of ["issue_closed", "pr_closed", "pr_merged"] as const) {
@@ -1297,7 +1446,7 @@ for (const mutation of ["issue_closed", "pr_closed", "pr_merged"] as const) {
     await harness.main.runPass();
     assert.equal(harness.launches.length, 2);
     const input = harness.launches[1]!;
-    workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: input.workItemId,
+    workers.push({ taskId: input.taskId, projectSlug: "example", changeSetId: input.changeSetId,
       clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: "legacy", paneId: "%9", containerId: null });
     if (mutation === "issue_closed") harness.setIssueState("example", 7, "CLOSED");
     else harness.setPullRequest(13, mutation === "pr_merged"
@@ -1305,8 +1454,8 @@ for (const mutation of ["issue_closed", "pr_closed", "pr_merged"] as const) {
       : { state: "CLOSED" });
     await harness.restartMain().runPass();
     const snapshot = await harness.main.statusSnapshot();
-    assert.equal(snapshot.workItems[0]!.state, mutation === "pr_closed" ? "Blocked" : "Done");
-    if (mutation === "pr_closed") assert.equal(snapshot.workItems[0]!.blockedReason, "pr_closed");
+    assert.equal(snapshot.changeSets[0]!.state, mutation === "pr_closed" ? "Blocked" : "Done");
+    if (mutation === "pr_closed") assert.equal(snapshot.changeSets[0]!.blockedReason, "pr_closed");
     assert.equal(snapshot.decisions.length, 0);
     assert.equal(harness.deletedClones.length, 0);
     assert.equal(harness.launches.length, 2);
@@ -1320,18 +1469,18 @@ test("unsafe Projects still consume recorded Task results without obsolete trans
     issues: [{ projectSlug: "example", numbers: [7] }] });
   await harness.main.runPass();
   const input = harness.launches[0]!;
-  workers.push({ taskId: "missing", projectSlug: "example", workItemId: input.workItemId,
+  workers.push({ taskId: "missing", projectSlug: "example", changeSetId: input.changeSetId,
     clonePath: input.clonePath, tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) });
   await harness.main.stopObjectives();
   const snapshot = await harness.main.statusSnapshot();
   assert.equal(snapshot.tasks[0]!.status, "finalized");
   assert.equal(snapshot.tasks[0]!.outcome, "success");
-  assert.equal(snapshot.workItems[0]!.state, "Implementing");
+  assert.equal(snapshot.changeSets[0]!.state, "Implementing");
   assert.equal(harness.launches.length, 1);
   assert.equal(harness.cleanupCalls.length, 0);
   workers.length = 0;
   await harness.main.runPass();
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]!.state, "Obsolete");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, "Obsolete");
   assert.deepEqual(harness.cleanupCalls, [input.taskId]);
 });
 
@@ -1339,7 +1488,7 @@ test("unidentified orphan worker gates the workspace until its ownership can be 
   const harness = await createHarness(t, {
     projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
     ownedWorkers: async (project) => project.slug === "example" ? [{
-      taskId: null, projectSlug: project.slug, workItemId: null, clonePath: null,
+      taskId: null, projectSlug: project.slug, changeSetId: null, clonePath: null,
       tmuxSession: "merro-example", tmuxWindow: "unidentified", paneId: "%9", containerId: null,
     }] : [],
   });
@@ -1349,11 +1498,11 @@ test("unidentified orphan worker gates the workspace until its ownership can be 
   assert.equal(harness.launches.length, 0);
 });
 
-test("orphan WorkItems remain active conflict endpoints across Projects", async (t) => {
+test("orphan ChangeSets remain active conflict endpoints across Projects", async (t) => {
   const harness = await createHarness(t, {
     projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
     ownedWorkers: async (project) => project.slug === "example" ? [{
-      taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+      taskId: "missing", projectSlug: project.slug, changeSetId: "example:issue-7:g1", clonePath: "/clone",
       tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64),
     }] : [],
   });
@@ -1373,7 +1522,7 @@ test("orphan safety gating still discovers new cross-Project conflicts", async (
   const harness = await createHarness(t, {
     projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
     ownedWorkers: async (project) => project.slug === "example" && orphan ? [{
-      taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+      taskId: "missing", projectSlug: project.slug, changeSetId: "example:issue-7:g1", clonePath: "/clone",
       tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64),
     }] : [],
   });
@@ -1417,9 +1566,9 @@ for (const identity of ["pane", "window"] as const) {
       store.finalizeTask({ id: input.taskId, outcome: "failed", summary: "Finalized legacy record", resultJson: "{}" });
       store.close();
       workers.push(
-        { taskId: null, projectSlug: "example", workItemId: null, clonePath: null,
+        { taskId: null, projectSlug: "example", changeSetId: null, clonePath: null,
           tmuxSession: runtime.tmuxSession, tmuxWindow: runtime.tmuxWindow, paneId: "%9", containerId: null },
-        { taskId: input.taskId, projectSlug: "example", workItemId: null, clonePath: input.clonePath,
+        { taskId: input.taskId, projectSlug: "example", changeSetId: null, clonePath: input.clonePath,
           tmuxSession: null, tmuxWindow: null, paneId: null, containerId: runtime.containerId },
       );
       await harness.main.startObjective({ goal: "B", projectSlugs: ["other"],
@@ -1438,9 +1587,9 @@ for (const cap of [1, 2]) {
     const harness = await createHarness(t, {
       maxConcurrentTasks: cap, projects: [{ slug: "example", issueNumbers: [7] }, { slug: "other", issueNumbers: [8] }],
       ownedWorkers: async (project) => project.slug === "example" ? [
-        { taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+        { taskId: "missing", projectSlug: project.slug, changeSetId: "example:issue-7:g1", clonePath: "/clone",
           tmuxSession: "merro-example", tmuxWindow: "impl-missing", paneId: "%9", containerId: null },
-        { taskId: "missing", projectSlug: project.slug, workItemId: "example:issue-7:g1", clonePath: "/clone",
+        { taskId: "missing", projectSlug: project.slug, changeSetId: "example:issue-7:g1", clonePath: "/clone",
           tmuxSession: null, tmuxWindow: null, paneId: null, containerId: "a".repeat(64) },
       ] : [],
     });
@@ -1494,14 +1643,14 @@ test("removed inference is rebuilt without deleting explicit Main relations", as
   const started = await harness.main.startObjective({
     goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }],
   });
-  const explicit: Relation = { kind: "Requires", from: started.workItems[2]!.id, to: started.workItems[0]!.id,
+  const explicit: Relation = { kind: "Requires", from: started.changeSets[2]!.id, to: started.changeSets[0]!.id,
     confidence: "explicit", rationale: "Approved plan", evidence: "User direction" };
   await harness.main.updateRelations([explicit]);
   assert.equal(harness.launches.length, 1);
   harness.issues.get("example:8")!.body = "Independent work.";
   await harness.restartMain().runPass();
-  assert.ok(harness.launches.some((launch) => launch.workItemId === "example:issue-8:g1"));
-  assert.ok(!harness.launches.some((launch) => launch.workItemId === "example:issue-9:g1"));
+  assert.ok(harness.launches.some((launch) => launch.changeSetId === "example:issue-8:g1"));
+  assert.ok(!harness.launches.some((launch) => launch.changeSetId === "example:issue-9:g1"));
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try { assert.deepEqual(store.listRelations(), [explicit]); } finally { store.close(); }
 });
@@ -1517,7 +1666,7 @@ test("Objective completion requires a fresh GitHub check even for fixed issue se
   fail = true;
   await harness.main.resolveMergeDecision(decision.id, true);
   let snapshot = await harness.main.statusSnapshot();
-  assert.equal(snapshot.workItems[0]?.state, "Done");
+  assert.equal(snapshot.changeSets[0]?.state, "Done");
   assert.equal(snapshot.objectives[0]?.state, "Active");
   fail = false;
   await harness.restartMain().runPass();
@@ -1564,18 +1713,18 @@ test("legacy Objectives retain fixed selections rather than inferring a query fr
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
     store.createObjective({ id: "legacy", goal: "Ship all features", priority: "normal", state: "Active", projectSlugs: ["example", "web"] });
-    store.createWorkItem({
-      id: "example:issue-7:g1", projectSlug: "example", sourceType: "issue", sourceRef: "7", generation: 1,
+    store.createChangeSet({
+      id: "example:issue-7:g1", projectSlug: "example", slug: "existing-change", issues: [{ projectSlug: "example", number: 7 }], generation: 1,
       state: "Ready", priority: "normal", readySince: "2026-01-01T00:00:00Z", blockedReason: null, blockedResumeState: null,
     });
-    store.attachWorkItem("legacy", "example:issue-7:g1");
+    store.attachChangeSet("legacy", "example:issue-7:g1");
   } finally { store.close(); }
   harness.setIssueState("example", 7, "CLOSED");
   await harness.restartMain().runPass();
   const snapshot = await harness.main.statusSnapshot();
   assert.equal(snapshot.objectives[0]?.state, "Done");
   assert.deepEqual(snapshot.objectives[0]?.issueScopes, [{ projectSlug: "example", numbers: [7] }, { projectSlug: "web", numbers: [] }]);
-  assert.deepEqual(snapshot.workItems.map((item) => item.sourceRef), ["7"]);
+  assert.deepEqual(snapshot.changeSets.map((item) => item.issues.map((issue) => issue.number).join(",")), ["7"]);
 });
 
 test("zero-work legacy Objectives recover empty fixed selections and complete after restart", async (t) => {
@@ -1585,7 +1734,7 @@ test("zero-work legacy Objectives recover empty fixed selections and complete af
   try {
     store.createObjective({ id: "legacy", goal: "Ship all features", priority: "normal", state: "Active", projectSlugs: ["api"] });
     assert.equal(store.getObjective("legacy")?.issueScopes, undefined);
-    assert.deepEqual(store.listWorkItems("legacy"), []);
+    assert.deepEqual(store.listChangeSets("legacy"), []);
   } finally { store.close(); }
   const database = new DatabaseSync(databasePath);
   try {
@@ -1597,7 +1746,7 @@ test("zero-work legacy Objectives recover empty fixed selections and complete af
   const snapshot = await restarted.statusSnapshot();
   assert.deepEqual(snapshot.objectives[0]?.issueScopes, [{ projectSlug: "api", numbers: [] }]);
   assert.equal(snapshot.objectives[0]?.state, "Done");
-  assert.deepEqual(snapshot.workItems, []);
+  assert.deepEqual(snapshot.changeSets, []);
   assert.equal(harness.launches.length, 0);
 });
 
@@ -1633,8 +1782,8 @@ test("one Project scope failure does not prevent another Project from discoverin
   await harness.main.runPass();
   const snapshot = await harness.main.statusSnapshot();
   assert.equal(snapshot.objectives[0]?.state, "Active");
-  assert.deepEqual(snapshot.workItems.map((item) => item.id), ["plugins:issue-4:g1"]);
-  assert.equal(harness.launches[0]?.workItemId, "plugins:issue-4:g1");
+  assert.deepEqual(snapshot.changeSets.map((item) => item.id), ["plugins:issue-4:g1"]);
+  assert.equal(harness.launches[0]?.changeSetId, "plugins:issue-4:g1");
 });
 
 for (const missingProject of ["api", "web"]) {
@@ -1642,10 +1791,10 @@ for (const missingProject of ["api", "web"]) {
     const harness = await createHarness(t, { projects: [{ slug: "api", issueNumbers: [7] }, { slug: "web", issueNumbers: [8] }] });
     const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
     registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
-    const approve = tools.get("merro_start_objective");
+    const approve = tools.get("merro_propose_objective");
     assert.ok(approve);
     await assert.rejects(approve.execute("approve", {
-      goal: "Ship both", project_slugs: ["api", "web"],
+      goal: "Ship both", change: "ship-both", project_slugs: ["api", "web"],
       issues: [{ project_slug: missingProject === "api" ? "web" : "api", query: {} }],
     }), new RegExp(`missing issue scope for Project '${missingProject}'`));
     await assert.rejects(harness.main.startObjective({
@@ -1654,7 +1803,7 @@ for (const missingProject of ["api", "web"]) {
     }), new RegExp(`missing issue scope for Project '${missingProject}'`));
     const snapshot = await harness.main.statusSnapshot();
     assert.equal(snapshot.objectives.length, 0);
-    assert.equal(snapshot.workItems.length, 0);
+    assert.equal(snapshot.changeSets.length, 0);
     assert.equal(harness.launches.length, 0);
   });
 }
@@ -1667,7 +1816,7 @@ test("Objective approval normalizes duplicate Project slugs before scope validat
   });
   assert.deepEqual(started.objective.projectSlugs, ["api", "web"]);
   assert.equal(started.objective.issueScopes?.length, 2);
-  assert.equal(started.workItems.length, 2);
+  assert.equal(started.changeSets.length, 2);
   assert.deepEqual((await harness.restartMain().statusSnapshot()).objectives[0]?.projectSlugs, ["api", "web"]);
 });
 
@@ -1677,7 +1826,7 @@ test("complete multi-Project scopes persist and check every Project before Objec
     goal: "Ship both", projectSlugs: ["api", "web"],
     issues: [{ projectSlug: "web", numbers: [8] }, { projectSlug: "api", query: {} }],
   });
-  assert.deepEqual(started.workItems.map((item) => item.projectSlug).sort(), ["api", "web"]);
+  assert.deepEqual(started.changeSets.map((item) => item.projectSlug).sort(), ["api", "web"]);
   const restarted = harness.restartMain();
   assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, started.objective.issueScopes);
   harness.setIssueState("api", 7, "CLOSED");
@@ -1711,10 +1860,10 @@ test("blocked reason follows external PR closure without losing resume state", a
   await harness.main.runPass();
   await harness.main.runPass();
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-  try { store.transitionWorkItem(id, "Blocked", "task_failed"); } finally { store.close(); }
+  try { store.transitionChangeSet(id, "Blocked", "task_failed"); } finally { store.close(); }
   harness.setPullRequest(13, { state: "CLOSED" });
   await harness.main.runPass();
-  const item = (await harness.main.statusSnapshot()).workItems[0]!;
+  const item = (await harness.main.statusSnapshot()).changeSets[0]!;
   assert.equal(item.blockedReason, "pr_closed");
   assert.equal(item.blockedResumeState, "AwaitingMerge");
 });
@@ -1760,7 +1909,7 @@ test("adopt a moved Project path only for the same repository identity", async (
   const moved = join(harness.workspacePath, "moved");
   harness.setProjectState("example", { path: moved, baseRemote: "git@github.com:example/example.git" });
   await harness.main.runPass();
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.blockedReason, "project_unavailable");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.blockedReason, "project_unavailable");
   const adopted = await harness.main.addProject(moved, "example");
   assert.equal(adopted.path, moved);
   assert.equal((await harness.main.listProjects())[0]?.path, moved);
@@ -1781,14 +1930,14 @@ test("partial launch stops the worker and finalizes/blocks once, including after
   assert.equal(snapshot.tasks.length, 1);
   assert.equal(snapshot.tasks[0]?.status, "finalized");
   assert.equal(snapshot.tasks[0]?.outcome, "failed");
-  assert.equal(snapshot.tasks[0]?.workItemId, id);
-  assert.equal(snapshot.workItems[0]?.blockedReason, "task_failed");
+  assert.equal(snapshot.tasks[0]?.changeSetId, id);
+  assert.equal(snapshot.changeSets[0]?.blockedReason, "task_failed");
   const failureReports = harness.notifications.filter((message) => message.includes("Could not start"));
   assert.equal(failureReports.length, 1);
   await harness.restartMain().runPass();
   const restarted = await harness.main.statusSnapshot();
   assert.deepEqual(restarted.tasks, snapshot.tasks);
-  assert.equal(restarted.workItems[0]?.state, "Blocked");
+  assert.equal(restarted.changeSets[0]?.state, "Blocked");
   assert.equal(stops, 1);
   assert.equal(harness.launches.length, 1);
   assert.deepEqual(harness.notifications.filter((message) => message.includes("Could not start")), failureReports);
@@ -1800,11 +1949,11 @@ test("failed launch remains active if stopping the worker fails", async (t) => {
   await harness.main.runPass();
   const snapshot = await harness.main.statusSnapshot();
   assert.equal(snapshot.tasks[0]?.status, "active");
-  assert.equal(snapshot.workItems[0]?.blockedReason, "task_failed");
+  assert.equal(snapshot.changeSets[0]?.blockedReason, "task_failed");
 });
 
 for (const outcome of ["success", "pass", "reject"] as const) {
-  test(`valid late ${outcome} result resumes its WorkItem after launch and stop fail`, async (t) => {
+  test(`valid late ${outcome} result resumes its ChangeSet after launch and stop fail`, async (t) => {
     const role = outcome === "success" ? "implement" : "review";
     const harness = await createHarness(t, {
       launchFailure: (input) => input.role === role,
@@ -1815,19 +1964,19 @@ for (const outcome of ["success", "pass", "reject"] as const) {
     if (role === "review") await harness.main.runPass();
     const before = await harness.main.statusSnapshot();
     const task = before.tasks.find((candidate) => candidate.status === "active")!;
-    assert.equal(before.workItems[0]?.state, "Blocked");
+    assert.equal(before.changeSets[0]?.state, "Blocked");
     const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
     const runtime = store.getTaskRuntime(task.id)!;
     store.close();
     await mkdir(dirname(runtime.resultPath), { recursive: true });
     const result = outcome === "success"
-      ? { task_id: task.id, status: outcome, summary: "Late implementation", commit: createHash("sha1").update(task.id).digest("hex"), verification: [] }
+      ? { task_id: task.id, status: outcome, summary: "Late implementation", commit: createHash("sha1").update(task.id).digest("hex"), verification: [{ kind: "command", project: "example", cwd: runtime.clonePath, command: "scripts/run-ci.sh", exit_code: 0 }] }
       : { task_id: task.id, status: outcome, summary: "Late review", reviewed_commit: runtime.expectedCommit, verification: [], findings: outcome === "reject" ? [{ severity: "blocking", summary: "Needs rework" }] : [] };
     await writeFile(runtime.resultPath, JSON.stringify(result));
     await harness.main.runPass();
     const after = await harness.main.statusSnapshot();
     assert.equal(after.tasks.find((candidate) => candidate.id === task.id)?.outcome, outcome);
-    assert.equal(after.workItems[0]?.state, outcome === "success" ? "Reviewing" : outcome === "pass" ? "AwaitingMerge" : "Implementing");
+    assert.equal(after.changeSets[0]?.state, outcome === "success" ? "Reviewing" : outcome === "pass" ? "AwaitingMerge" : "Implementing");
     assert.ok(harness.cleanupCalls.includes(task.id));
   });
 }
@@ -1835,10 +1984,11 @@ for (const outcome of ["success", "pass", "reject"] as const) {
 for (const failure of ["success", "cancelled", "unreadable", "missing", "identity", "malformed", "wrong_task_id"] as const) {
   test(`finalized ${failure} Task artifacts are cleaned and cleanup retries survive a Main restart`, async (t) => {
     let failCleanup = true;
+    let ambiguous = failure === "identity";
     const harness = await createHarness(t, {
       taskArtifacts: true,
       cleanupFailure: () => failCleanup,
-      inspect: async () => ({ alive: failure === "identity", identityMatches: false, reason: "worker unavailable" }),
+      inspect: async () => ({ alive: ambiguous, identityMatches: false, reason: "worker unavailable" }),
       result: (_input, _number, result) => failure === "missing" || failure === "identity" ? null : result,
     });
     await startDefaultObjective(harness.main);
@@ -1854,13 +2004,14 @@ for (const failure of ["success", "cancelled", "unreadable", "missing", "identit
       await writeFile(resultPath, JSON.stringify({ ...result, task_id: "another-task" }));
     }
     await harness.main.runPass();
-    const finalized = (await harness.main.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id)!;
-    assert.equal(finalized.status, "finalized");
     if (failure === "identity") {
-      // A live identity mismatch is unsafe even if inventory missed it. Retry only after a fresh pass.
+      assert.equal((await harness.main.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id)!.status, "active");
       assert.equal(harness.cleanupCalls.includes(task.id), false);
+      ambiguous = false;
       await harness.main.runPass();
     }
+    const finalized = (await harness.main.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id)!;
+    assert.equal(finalized.status, "finalized");
     assert.ok(harness.cleanupCalls.includes(task.id));
     assert.match(await readFile(join(dir, "pi-config", "auth.json"), "utf8"), /auth/);
     failCleanup = false;
@@ -1946,7 +2097,7 @@ test("failed launch cleanup retries after Main restarts even when the Project is
   await harness.main.runPass();
   const task = (await harness.main.statusSnapshot()).tasks[0]!;
   assert.equal(task.status, "finalized");
-  const scratch = join(harness.workspacePath, ".merro", "runtime", "tasks", task.id);
+  const scratch = dirname(new WorkerRuntime({ workspacePath: join(harness.workspacePath, ".merro", "runtime"), config: DEFAULT_CONFIG }).plan(harness.launches[0]!).resultPath);
   assert.match(await readFile(join(scratch, "pi-config", "auth.json"), "utf8"), /auth/);
   await rm(harness.projects.get("example")!.path, { recursive: true, force: true });
   failCleanup = false;
@@ -2011,21 +2162,21 @@ test("Task cleanup failure does not prevent review scheduling or reset of infras
   const id = await startDefaultObjective(harness.main);
   await harness.main.runPass();
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-  try { store.saveWorkItemRuntime({ ...store.getWorkItemRuntime(id)!, infrastructureRetries: 1 }); } finally { store.close(); }
+  try { store.saveChangeSetRuntime({ ...store.getChangeSetRuntime(id)!, infrastructureRetries: 1 }); } finally { store.close(); }
   await harness.main.runPass();
   const reopened = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
-  try { assert.equal(reopened.getWorkItemRuntime(id)?.infrastructureRetries, 0); } finally { reopened.close(); }
+  try { assert.equal(reopened.getChangeSetRuntime(id)?.infrastructureRetries, 0); } finally { reopened.close(); }
   assert.deepEqual(harness.launches.map((input) => input.role), ["implement", "review"]);
   assert.ok(harness.notifications.some((message) => message.includes("Task cleanup failed")));
 });
 
-test("local WorkItem launches without querying an issue", async (t) => {
+test("local ChangeSet launches without querying an issue", async (t) => {
   const harness = await createHarness(t);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
     store.createObjective({ id: "local-goal", goal: "Add local feature", projectSlugs: ["example"], priority: "normal", state: "Active" });
-    store.createWorkItem({ id: "example:local:feature:g1", projectSlug: "example", sourceType: "local", sourceRef: "feature", generation: 1, state: "Ready", priority: "normal", readySince: new Date().toISOString(), blockedReason: null, blockedResumeState: null, guidance: "Implement local feature" });
-    store.attachWorkItem("local-goal", "example:local:feature:g1");
+    store.createChangeSet({ id: "example:local:feature:g1", projectSlug: "example", slug: "feature", issues: [], generation: 1, state: "Ready", priority: "normal", readySince: new Date().toISOString(), blockedReason: null, blockedResumeState: null, guidance: "Implement local feature" });
+    store.attachChangeSet("local-goal", "example:local:feature:g1");
   } finally { store.close(); }
   await harness.main.runPass();
   assert.equal(harness.launches.length, 1);
@@ -2038,7 +2189,7 @@ test("local WorkItem launches without querying an issue", async (t) => {
 
 test("merge finalization remains complete when terminal clone cleanup fails", async (t) => {
   const harness = await createHarness(t, { deleteCloneFailure: true });
-  const workItemId = await startDefaultObjective(harness.main);
+  const changeSetId = await startDefaultObjective(harness.main);
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
@@ -2049,11 +2200,11 @@ test("merge finalization remains complete when terminal clone cleanup fails", as
   await harness.main.resolveMergeDecision(decision.id, true);
 
   const completed = await harness.main.statusSnapshot();
-  assert.equal(completed.workItems.find((item) => item.id === workItemId)?.state, "Done");
-  assert.ok(harness.notifications.some((message) => message.includes("Could not clean up terminal WorkItem clone")));
+  assert.equal(completed.changeSets.find((item) => item.id === changeSetId)?.state, "Done");
+  assert.ok(harness.notifications.some((message) => message.includes("Could not clean up terminal ChangeSet clone")));
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    assert.ok(store.getFinalSummary(workItemId));
+    assert.ok(store.getFinalSummary(changeSetId));
   } finally {
     store.close();
   }
@@ -2136,7 +2287,7 @@ test("required approvals count only write-eligible reviewers and allow stale app
   await harness.main.runPass();
 
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(state.decisions.length, 1);
 });
 
@@ -2216,7 +2367,7 @@ test("reopened issue generations use distinct branches and pull requests", async
     projectSlugs: ["example"],
     issues: [{ projectSlug: "example", numbers: [7] }],
   });
-  assert.equal(second.workItems[0]?.generation, 2);
+  assert.equal(second.changeSets[0]?.generation, 2);
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
@@ -2229,7 +2380,7 @@ test("reopened issue generations use distinct branches and pull requests", async
   assert.equal(harness.pullRequests.get(firstPullRequest.number)?.state, "CLOSED");
   assert.equal(nextPullRequest.state, "OPEN");
   assert.equal(nextPullRequest.mergedAt, null);
-  assert.equal((await harness.main.statusSnapshot()).workItems.find((item) => item.generation === 2)?.state, "AwaitingMerge");
+  assert.equal((await harness.main.statusSnapshot()).changeSets.find((item) => item.generation === 2)?.state, "AwaitingMerge");
 });
 
 const reworkScenarios: Array<{ name: string; update: Partial<GitHubPullRequest> }> = [
@@ -2249,14 +2400,14 @@ for (const scenario of reworkScenarios) {
 
     await harness.main.runPass();
     assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
-    assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Implementing");
+    assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Implementing");
     assert.equal((await harness.main.statusSnapshot()).decisions.length, 0);
 
     await harness.main.runPass();
     await harness.main.runPass();
     const afterRework = await harness.main.statusSnapshot();
     assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement", "review"]);
-    assert.equal(afterRework.workItems[0]?.state, "AwaitingMerge");
+    assert.equal(afterRework.changeSets[0]?.state, "AwaitingMerge");
     assert.equal(afterRework.decisions.length, 0);
     assert.notEqual(harness.pullRequests.get(number)?.headRefOid, original.headRefOid);
     assert.equal(harness.pullRequests.get(number)?.reviewDecision, null);
@@ -2265,7 +2416,7 @@ for (const scenario of reworkScenarios) {
 
 test("persistent CHANGES_REQUESTED reworks only once for the same review and reviewed head", async (t) => {
   const harness = await createHarness(t, { requireExternalApproval: true });
-  const workItemId = await startDefaultObjective(harness.main);
+  const changeSetId = await startDefaultObjective(harness.main);
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
@@ -2286,7 +2437,7 @@ test("persistent CHANGES_REQUESTED reworks only once for the same review and rev
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    const trigger = store.getWorkItemRuntime(workItemId)?.lastReworkTrigger;
+    const trigger = store.getChangeSetRuntime(changeSetId)?.lastReworkTrigger;
     assert.ok(trigger?.includes("changes-request-1"));
     assert.ok(trigger?.includes(original.headRefOid));
   } finally {
@@ -2297,7 +2448,7 @@ test("persistent CHANGES_REQUESTED reworks only once for the same review and rev
   await harness.main.runPass();
   let state = await harness.main.statusSnapshot();
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement", "review"]);
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(state.decisions.length, 0);
   assert.equal(harness.pullRequests.get(number)?.reviewDecision, "CHANGES_REQUESTED");
   assert.notEqual(harness.pullRequests.get(number)?.headRefOid, original.headRefOid);
@@ -2305,7 +2456,7 @@ test("persistent CHANGES_REQUESTED reworks only once for the same review and rev
   await harness.main.runPass();
   state = await harness.main.statusSnapshot();
   assert.equal(harness.launches.length, 4);
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(state.decisions.length, 0);
 });
 
@@ -2324,7 +2475,7 @@ test("base movement schedules implementation and verification before a fresh rev
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
   assert.match(harness.launches[2]!.taskFile, /updated base/i);
   assert.match(harness.launches[2]!.taskFile, /dddddddddddddddddddddddddddddddddddddddd/);
-  assert.equal((await harness.main.statusSnapshot()).workItems[0]?.state, "Implementing");
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Implementing");
   assert.equal((await harness.main.statusSnapshot()).decisions.length, 0);
   assert.equal(harness.fetchedBases[0]?.baseCommit, "d".repeat(40));
   const restarted = harness.restartMain();
@@ -2332,7 +2483,7 @@ test("base movement schedules implementation and verification before a fresh rev
   await restarted.runPass();
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement", "review"]);
   const snapshot = await restarted.statusSnapshot();
-  assert.equal(snapshot.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(snapshot.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(snapshot.decisions[0]?.kind, "merge");
   assert.equal(snapshot.tasks.filter((task) => task.role === "review").length, 2);
 });
@@ -2349,7 +2500,7 @@ test("base merge conflicts create one merge_conflict Decision", async (t) => {
   harness.setPullRequest(number, { baseRefOid: "d".repeat(40) });
   await harness.main.runPass();
   let state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(state.decisions.length, 1);
   assert.equal(state.decisions[0]?.kind, "merge_conflict");
 
@@ -2378,15 +2529,15 @@ test("approve command schedules an implementer to resolve a merge conflict befor
   const approve = commands.get("merro-approve");
   assert.ok(approve);
   harness.setBaseMergeConflict(false);
-  await approve.handler(decision.id, { ui: { notify() {} } });
+  await approve.handler((await harness.main.statusSnapshot()).changeSets[0]!.slug, { ui: { notify() {} } });
 
   const state = await harness.main.statusSnapshot();
   assert.equal(state.decisions.length, 0);
-  assert.equal(state.workItems[0]?.state, "Implementing");
+  assert.equal(state.changeSets[0]?.state, "Implementing");
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
 });
 
-test("reject command abandons a merge_conflict Decision without wedging the WorkItem", async (t) => {
+test("reject command abandons a merge_conflict Decision without wedging the ChangeSet", async (t) => {
   const harness = await createHarness(t, { baseMergeConflict: true });
   await startDefaultObjective(harness.main);
   await harness.main.runPass();
@@ -2403,12 +2554,12 @@ test("reject command abandons a merge_conflict Decision without wedging the Work
   registerCommands({ registerCommand(name, config) { commands.set(name, config); } }, harness.workspacePath, harness.main);
   const reject = commands.get("merro-reject");
   assert.ok(reject);
-  await reject.handler(decision.id, { ui: { notify() {} } });
+  await reject.handler((await harness.main.statusSnapshot()).changeSets[0]!.slug, { ui: { notify() {} } });
 
   const state = await harness.main.statusSnapshot();
   assert.equal(state.decisions.length, 0);
-  assert.equal(state.workItems[0]?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "merge_rejected");
+  assert.equal(state.changeSets[0]?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "merge_rejected");
 });
 
 test("Main tool exposes merge_conflict resolution", async (t) => {
@@ -2426,14 +2577,14 @@ test("Main tool exposes merge_conflict resolution", async (t) => {
 
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
-  const resolve = tools.get("merro_resolve_merge_conflict");
+  const resolve = tools.get("merro_resolve_decision");
   assert.ok(resolve);
-  const result = await resolve.execute("call", { decision_id: decision.id, resolution: "abandon" });
-  assert.match(result.content[0]?.text ?? "", /abandon/);
+  const result = await resolve.execute("call", { change: (await harness.main.statusSnapshot()).changeSets[0]!.slug, approved: false });
+  assert.match(result.content[0]?.text ?? "", /resolved/);
   const state = await harness.main.statusSnapshot();
   assert.equal(state.decisions.length, 0);
-  assert.equal(state.workItems[0]?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "merge_rejected");
+  assert.equal(state.changeSets[0]?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "merge_rejected");
 });
 
 test("stopping an Objective resolves its pending merge_conflict Decision", async (t) => {
@@ -2454,7 +2605,7 @@ test("stopping an Objective resolves its pending merge_conflict Decision", async
   await harness.main.stopObjectives(objective.id);
   state = await harness.main.statusSnapshot();
   assert.equal(state.decisions.length, 0);
-  assert.equal(state.workItems[0]?.state, "Obsolete");
+  assert.equal(state.changeSets[0]?.state, "Obsolete");
 });
 
 test("external issue closure prevents launch and cancels active work", async (t) => {
@@ -2463,7 +2614,7 @@ test("external issue closure prevents launch and cancels active work", async (t)
   beforeLaunch.setIssueState("example", 7, "CLOSED");
   await beforeLaunch.main.runPass();
   let state = await beforeLaunch.main.statusSnapshot();
-  assert.equal(state.workItems.find((item) => item.id === unstartedId)?.state, "Done");
+  assert.equal(state.changeSets.find((item) => item.id === unstartedId)?.state, "Done");
   assert.equal(state.tasks.length, 0);
   assert.equal(beforeLaunch.launches.length, 0);
 
@@ -2474,7 +2625,7 @@ test("external issue closure prevents launch and cancels active work", async (t)
   active.setIssueState("example", 7, "CLOSED");
   await active.main.runPass();
   state = await active.main.statusSnapshot();
-  assert.equal(state.workItems.find((item) => item.id === activeId)?.state, "Done");
+  assert.equal(state.changeSets.find((item) => item.id === activeId)?.state, "Done");
   assert.equal(state.tasks[0]?.outcome, "cancelled");
 });
 
@@ -2490,15 +2641,15 @@ test("reopening an issue under an active Objective creates a new generation", as
   await harness.main.runPass();
   let state = await harness.main.statusSnapshot();
   assert.ok(state.objectives.some((objective) => objective.state === "Active"));
-  assert.ok(state.workItems.some((item) => item.sourceRef === "7" && item.generation === 1 && item.state === "Done"));
+  assert.ok(state.changeSets.some((item) => item.issues.some((issue) => issue.number === 7) && item.generation === 1 && item.state === "Done"));
 
   harness.setIssueState("example", 7, "OPEN");
   await harness.main.runPass();
   state = await harness.main.statusSnapshot();
-  const reopened = state.workItems.find((item) => item.sourceRef === "7" && item.generation === 2);
+  const reopened = state.changeSets.find((item) => item.issues.some((issue) => issue.number === 7) && item.generation === 2);
   assert.ok(reopened);
   assert.ok(state.objectives.some((objective) => objective.state === "Active"));
-  assert.ok(harness.launches.some((launch) => launch.workItemId === reopened.id));
+  assert.ok(harness.launches.some((launch) => launch.changeSetId === reopened.id));
 });
 
 test("PR reconciliation repairs required body sections and canonical review notes", async (t) => {
@@ -2542,8 +2693,8 @@ test("failed PR-content repair blocks merge readiness and clears stale Decisions
   await harness.main.runPass();
 
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "github_unavailable");
+  assert.equal(state.changeSets[0]?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "github_unavailable");
   assert.equal(state.decisions.length, 0);
 });
 
@@ -2577,7 +2728,7 @@ test("title edits stop regenerating the PR verification section", async (t) => {
   assert.doesNotMatch(updated.body, /New implementation verification/);
 });
 
-test("one issue lookup failure blocks only its WorkItem and does not abort other Projects", async (t) => {
+test("one issue lookup failure blocks only its ChangeSet and does not abort other Projects", async (t) => {
   const harness = await createHarness(t, {
     projects: [{ slug: "unavailable", issueNumbers: [7] }, { slug: "healthy", issueNumbers: [8] }],
     issueFailure: (projectSlug) => projectSlug === "unavailable",
@@ -2590,12 +2741,12 @@ test("one issue lookup failure blocks only its WorkItem and does not abort other
 
   await harness.main.runPass();
   const state = await harness.main.statusSnapshot();
-  const unavailable = started.workItems.find((item) => item.projectSlug === "unavailable");
-  const healthy = started.workItems.find((item) => item.projectSlug === "healthy");
+  const unavailable = started.changeSets.find((item) => item.projectSlug === "unavailable");
+  const healthy = started.changeSets.find((item) => item.projectSlug === "healthy");
   assert.ok(unavailable && healthy);
-  assert.equal(state.workItems.find((item) => item.id === unavailable.id)?.blockedReason, "github_unavailable");
-  assert.equal(state.workItems.find((item) => item.id === healthy.id)?.state, "Implementing");
-  assert.deepEqual(harness.launches.map((launch) => launch.workItemId), [healthy.id]);
+  assert.equal(state.changeSets.find((item) => item.id === unavailable.id)?.blockedReason, "github_unavailable");
+  assert.equal(state.changeSets.find((item) => item.id === healthy.id)?.state, "Implementing");
+  assert.deepEqual(harness.launches.map((launch) => launch.changeSetId), [healthy.id]);
 });
 
 test("worker stop failure for a closed issue does not prevent other Project reconciliation", async (t) => {
@@ -2616,11 +2767,11 @@ test("worker stop failure for a closed issue does not prevent other Project reco
   await harness.main.runPass();
 
   const state = await harness.main.statusSnapshot();
-  const closing = started.workItems.find((item) => item.projectSlug === "closing");
-  const healthy = started.workItems.find((item) => item.projectSlug === "healthy");
+  const closing = started.changeSets.find((item) => item.projectSlug === "closing");
+  const healthy = started.changeSets.find((item) => item.projectSlug === "healthy");
   assert.ok(closing && healthy);
-  assert.equal(state.workItems.find((item) => item.id === closing.id)?.blockedReason, "github_unavailable");
-  assert.equal(state.workItems.find((item) => item.id === healthy.id)?.state, "Reviewing");
+  assert.equal(state.changeSets.find((item) => item.id === closing.id)?.blockedReason, "github_unavailable");
+  assert.equal(state.changeSets.find((item) => item.id === healthy.id)?.state, "Reviewing");
 });
 
 test("active worker inspection failure does not abort reconciliation of other Tasks", async (t) => {
@@ -2647,7 +2798,7 @@ test("active worker inspection failure does not abort reconciliation of other Ta
   await assert.doesNotReject(harness.main.runPass());
   assert.equal(inspectCalls, 2);
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems.filter((item) => item.blockedReason === "github_unavailable").length, 1);
+  assert.equal(state.changeSets.filter((item) => item.blockedReason === "github_unavailable").length, 1);
   assert.ok(harness.notifications.some((message) => message.includes("Could not inspect active Task")));
 });
 
@@ -2666,8 +2817,8 @@ test("closed-issue PR lookup failure is isolated and clears its merge Decision",
   await harness.main.runPass();
   await harness.main.runPass();
   const closingPr = [...harness.pullRequests.values()].find((pr) => pr.headRefName.includes("issue-7-for-closing"));
-  const closing = started.workItems.find((item) => item.projectSlug === "closing");
-  const healthy = started.workItems.find((item) => item.projectSlug === "healthy");
+  const closing = started.changeSets.find((item) => item.projectSlug === "closing");
+  const healthy = started.changeSets.find((item) => item.projectSlug === "healthy");
   assert.ok(closingPr && closing && healthy);
   harness.setIssueState("closing", 7, "CLOSED");
   unavailablePullRequest = closingPr.number;
@@ -2675,8 +2826,8 @@ test("closed-issue PR lookup failure is isolated and clears its merge Decision",
   await harness.main.runPass();
 
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems.find((item) => item.id === closing.id)?.blockedReason, "github_unavailable");
-  assert.equal(state.workItems.find((item) => item.id === healthy.id)?.state, "AwaitingMerge");
+  assert.equal(state.changeSets.find((item) => item.id === closing.id)?.blockedReason, "github_unavailable");
+  assert.equal(state.changeSets.find((item) => item.id === healthy.id)?.state, "AwaitingMerge");
   assert.deepEqual(state.decisions.map((decision) => decision.subjectId), [healthy.id]);
 });
 
@@ -2695,7 +2846,7 @@ test("unchanged effective diff survives an external PR head rewrite", async (t) 
 
   const state = await harness.main.statusSnapshot();
   assert.equal(harness.launches.filter((launch) => launch.role === "review").length, reviewCount);
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(state.decisions.length, 1);
   const payload = state.decisions[0]?.payload as Record<string, unknown>;
   assert.equal(payload.headRefOid, "a".repeat(40));
@@ -2715,21 +2866,21 @@ test("permanent squash-merge rejection blocks without an automatic retry", async
 
   await harness.main.resolveMergeDecision(decision.id, true);
   let state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "merge_failed");
+  assert.equal(state.changeSets[0]?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "merge_failed");
   assert.equal(state.decisions.length, 0);
   const taskCount = state.tasks.length;
 
   await harness.main.runPass();
   state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.blockedReason, "merge_failed");
+  assert.equal(state.changeSets[0]?.blockedReason, "merge_failed");
   assert.equal(state.decisions.length, 0);
   assert.equal(state.tasks.length, taskCount);
 });
 
-test("manual merge completes a blocked PR-backed WorkItem with a different resume state", async (t) => {
+test("manual merge completes a blocked PR-backed ChangeSet with a different resume state", async (t) => {
   const harness = await createHarness(t);
-  const workItemId = await startDefaultObjective(harness.main);
+  const changeSetId = await startDefaultObjective(harness.main);
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
@@ -2738,8 +2889,8 @@ test("manual merge completes a blocked PR-backed WorkItem with a different resum
 
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    store.transitionWorkItem(workItemId, "Implementing");
-    store.transitionWorkItem(workItemId, "Blocked", "task_failed");
+    store.transitionChangeSet(changeSetId, "Implementing");
+    store.transitionChangeSet(changeSetId, "Blocked", "task_failed");
   } finally {
     store.close();
   }
@@ -2751,12 +2902,12 @@ test("manual merge completes a blocked PR-backed WorkItem with a different resum
 
   await harness.main.runPass();
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Done");
+  assert.equal(state.changeSets[0]?.state, "Done");
   assert.equal(state.objectives[0]?.state, "Done");
   assert.equal(state.decisions.length, 0);
 });
 
-test("stopping a high-priority Objective recomputes shared WorkItem priority", async (t) => {
+test("stopping a high-priority Objective recomputes shared ChangeSet priority", async (t) => {
   const harness = await createHarness(t);
   const normal = await harness.main.startObjective({
     goal: "Normal priority owner",
@@ -2770,17 +2921,17 @@ test("stopping a high-priority Objective recomputes shared WorkItem priority", a
     issues: [{ projectSlug: "example", numbers: [7] }],
     priority: "high",
   });
-  assert.equal(high.workItems[0]?.priority, "high");
+  assert.equal(high.changeSets[0]?.priority, "high");
 
   await harness.main.stopObjectives(high.objective.id);
 
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.id, normal.workItems[0]?.id);
-  assert.equal(state.workItems[0]?.priority, "normal");
+  assert.equal(state.changeSets[0]?.id, normal.changeSets[0]?.id);
+  assert.equal(state.changeSets[0]?.priority, "normal");
   assert.equal(state.objectives.find((objective) => objective.id === high.objective.id)?.state, "Stopped");
 });
 
-test("one active WorkItem can serve multiple Objectives and completion updates both", async (t) => {
+test("one active ChangeSet can serve multiple Objectives and completion updates both", async (t) => {
   const harness = await createHarness(t);
   const first = await harness.main.startObjective({
     goal: "Ship the initial scope",
@@ -2793,9 +2944,9 @@ test("one active WorkItem can serve multiple Objectives and completion updates b
     issues: [{ projectSlug: "example", numbers: [7] }],
     priority: "high",
   });
-  assert.equal(first.workItems[0]?.id, second.workItems[0]?.id);
-  assert.equal(second.workItems[0]?.priority, "high");
-  assert.equal((await harness.main.statusSnapshot()).workItems.length, 1);
+  assert.equal(first.changeSets[0]?.id, second.changeSets[0]?.id);
+  assert.equal(second.changeSets[0]?.priority, "high");
+  assert.equal((await harness.main.statusSnapshot()).changeSets.length, 1);
 
   await harness.main.runPass();
   await harness.main.runPass();
@@ -2806,21 +2957,21 @@ test("one active WorkItem can serve multiple Objectives and completion updates b
   await harness.main.resolveMergeDecision(decision.id, true);
 
   const completed = await harness.main.statusSnapshot();
-  assert.equal(completed.workItems.length, 1);
+  assert.equal(completed.changeSets.length, 1);
   assert.equal(completed.objectives.length, 2);
   assert.ok(completed.objectives.every((objective) => objective.state === "Done"));
   assert.equal(harness.launches.length, 2);
 });
 
-test("Main obsoletes ownerless planned WorkItems instead of marking them Ready", async (t) => {
+test("Main obsoletes ownerless planned ChangeSets instead of marking them Ready", async (t) => {
   const harness = await createHarness(t);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try {
-    store.createWorkItem({
+    store.createChangeSet({
       id: "ownerless",
       projectSlug: "example",
-      sourceType: "issue",
-      sourceRef: "99",
+      slug: "extra-change",
+      issues: [{ projectSlug: "example", number: 99 }],
       generation: 1,
       state: "Planned",
       priority: "normal",
@@ -2834,7 +2985,7 @@ test("Main obsoletes ownerless planned WorkItems instead of marking them Ready",
 
   await harness.main.runPass();
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Obsolete");
+  assert.equal(state.changeSets[0]?.state, "Obsolete");
   assert.equal(harness.launches.length, 0);
 });
 
@@ -2846,7 +2997,7 @@ test("/stop obsoletes exclusive work and leaves shared work for an active Object
     issues: [{ projectSlug: "example", numbers: [7] }],
   });
   assert.equal(await exclusive.main.stopObjectives(only.objective.id), 1);
-  assert.equal((await exclusive.main.statusSnapshot()).workItems[0]?.state, "Obsolete");
+  assert.equal((await exclusive.main.statusSnapshot()).changeSets[0]?.state, "Obsolete");
   assert.equal(exclusive.launches.length, 0);
 
   const shared = await createHarness(t);
@@ -2862,19 +3013,19 @@ test("/stop obsoletes exclusive work and leaves shared work for an active Object
   });
   assert.equal(await shared.main.stopObjectives(first.objective.id), 1);
   const continued = await shared.main.statusSnapshot();
-  assert.equal(continued.workItems[0]?.state, "Implementing");
+  assert.equal(continued.changeSets[0]?.state, "Implementing");
   assert.equal(continued.objectives.find((objective) => objective.id === first.objective.id)?.state, "Stopped");
   assert.equal(continued.objectives.find((objective) => objective.id !== first.objective.id)?.state, "Active");
   assert.equal(shared.launches.length, 1);
 });
 
-test("/stop lets an active Task finish, then obsoletes its unowned WorkItem", async (t) => {
+test("/stop lets an active Task finish, then obsoletes its unowned ChangeSet", async (t) => {
   let alive = true;
   const harness = await createHarness(t, {
     inspect: async () => ({ alive, identityMatches: true, reason: null }),
     result: () => null,
   });
-  const workItemId = await startDefaultObjective(harness.main);
+  const changeSetId = await startDefaultObjective(harness.main);
   await harness.main.runPass();
   const initial = await harness.main.statusSnapshot();
   const taskId = initial.tasks[0]?.id;
@@ -2883,7 +3034,7 @@ test("/stop lets an active Task finish, then obsoletes its unowned WorkItem", as
 
   await harness.main.stopObjectives();
   const stopped = await harness.main.statusSnapshot();
-  assert.equal(stopped.workItems.find((item) => item.id === workItemId)?.state, "Implementing");
+  assert.equal(stopped.changeSets.find((item) => item.id === changeSetId)?.state, "Implementing");
   assert.equal(stopped.tasks.find((task) => task.id === taskId)?.status, "active");
   assert.equal(harness.launches.length, 1);
 
@@ -2899,7 +3050,7 @@ test("/stop lets an active Task finish, then obsoletes its unowned WorkItem", as
   await harness.main.runPass();
   const finished = await harness.main.statusSnapshot();
   assert.equal(finished.tasks.find((task) => task.id === taskId)?.outcome, "success");
-  assert.equal(finished.workItems.find((item) => item.id === workItemId)?.state, "Obsolete");
+  assert.equal(finished.changeSets.find((item) => item.id === changeSetId)?.state, "Obsolete");
   assert.equal(harness.launches.length, 1);
 });
 
@@ -2909,7 +3060,7 @@ test("new Main consumes a healthy worker result after a crash without restarting
     inspect: async () => ({ alive, identityMatches: true, reason: null }),
     result: () => null,
   });
-  const workItemId = await startDefaultObjective(harness.main);
+  const changeSetId = await startDefaultObjective(harness.main);
   await harness.main.runPass();
   assert.equal(harness.launches.length, 1);
 
@@ -2921,13 +3072,13 @@ test("new Main consumes a healthy worker result after a crash without restarting
     status: "success",
     summary: "Recovered implementation result.",
     commit,
-    verification: [{ kind: "manual", project: "example", summary: "Checked after Main restart." }],
+    verification: [{ kind: "command", project: "example", cwd: ".", command: "scripts/run-ci.sh", exit_code: 0 }],
   }));
   alive = false;
 
   const recoveredMain = new MainOrchestrator({
     workspacePath: harness.workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: "none", work_root: join(harness.workspacePath, "workers") },
+    config: { ...DEFAULT_CONFIG, sandbox: "none" },
     notify: () => {},
     git: {
       async discoverProject(path, slug) {
@@ -2935,7 +3086,8 @@ test("new Main consumes a healthy worker result after a crash without restarting
         if (!project) throw new Error(`unknown project ${slug}`);
         return { ...project, path };
       },
-      async createWorkItemClone(_project, path, branchName) { return { path, branchName, baseCommit: "base-sha" }; },
+      async createChangeSetClone(_project, path, branchName) { return { path, branchName, baseCommit: "base-sha" }; },
+      async fullDiff() { return "diff --git a/recovered b/recovered\n+recovered change\n"; },
       async currentCommit() { return "base-sha"; },
       async validateTaskCommit(_path, expected, reported) {
         assert.equal(expected, "base-sha");
@@ -3004,12 +3156,12 @@ test("new Main consumes a healthy worker result after a crash without restarting
   await recoveredMain.runPass();
   const state = await recoveredMain.statusSnapshot();
   assert.equal(state.tasks.find((task) => task.id === firstTaskId)?.outcome, "success");
-  assert.equal(state.workItems.find((item) => item.id === workItemId)?.state, "Reviewing");
+  assert.equal(state.changeSets.find((item) => item.id === changeSetId)?.state, "Reviewing");
   assert.equal(harness.launches.filter((launch) => launch.role === "implement").length, 1);
   assert.equal(harness.launches.filter((launch) => launch.role === "review").length, 1);
 });
 
-test("Requires blocks a cross-Project WorkItem while independent Projects run in parallel", async (t) => {
+test("Requires blocks a cross-Project ChangeSet while independent Projects run in parallel", async (t) => {
   const { main, launches } = await createHarness(t, {
     projects: [
       { slug: "api", issueNumbers: [1] },
@@ -3027,8 +3179,8 @@ test("Requires blocks a cross-Project WorkItem while independent Projects run in
       { projectSlug: "tools", numbers: [3] },
     ],
   });
-  const api = started.workItems.find((item) => item.projectSlug === "api");
-  const web = started.workItems.find((item) => item.projectSlug === "web");
+  const api = started.changeSets.find((item) => item.projectSlug === "api");
+  const web = started.changeSets.find((item) => item.projectSlug === "web");
   assert.ok(api && web);
   const relation: Relation = {
     kind: "Requires",
@@ -3041,11 +3193,11 @@ test("Requires blocks a cross-Project WorkItem while independent Projects run in
 
   await main.updateRelations([relation]);
   assert.deepEqual(launches.map((launch) => launch.project.slug).sort(), ["api", "tools"]);
-  assert.ok(!launches.some((launch) => launch.workItemId === web.id));
+  assert.ok(!launches.some((launch) => launch.changeSetId === web.id));
   assert.equal((await main.statusSnapshot()).tasks.filter((task) => task.status === "active").length, 2);
 });
 
-test("Requires cycles block their WorkItems without launching Tasks", async (t) => {
+test("Requires cycles block their ChangeSets without launching Tasks", async (t) => {
   const harness = await createHarness(t, {
     projects: [{ slug: "example", issueNumbers: [1, 2] }],
   });
@@ -3054,7 +3206,7 @@ test("Requires cycles block their WorkItems without launching Tasks", async (t) 
     projectSlugs: ["example"],
     issues: [{ projectSlug: "example", numbers: [1, 2] }],
   });
-  const [first, second] = started.workItems;
+  const [first, second] = started.changeSets;
   assert.ok(first && second);
   await harness.main.updateRelations([
     { kind: "Requires", from: first.id, to: second.id, confidence: "explicit", rationale: "cycle", evidence: "test" },
@@ -3062,12 +3214,12 @@ test("Requires cycles block their WorkItems without launching Tasks", async (t) 
   ]);
 
   const snapshot = await harness.main.statusSnapshot();
-  assert.ok(snapshot.workItems.every((item) => item.state === "Blocked" && item.blockedReason === "cycle"));
+  assert.ok(snapshot.changeSets.every((item) => item.state === "Blocked" && item.blockedReason === "cycle"));
   assert.equal(snapshot.tasks.length, 0);
   assert.equal(harness.launches.length, 0);
 });
 
-test("concurrency cap leaves unselected WorkItems Ready until a slot opens", async (t) => {
+test("concurrency cap leaves unselected ChangeSets Ready until a slot opens", async (t) => {
   const harness = await createHarness(t, {
     projects: [{ slug: "example", issueNumbers: [1, 2, 3] }],
     maxConcurrentTasks: 1,
@@ -3081,8 +3233,8 @@ test("concurrency cap leaves unselected WorkItems Ready until a slot opens", asy
 
   const snapshot = await harness.main.statusSnapshot();
   assert.equal(snapshot.tasks.filter((task) => task.status === "active").length, 1);
-  assert.equal(snapshot.workItems.filter((item) => item.state === "Implementing").length, 1);
-  assert.equal(snapshot.workItems.filter((item) => item.state === "Ready").length, 2);
+  assert.equal(snapshot.changeSets.filter((item) => item.state === "Implementing").length, 1);
+  assert.equal(snapshot.changeSets.filter((item) => item.state === "Ready").length, 2);
 });
 
 test("task failure reports direct dependents without activating them", async (t) => {
@@ -3104,8 +3256,8 @@ test("task failure reports direct dependents without activating them", async (t)
     projectSlugs: ["example"],
     issues: [{ projectSlug: "example", numbers: [7, 8] }],
   });
-  const prerequisite = started.workItems.find((item) => item.sourceRef === "7");
-  const dependent = started.workItems.find((item) => item.sourceRef === "8");
+  const prerequisite = started.changeSets.find((item) => item.issues.some((issue) => issue.number === 7));
+  const dependent = started.changeSets.find((item) => item.issues.some((issue) => issue.number === 8));
   assert.ok(prerequisite && dependent);
   await harness.main.updateRelations([{
     kind: "Requires",
@@ -3118,9 +3270,9 @@ test("task failure reports direct dependents without activating them", async (t)
   await harness.main.runPass();
 
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems.find((item) => item.id === prerequisite.id)?.state, "Blocked");
-  assert.equal(state.workItems.find((item) => item.id === dependent.id)?.state, "Planned");
-  assert.ok(harness.notifications.some((message) => message.includes(`Direct dependents: ${dependent.id} (Planned)`)));
+  assert.equal(state.changeSets.find((item) => item.id === prerequisite.id)?.state, "Blocked");
+  assert.equal(state.changeSets.find((item) => item.id === dependent.id)?.state, "Planned");
+  assert.ok(harness.notifications.some((message) => message.includes(`Direct dependents: ${dependent.slug} (Planned)`)));
 });
 
 test("task failure blocks once, continue creates a fresh Task, and finalized Tasks stay unchanged", async (t) => {
@@ -3140,24 +3292,24 @@ test("task failure blocks once, continue creates a fresh Task, and finalized Tas
       return result;
     },
   });
-  const workItemId = await startDefaultObjective(main);
+  const changeSetId = await startDefaultObjective(main);
   await main.runPass();
   await main.runPass();
   const blocked = await main.statusSnapshot();
-  assert.equal(blocked.workItems[0]?.state, "Blocked");
-  assert.equal(blocked.workItems[0]?.blockedReason, "task_failed");
+  assert.equal(blocked.changeSets[0]?.state, "Blocked");
+  assert.equal(blocked.changeSets[0]?.blockedReason, "task_failed");
   assert.equal(blocked.tasks.length, 1);
   assert.equal(blocked.tasks[0]?.outcome, "failed");
   const originalTask = structuredClone(blocked.tasks[0]);
 
-  await main.continueWorkItem(workItemId);
+  await main.continueChangeSet(changeSetId);
   const resumed = await main.statusSnapshot();
   assert.equal(resumed.tasks.length, 2);
   assert.deepEqual(resumed.tasks[0], originalTask);
   assert.equal(resumed.tasks[1]?.status, "active");
 });
 
-test("Main rejects stale worker results before changing WorkItem state", async (t) => {
+test("Main rejects stale worker results before changing ChangeSet state", async (t) => {
   const { main } = await createHarness(t, {
     result(_input, _launchNumber, result) {
       return { ...result, task_id: "stale-task" };
@@ -3168,8 +3320,8 @@ test("Main rejects stale worker results before changing WorkItem state", async (
   await main.runPass();
 
   const state = await main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "task_failed");
+  assert.equal(state.changeSets[0]?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "task_failed");
   assert.equal(state.tasks[0]?.outcome, "failed");
   assert.equal(state.tasks[0]?.summary, "Task result validation failed");
   assert.equal(state.decisions.length, 0);
@@ -3187,8 +3339,8 @@ test("Main rejects review results for a different commit", async (t) => {
   await main.runPass();
 
   const state = await main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "task_failed");
+  assert.equal(state.changeSets[0]?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "task_failed");
   assert.deepEqual(state.tasks.map((task) => task.outcome), ["success", "failed"]);
   assert.equal(state.decisions.length, 0);
 });
@@ -3197,20 +3349,20 @@ test("infrastructure failure retries once, then blocks without mutating finalize
   const { main } = await createHarness(t, {
     result: () => null,
   });
-  const workItemId = await startDefaultObjective(main);
+  const changeSetId = await startDefaultObjective(main);
   await main.runPass();
   await main.runPass();
 
   let state = await main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Implementing");
+  assert.equal(state.changeSets[0]?.state, "Implementing");
   assert.equal(state.tasks.length, 2);
   assert.deepEqual(state.tasks.map((task) => task.outcome), ["failed", null]);
   const firstTask = structuredClone(state.tasks[0]);
 
   await main.runPass();
   state = await main.statusSnapshot();
-  assert.equal(state.workItems.find((item) => item.id === workItemId)?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "task_failed");
+  assert.equal(state.changeSets.find((item) => item.id === changeSetId)?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "task_failed");
   assert.equal(state.tasks.length, 2);
   assert.deepEqual(state.tasks[0], firstTask);
   assert.deepEqual(state.tasks.map((task) => task.outcome), ["failed", "failed"]);
@@ -3238,22 +3390,22 @@ test("review cap blocks after the configured round and continue grants a fresh r
     issues: [{ projectSlug: "example", numbers: [7] }],
     maxReviewRounds: 1,
   });
-  const workItemId = started.workItems[0]?.id;
-  assert.ok(workItemId);
+  const changeSetId = started.changeSets[0]?.id;
+  assert.ok(changeSetId);
 
   await main.runPass();
   await main.runPass();
   await main.runPass();
   const blocked = await main.statusSnapshot();
-  assert.equal(blocked.workItems[0]?.state, "Blocked");
-  assert.equal(blocked.workItems[0]?.blockedReason, "review_cap");
+  assert.equal(blocked.changeSets[0]?.state, "Blocked");
+  assert.equal(blocked.changeSets[0]?.blockedReason, "review_cap");
   assert.equal(blocked.tasks.map((task) => task.outcome).join(","), "success,reject");
   assert.equal(launches.length, 2);
 
-  await main.continueWorkItem(workItemId);
+  await main.continueChangeSet(changeSetId);
   assert.equal(launches.length, 3);
   assert.equal(launches[2]?.role, "implement");
-  assert.equal((await main.statusSnapshot()).workItems[0]?.state, "Implementing");
+  assert.equal((await main.statusSnapshot()).changeSets[0]?.state, "Implementing");
 });
 
 test("review cap ignores stopped Objective owners and uses the strictest active owner limit", async (t) => {
@@ -3284,13 +3436,13 @@ test("review cap ignores stopped Objective owners and uses the strictest active 
     issues: [{ projectSlug: "example", numbers: [7] }],
     maxReviewRounds: "unlimited",
   });
-  assert.equal(activeOwner.workItems[0]?.id, stoppedOwner.workItems[0]?.id);
+  assert.equal(activeOwner.changeSets[0]?.id, stoppedOwner.changeSets[0]?.id);
   await harness.main.stopObjectives(stoppedOwner.objective.id);
   await harness.main.runPass();
   await harness.main.runPass();
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Implementing");
-  assert.equal(state.workItems[0]?.blockedReason, null);
+  assert.equal(state.changeSets[0]?.state, "Implementing");
+  assert.equal(state.changeSets[0]?.blockedReason, null);
   assert.equal(harness.launches.map((launch) => launch.role).join(","), "implement,review,implement");
 
   const capped = await createHarness(t, {
@@ -3323,7 +3475,7 @@ test("review cap ignores stopped Objective owners and uses the strictest active 
   await capped.main.runPass();
   await capped.main.runPass();
   await capped.main.runPass();
-  assert.equal((await capped.main.statusSnapshot()).workItems[0]?.blockedReason, "review_cap");
+  assert.equal((await capped.main.statusSnapshot()).changeSets[0]?.blockedReason, "review_cap");
 });
 
 test("cross-Project dependency DAG gates work through implement, review, fix, and merge", async (t) => {
@@ -3364,10 +3516,10 @@ test("cross-Project dependency DAG gates work through implement, review, fix, an
       { projectSlug: "tools", numbers: [3] },
     ],
   });
-  const core = started.workItems.find((item) => item.projectSlug === "core");
-  const api = started.workItems.find((item) => item.projectSlug === "api");
-  const web = started.workItems.find((item) => item.projectSlug === "web");
-  const tools = started.workItems.find((item) => item.projectSlug === "tools");
+  const core = started.changeSets.find((item) => item.projectSlug === "core");
+  const api = started.changeSets.find((item) => item.projectSlug === "api");
+  const web = started.changeSets.find((item) => item.projectSlug === "web");
+  const tools = started.changeSets.find((item) => item.projectSlug === "tools");
   assert.ok(core && api && web && tools);
   await main.updateRelations([
     {
@@ -3391,10 +3543,10 @@ test("cross-Project dependency DAG gates work through implement, review, fix, an
   await main.runPass();
   await main.runPass();
   const beforeRootMerge = await main.statusSnapshot();
-  assert.equal(beforeRootMerge.workItems.find((item) => item.id === core.id)?.state, "AwaitingMerge");
-  assert.equal(beforeRootMerge.workItems.find((item) => item.id === tools.id)?.state, "AwaitingMerge");
-  assert.equal(beforeRootMerge.workItems.find((item) => item.id === api.id)?.state, "Planned");
-  assert.equal(beforeRootMerge.workItems.find((item) => item.id === web.id)?.state, "Planned");
+  assert.equal(beforeRootMerge.changeSets.find((item) => item.id === core.id)?.state, "AwaitingMerge");
+  assert.equal(beforeRootMerge.changeSets.find((item) => item.id === tools.id)?.state, "AwaitingMerge");
+  assert.equal(beforeRootMerge.changeSets.find((item) => item.id === api.id)?.state, "Planned");
+  assert.equal(beforeRootMerge.changeSets.find((item) => item.id === web.id)?.state, "Planned");
 
   for (const [number, pullRequest] of pullRequests) {
     setPullRequest(number, {
@@ -3421,11 +3573,11 @@ test("cross-Project dependency DAG gates work through implement, review, fix, an
   await main.runPass();
   await main.runPass();
   const beforeUpstreamMerges = await main.statusSnapshot();
-  assert.equal(beforeUpstreamMerges.workItems.find((item) => item.id === api.id)?.state, "AwaitingMerge");
-  assert.equal(beforeUpstreamMerges.workItems.find((item) => item.id === web.id)?.state, "Planned");
-  assert.equal(beforeUpstreamMerges.tasks.filter((task) => task.workItemId === api.id && task.role === "implement").length, 2);
-  assert.equal(beforeUpstreamMerges.tasks.filter((task) => task.workItemId === api.id && task.role === "review").map((task) => task.outcome).join(","), "reject,pass");
-  const apiCycle = launches.filter((launch) => launch.workItemId === api.id);
+  assert.equal(beforeUpstreamMerges.changeSets.find((item) => item.id === api.id)?.state, "AwaitingMerge");
+  assert.equal(beforeUpstreamMerges.changeSets.find((item) => item.id === web.id)?.state, "Planned");
+  assert.equal(beforeUpstreamMerges.tasks.filter((task) => task.changeSetId === api.id && task.role === "implement").length, 2);
+  assert.equal(beforeUpstreamMerges.tasks.filter((task) => task.changeSetId === api.id && task.role === "review").map((task) => task.outcome).join(","), "reject,pass");
+  const apiCycle = launches.filter((launch) => launch.changeSetId === api.id);
   assert.deepEqual(apiCycle.map((launch) => launch.role), ["implement", "review", "implement", "review"]);
   assert.notEqual(apiCycle[1]?.expectedCommit, apiCycle[3]?.expectedCommit);
 
@@ -3444,7 +3596,7 @@ test("cross-Project dependency DAG gates work through implement, review, fix, an
   assert.ok(apiApproval && toolsApproval);
   await main.resolveMergeDecision(apiApproval.id, true);
   assert.ok(!launches.some((launch) => launch.project.slug === "web"));
-  assert.equal((await main.statusSnapshot()).workItems.find((item) => item.id === web.id)?.state, "Planned");
+  assert.equal((await main.statusSnapshot()).changeSets.find((item) => item.id === web.id)?.state, "Planned");
   await main.resolveMergeDecision(toolsApproval.id, true);
   assert.equal(launches.at(-1)?.project.slug, "web");
   await main.runPass();
@@ -3472,7 +3624,7 @@ test("cross-Project dependency DAG gates work through implement, review, fix, an
   assert.ok(webApproval);
   await main.resolveMergeDecision(webApproval.id, true);
   const completed = await main.statusSnapshot();
-  assert.ok(completed.workItems.every((item) => item.state === "Done"));
+  assert.ok(completed.changeSets.every((item) => item.state === "Done"));
   assert.equal(completed.objectives[0]?.state, "Done");
   assert.equal(completed.tasks.filter((task) => task.status === "finalized").length, 10);
 });
@@ -3492,7 +3644,7 @@ test("deleted local clone is restored from the reviewed remote head", async (t) 
     branchName: pullRequest.headRefName,
     headCommit: pullRequest.headRefOid,
   }]);
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(state.tasks.filter((task) => task.role === "review").length, 1);
   assert.equal(state.decisions.length, 1);
 });
@@ -3505,8 +3657,8 @@ test("deleted remote branch blocks merge reconciliation without repushing", asyn
   await main.runPass();
 
   const state = await main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Blocked");
-  assert.equal(state.workItems[0]?.blockedReason, "remote_branch_deleted");
+  assert.equal(state.changeSets[0]?.state, "Blocked");
+  assert.equal(state.changeSets[0]?.blockedReason, "remote_branch_deleted");
   assert.equal(state.decisions.length, 0);
   assert.equal(launches.length, 2);
 });
@@ -3528,14 +3680,14 @@ test("external PR head rewrites invalidate merge approval and trigger a fresh re
   await harness.main.runPass();
 
   let state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Reviewing");
+  assert.equal(state.changeSets[0]?.state, "Reviewing");
   assert.equal(state.decisions.length, 0);
   assert.equal(harness.launches.at(-1)?.role, "review");
   assert.deepEqual(harness.synchronizedHeads, [rewrittenHead]);
 
   await harness.main.runPass();
   state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
   assert.equal(state.tasks.filter((task) => task.role === "review").at(-1)?.reviewedCommit, rewrittenHead);
   assert.equal(state.decisions.length, 1);
 });
@@ -3557,7 +3709,7 @@ test("merge approval cannot merge a PR head that changed after the Decision", as
   await harness.main.resolveMergeDecision(decision.id, true);
 
   const state = await harness.main.statusSnapshot();
-  assert.equal(state.workItems[0]?.state, "Reviewing");
+  assert.equal(state.changeSets[0]?.state, "Reviewing");
   assert.equal(state.decisions.length, 0);
   assert.equal(state.tasks.filter((task) => task.role === "review").length, 2);
   assert.equal(harness.launches.at(-1)?.role, "review");
@@ -3573,44 +3725,44 @@ test("reconciliation adopts a PR created before Main lost the GitHub response", 
 
   const state = await main.statusSnapshot();
   assert.equal(pullRequests.size, 1);
-  assert.equal(state.workItems[0]?.state, "AwaitingMerge");
-  assert.equal(state.workItems[0]?.blockedReason, null);
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
+  assert.equal(state.changeSets[0]?.blockedReason, null);
   assert.equal(state.decisions.length, 1);
 });
 
 test("an externally reopened pull request stays blocked until explicit continuation", async (t) => {
   const harness = await createHarness(t);
-  const workItemId = await startDefaultObjective(harness.main);
+  const changeSetId = await startDefaultObjective(harness.main);
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
   await harness.main.runPass();
 
   const beforeClose = await harness.main.statusSnapshot();
-  const decision = beforeClose.decisions.find((candidate) => candidate.subjectId === workItemId);
+  const decision = beforeClose.decisions.find((candidate) => candidate.subjectId === changeSetId);
   const [pullRequestNumber, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
   assert.ok(decision && pullRequestNumber && pullRequest);
   harness.setPullRequest(pullRequestNumber, { state: "CLOSED" });
   await harness.main.runPass();
   const closed = await harness.main.statusSnapshot();
-  assert.equal(closed.workItems.find((item) => item.id === workItemId)?.blockedReason, "pr_closed");
+  assert.equal(closed.changeSets.find((item) => item.id === changeSetId)?.blockedReason, "pr_closed");
   assert.equal(closed.decisions.length, 0);
 
   harness.setPullRequest(pullRequestNumber, { state: "OPEN" });
   await harness.main.runPass();
   const reopened = await harness.main.statusSnapshot();
-  assert.equal(reopened.workItems.find((item) => item.id === workItemId)?.state, "Blocked");
-  assert.equal(reopened.workItems.find((item) => item.id === workItemId)?.blockedReason, "pr_closed");
+  assert.equal(reopened.changeSets.find((item) => item.id === changeSetId)?.state, "Blocked");
+  assert.equal(reopened.changeSets.find((item) => item.id === changeSetId)?.blockedReason, "pr_closed");
   assert.equal(reopened.decisions.length, 0);
 
-  await harness.main.continueWorkItem(workItemId);
+  await harness.main.continueChangeSet(changeSetId);
   const continued = await harness.main.statusSnapshot();
-  assert.equal(continued.workItems.find((item) => item.id === workItemId)?.state, "AwaitingMerge");
+  assert.equal(continued.changeSets.find((item) => item.id === changeSetId)?.state, "AwaitingMerge");
   assert.equal(continued.decisions.length, 1);
   assert.notEqual(continued.decisions[0]?.id, decision.id);
 });
 
-test("a policy_unknown WorkItem automatically resumes when policy visibility returns", async (t) => {
+test("a policy_unknown ChangeSet automatically resumes when policy visibility returns", async (t) => {
   const harness = await createHarness(t, { branchPolicyAvailable: false });
   await startDefaultObjective(harness.main);
   await harness.main.runPass();
@@ -3618,19 +3770,19 @@ test("a policy_unknown WorkItem automatically resumes when policy visibility ret
   await harness.main.runPass();
 
   const blocked = await harness.main.statusSnapshot();
-  assert.equal(blocked.workItems[0]?.state, "Blocked");
-  assert.equal(blocked.workItems[0]?.blockedReason, "policy_unknown");
+  assert.equal(blocked.changeSets[0]?.state, "Blocked");
+  assert.equal(blocked.changeSets[0]?.blockedReason, "policy_unknown");
   assert.equal(blocked.decisions.length, 0);
 
   harness.setBranchPolicyAvailable(true);
   await harness.main.runPass();
   const resumed = await harness.main.statusSnapshot();
-  assert.equal(resumed.workItems[0]?.state, "AwaitingMerge");
-  assert.equal(resumed.workItems[0]?.blockedReason, null);
+  assert.equal(resumed.changeSets[0]?.state, "AwaitingMerge");
+  assert.equal(resumed.changeSets[0]?.blockedReason, null);
   assert.equal(resumed.decisions.length, 1);
 });
 
-test("an external merge completes the WorkItem and resolves its pending merge Decision", async (t) => {
+test("an external merge completes the ChangeSet and resolves its pending merge Decision", async (t) => {
   const { main, workspacePath, deletedClones, pullRequests, setPullRequest, setIssueState } = await createHarness(t);
   await startDefaultObjective(main);
   await main.runPass();
@@ -3639,7 +3791,7 @@ test("an external merge completes the WorkItem and resolves its pending merge De
   await main.runPass();
   const beforeMerge = await main.statusSnapshot();
   const decision = beforeMerge.decisions[0];
-  const runtime = beforeMerge.workItems[0];
+  const runtime = beforeMerge.changeSets[0];
   assert.ok(decision && runtime);
   const pullRequestNumber = [...pullRequests.keys()][0];
   assert.ok(pullRequestNumber);
@@ -3652,7 +3804,7 @@ test("an external merge completes the WorkItem and resolves its pending merge De
   setIssueState("example", 7, "CLOSED");
   await main.runPass();
   const completed = await main.statusSnapshot();
-  assert.equal(completed.workItems[0]?.state, "Done");
+  assert.equal(completed.changeSets[0]?.state, "Done");
   assert.equal(completed.objectives[0]?.state, "Done");
   assert.equal(completed.decisions.length, 0);
   assert.equal(completed.tasks.filter((task) => task.status === "finalized").length, 2);

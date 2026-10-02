@@ -1,26 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { dockerBindMount } from "../src/runtime/docker-mount.js";
-import { workItemPathName } from "../src/runtime/filesystem-identity.js";
+import { changeSetPathName } from "../src/runtime/filesystem-identity.js";
 
-test("WorkItem path names are deterministic, bounded, readable and collision-resistant", () => {
-  const id = "merro-acceptance:issue-1:g1";
-  assert.match(workItemPathName(id), /^merro-acceptance-issue-1-g1-[0-9a-f]{16}$/);
-  for (const value of [id, "project:issue-1:g1", "project/issue-1/g1", "project\\issue-1\\g1", "..", ".", "", "你好", "A".repeat(500)]) {
-    const name = workItemPathName(value);
-    assert.equal(name, workItemPathName(value));
+test("ChangeSet path names are deterministic, bounded and semantic", () => {
+  const id = "plugin-lifecycle-safety";
+  assert.equal(changeSetPathName(id), id);
+  for (const value of [id, "project:issue-1:g1", "project/issue-1/g1", "project\\issue-1\\g1", "A".repeat(500)]) {
+    const name = changeSetPathName(value);
+    assert.equal(name, changeSetPathName(value));
     assert.ok(name.length <= 65);
     assert.match(name, /^[a-z0-9-]+$/);
     assert.ok(!/[/:\\]/.test(name));
   }
-  for (const [a, b] of [
-    ["project:issue-1:g1", "project/issue-1/g1"],
-    ["project:issue-1:g1", "PROJECT:ISSUE-1:G1"],
-    [`${"long".repeat(100)}:g1`, `${"long".repeat(100)}:g2`],
-  ] as const) {
-    assert.equal(workItemPathName(a).slice(0, -17), workItemPathName(b).slice(0, -17));
-    assert.notEqual(workItemPathName(a), workItemPathName(b));
-  }
+  assert.equal(changeSetPathName("Plugin lifecycle safety"), id);
+  for (const invalid of ["..", ".", "", "你好"]) assert.throws(() => changeSetPathName(invalid), /descriptive/);
 });
 
 test("Docker bind mounts preserve colons, spaces and platform-specific paths as one CLI argument", () => {

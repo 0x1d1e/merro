@@ -6,10 +6,10 @@ import { promisify } from "node:util";
 import { Type } from "typebox";
 import { parseImplementResult, parseReviewResult } from "../protocol/result.js";
 import type { TaskRole } from "../domain/model.js";
+import { publishWorkerState } from "../protocol/worker-state.js";
 
 const verificationSchema = Type.Array(Type.Any());
 const parameters = Type.Object({
-  task_id: Type.String(),
   status: Type.Union([
     Type.Literal("success"), Type.Literal("failed"),
     Type.Literal("pass"), Type.Literal("reject"), Type.Literal("cancelled"),
@@ -74,10 +74,8 @@ export function registerWorkerResultTool(pi: WorkerResultToolAPI, options: Worke
     async execute(_toolCallId, args) {
       const taskId = typeof process.env.MERRO_TASK_ID === "string" ? process.env.MERRO_TASK_ID : "";
       if (!taskId) throw new Error("MERRO_TASK_ID is missing");
-      const result = options.role === "implement" ? parseImplementResult(args) : parseReviewResult(args);
-      if (result.task_id !== taskId) {
-        throw new Error(`task_id mismatch: worker Task is ${taskId}, submitted result is for ${result.task_id}`);
-      }
+      const artifact = { ...args, task_id: taskId };
+      const result = options.role === "implement" ? parseImplementResult(artifact) : parseReviewResult(artifact);
       // Failed implementers may report an unusable checkout; preserve that failure contract.
       if ("reviewed_commit" in result || result.status === "success") {
         await validateLocalCommit("reviewed_commit" in result ? result.reviewed_commit : result.commit,
@@ -91,9 +89,10 @@ export function registerWorkerResultTool(pi: WorkerResultToolAPI, options: Worke
       } finally {
         await rm(temporaryPath, { force: true });
       }
+      await publishWorkerState(join(dirname(options.resultPath), "worker-state.json"), "finished", "Result submitted");
       return {
-        content: [{ type: "text", text: `Result submitted for Task ${result.task_id}. Stop now.` }],
-        details: { taskId: result.task_id, role: options.role },
+        content: [{ type: "text", text: "Result submitted. Finished." }],
+        details: { role: options.role, status: result.status },
         terminate: true,
       };
     },
@@ -105,14 +104,14 @@ export default function merroWorker(pi: WorkerResultToolAPI): void {
   const resultPath = process.env.MERRO_RESULT_PATH;
   if (role !== "implement" && role !== "review") throw new Error("MERRO_TASK_ROLE must be implement or review");
   if (process.env.MERRO_RUNTIME !== "worker") throw new Error("MERRO_RUNTIME must be worker");
-  const configPath = process.env.PI_CODING_AGENT_DIR;
+  const scratchPath = process.env.MERRO_TASK_SCRATCH ?? "";
   const checkoutRelative = resultPath ? relative(process.cwd(), resolve(resultPath)) : "";
   const outsideCheckout = checkoutRelative === ".." || checkoutRelative.startsWith(`..${sep}`) || isAbsolute(checkoutRelative);
-  if (!resultPath || !isAbsolute(resultPath) || !configPath || !isAbsolute(configPath)
-    || basename(resolve(configPath)) !== "pi-config"
-    || resolve(resultPath) !== join(dirname(resolve(configPath)), ".merro-result.json")
+  if (!resultPath || !isAbsolute(resultPath) || !scratchPath || !isAbsolute(scratchPath)
+    || basename(resolve(resultPath)) !== ".merro-result.json"
+    || resolve(resultPath) !== join(resolve(scratchPath), ".merro-result.json")
     || !outsideCheckout) {
-    throw new Error("MERRO_RESULT_PATH must be the Task scratch result beside pi-config, outside the checkout");
+    throw new Error("MERRO_RESULT_PATH must be the Task scratch result outside the checkout");
   }
   registerWorkerResultTool(pi, { role, resultPath, checkoutPath: process.cwd() });
 }

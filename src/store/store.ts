@@ -4,7 +4,7 @@ import {
   type BaseUpdate,
   type BlockReason,
   type Decision,
-  type FlowWorkItemState,
+  type FlowChangeSetState,
   type Objective,
   type ObjectiveIssueScope,
   type Priority,
@@ -14,13 +14,14 @@ import {
   type Task,
   type TaskOutcome,
   type TaskRole,
-  type WorkItem,
-  type WorkItemState,
+  type ChangeSet,
+  type ChangeSetState,
 } from "../domain/model.js";
 import { parseObjectiveIssueScopes } from "../domain/objective.js";
+import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
-import { assertWorkItemTransition } from "../domain/work-item.js";
-import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, WorkItemRuntimeRecord } from "./model.js";
+import { assertChangeSetTransition } from "../domain/change-set.js";
+import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
 import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, SCHEMA_VERSION } from "./schema.js";
 
 function now(): string {
@@ -45,18 +46,19 @@ function reviewRoundLimit(value: unknown): ReviewRoundLimit | null {
   return limit;
 }
 
-function workItemFromRow(row: Record<string, unknown>): WorkItem {
+function changeSetFromRow(row: Record<string, unknown>): ChangeSet {
   return {
     id: String(row.id),
     projectSlug: String(row.project_slug),
-    sourceType: row.source_type === "issue" ? "issue" : "local",
-    sourceRef: String(row.source_ref),
+    // Old source columns remain a persisted-state detail, not a domain identity.
+    slug: row.slug ? String(row.slug) : row.source_type === "issue" ? `issues-${String(row.source_ref).replace(/,/g, "-")}` : semanticSlug(String(row.source_ref)),
+    issues: row.source_type === "issue" ? String(row.source_ref).split(",").map((number) => ({ projectSlug: String(row.project_slug), number: Number(number) })) : [],
     generation: Number(row.generation),
-    state: row.state as WorkItemState,
-    priority: row.priority as WorkItem["priority"],
+    state: row.state as ChangeSetState,
+    priority: row.priority as ChangeSet["priority"],
     readySince: row.ready_since === null ? null : String(row.ready_since),
     blockedReason: row.blocked_reason === null ? null : row.blocked_reason as BlockReason,
-    blockedResumeState: row.blocked_resume_state === null ? null : row.blocked_resume_state as FlowWorkItemState,
+    blockedResumeState: row.blocked_resume_state === null ? null : row.blocked_resume_state as FlowChangeSetState,
     guidance: typeof row.guidance === "string" ? row.guidance : "",
   };
 }
@@ -64,7 +66,7 @@ function workItemFromRow(row: Record<string, unknown>): WorkItem {
 function taskFromRow(row: Record<string, unknown>): Task {
   return {
     id: String(row.id),
-    workItemId: String(row.work_item_id),
+    changeSetId: String(row.work_item_id),
     role: row.role as TaskRole,
     attempt: Number(row.attempt),
     status: row.status as Task["status"],
@@ -304,6 +306,35 @@ export class MerroStore {
         throw error;
       }
     }
+    if (version < 14) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec("ALTER TABLE work_items ADD COLUMN slug TEXT; ALTER TABLE task_runtime ADD COLUMN window_id TEXT");
+        const used = new Set<string>();
+        for (const row of this.#db.prepare("SELECT * FROM work_items ORDER BY created_at, id").all()) {
+          const name = changeName(changeSetFromRow(row));
+          let slug = name;
+          for (let suffix = 2; used.has(slug); suffix++) slug = `${name.slice(0, 63 - String(suffix).length)}-${suffix}`;
+          used.add(slug);
+          this.#db.prepare("UPDATE work_items SET slug = ? WHERE id = ?").run(slug, String(row.id));
+        }
+        this.#db.exec("CREATE UNIQUE INDEX change_sets_unique_slug ON work_items(slug)");
+        this.#db.exec(`CREATE TRIGGER change_set_slug_immutable BEFORE UPDATE OF slug ON work_items
+          WHEN OLD.slug IS NOT NULL AND NEW.slug IS NOT OLD.slug BEGIN
+          SELECT RAISE(ABORT, 'ChangeSet name is immutable'); END;`);
+        this.#db.exec(`CREATE TRIGGER change_set_sources_exclusive BEFORE INSERT ON work_items
+          WHEN NEW.source_type = 'issue' AND NEW.state NOT IN ('Done', 'Obsolete', 'Cancelled') BEGIN
+          SELECT RAISE(ABORT, 'An issue already belongs to an active ChangeSet') WHERE EXISTS (
+            SELECT 1 FROM work_items w, json_each(CASE WHEN w.source_type = 'issue' THEN '[' || w.source_ref || ']' ELSE '[]' END) existing,
+              json_each('[' || NEW.source_ref || ']') incoming
+            WHERE w.project_slug = NEW.project_slug AND w.source_type = 'issue'
+              AND w.state NOT IN ('Done', 'Obsolete', 'Cancelled') AND existing.value = incoming.value
+          ); END;`);
+        this.#db.prepare("UPDATE schema_meta SET version = 14").run();
+        this.#db.exec("COMMIT");
+        version = 14;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -467,9 +498,9 @@ export class MerroStore {
     }
   }
 
-  #relationRebuild(analyzedIds: readonly string[], relations: readonly Relation[], occupiedWorkItemIds: readonly string[]) {
+  #relationRebuild(analyzedIds: readonly string[], relations: readonly Relation[], occupiedChangeSetIds: readonly string[]) {
     const analyzed = new Set(analyzedIds);
-    const occupied = new Set([...occupiedWorkItemIds,
+    const occupied = new Set([...occupiedChangeSetIds,
       ...this.#db.prepare("SELECT work_item_id FROM tasks WHERE status = 'active'").all().map((row) => String(row.work_item_id))]);
     const deactivateIds: number[] = [];
     const surviving = new Map<string, { relation: Relation; automatic: boolean }>();
@@ -499,10 +530,10 @@ export class MerroStore {
     return this.#relationRebuild(analyzedIds, relations, []).relations;
   }
 
-  rebuildAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[], occupiedWorkItemIds: readonly string[] = []): void {
+  rebuildAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[], occupiedChangeSetIds: readonly string[] = []): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const rebuild = this.#relationRebuild(analyzedIds, relations, occupiedWorkItemIds);
+      const rebuild = this.#relationRebuild(analyzedIds, relations, occupiedChangeSetIds);
       const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE id = ?");
       for (const id of rebuild.deactivateIds) deactivate.run(id);
       const upsert = this.#db.prepare(`
@@ -574,11 +605,11 @@ export class MerroStore {
     this.appendEvent("Decision", id, "resolved", { state, resolvedAt });
   }
 
-  getWorkItemRuntime(workItemId: string): WorkItemRuntimeRecord | null {
-    const row = this.#db.prepare("SELECT * FROM work_item_runtime WHERE work_item_id = ?").get(workItemId);
+  getChangeSetRuntime(changeSetId: string): ChangeSetRuntimeRecord | null {
+    const row = this.#db.prepare("SELECT * FROM work_item_runtime WHERE work_item_id = ?").get(changeSetId);
     if (!row) return null;
     return {
-      workItemId,
+      changeSetId,
       branchName: row.branch_name === null ? null : String(row.branch_name),
       clonePath: row.clone_path === null ? null : String(row.clone_path),
       baseCommit: row.base_commit === null ? null : String(row.base_commit),
@@ -599,7 +630,7 @@ export class MerroStore {
     };
   }
 
-  saveWorkItemRuntime(record: WorkItemRuntimeRecord): void {
+  saveChangeSetRuntime(record: ChangeSetRuntimeRecord): void {
     this.#db.prepare(`
       INSERT INTO work_item_runtime(
         work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
@@ -617,7 +648,7 @@ export class MerroStore {
         implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at,
         last_rework_trigger = excluded.last_rework_trigger, base_update_json = excluded.base_update_json
     `).run(
-      record.workItemId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
+      record.changeSetId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
       record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
       record.mergedCommitSha, record.lastIssueState, record.reviewedDiffHash, record.reviewRound,
       record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt, record.lastReworkTrigger,
@@ -625,15 +656,15 @@ export class MerroStore {
     );
   }
 
-  markPullRequestRework(runtime: WorkItemRuntimeRecord): void {
+  markPullRequestRework(runtime: ChangeSetRuntimeRecord): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const item = this.getWorkItem(runtime.workItemId);
+      const item = this.getChangeSet(runtime.changeSetId);
       if (!item || item.state !== "AwaitingMerge") {
-        throw new Error(`WorkItem ${runtime.workItemId} is not AwaitingMerge`);
+        throw new Error(`ChangeSet ${runtime.changeSetId} is not AwaitingMerge`);
       }
-      this.saveWorkItemRuntime(runtime);
-      this.transitionWorkItem(item.id, "Implementing");
+      this.saveChangeSetRuntime(runtime);
+      this.transitionChangeSet(item.id, "Implementing");
       this.#db.exec("COMMIT");
     } catch (error) {
       this.#db.exec("ROLLBACK");
@@ -650,6 +681,7 @@ export class MerroStore {
       tmuxSession: String(row.tmux_session),
       tmuxWindow: String(row.tmux_window),
       paneId: row.pane_id === null ? null : String(row.pane_id),
+      windowId: row.window_id === null ? null : String(row.window_id),
       containerId: row.container_id === null ? null : String(row.container_id),
       processPid: row.process_pid === null ? null : Number(row.process_pid),
       processStartedAt: row.process_started_at === null ? null : String(row.process_started_at),
@@ -665,16 +697,16 @@ export class MerroStore {
 
   saveTaskRuntime(record: TaskRuntimeRecord): void {
     this.#db.prepare(`
-      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, pane_id, container_id, process_pid, process_started_at, clone_path, task_file_path, result_path, expected_commit, started_at, runtime_kind, base_update_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, pane_id, container_id, process_pid, process_started_at, clone_path, task_file_path, result_path, expected_commit, started_at, runtime_kind, base_update_json, window_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         tmux_session = excluded.tmux_session, tmux_window = excluded.tmux_window, pane_id = excluded.pane_id,
         container_id = excluded.container_id, process_pid = excluded.process_pid, process_started_at = excluded.process_started_at,
         clone_path = excluded.clone_path, task_file_path = excluded.task_file_path,
         result_path = excluded.result_path, expected_commit = excluded.expected_commit, started_at = excluded.started_at,
-        runtime_kind = excluded.runtime_kind, base_update_json = excluded.base_update_json
+        runtime_kind = excluded.runtime_kind, base_update_json = excluded.base_update_json, window_id = excluded.window_id
     `).run(record.taskId, record.tmuxSession, record.tmuxWindow, record.paneId, record.containerId,
-      record.processPid, record.processStartedAt, record.clonePath, record.taskFilePath, record.resultPath, record.expectedCommit, record.startedAt, record.runtimeKind, record.baseUpdate ? JSON.stringify(record.baseUpdate) : null);
+      record.processPid, record.processStartedAt, record.clonePath, record.taskFilePath, record.resultPath, record.expectedCommit, record.startedAt, record.runtimeKind, record.baseUpdate ? JSON.stringify(record.baseUpdate) : null, record.windowId ?? null);
   }
 
   #objectiveFromRow(row: Record<string, unknown>): Objective {
@@ -693,14 +725,17 @@ export class MerroStore {
     };
   }
 
-  createWorkItem(item: WorkItem): void {
+  createChangeSet(item: ChangeSet): void {
+    semanticSlug(item.slug);
+    if (item.issues.some((issue) => issue.projectSlug !== item.projectSlug || !Number.isSafeInteger(issue.number) || issue.number < 1)
+      || new Set(issueNumbers(item)).size !== item.issues.length) throw new Error("ChangeSet sources must be distinct positive issue numbers in its Project.");
     const hasBlockedMetadata = item.blockedReason !== null || item.blockedResumeState !== null;
     if (item.state === "Blocked") {
       if (item.blockedReason === null || item.blockedResumeState === null) {
-        throw new Error("Blocked WorkItem requires BlockReason and resume state");
+        throw new Error("Blocked ChangeSet requires BlockReason and resume state");
       }
     } else if (hasBlockedMetadata) {
-      throw new Error("non-Blocked WorkItem cannot carry Blocked metadata");
+      throw new Error("non-Blocked ChangeSet cannot carry Blocked metadata");
     }
 
     const timestamp = now();
@@ -709,16 +744,17 @@ export class MerroStore {
       this.#db.prepare(`
         INSERT INTO work_items(
           id, project_slug, source_type, source_ref, generation, state, priority,
-          ready_since, blocked_reason, blocked_resume_state, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ready_since, blocked_reason, blocked_resume_state, created_at, updated_at, slug
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        item.id, item.projectSlug, item.sourceType, item.sourceRef, item.generation, item.state,
+        item.id, item.projectSlug, item.issues.length ? "issue" : "local", item.issues.length ? issueNumbers(item).sort((a, b) => a - b).join(",") : item.slug, item.generation, item.state,
         item.priority, item.readySince, item.blockedReason, item.blockedResumeState, timestamp, timestamp,
+        this.availableChangeName(changeName(item)),
       );
       this.#db.prepare("INSERT INTO work_item_settings(work_item_id, guidance) VALUES (?, ?)")
         .run(item.id, item.guidance ?? "");
       this.#db.prepare("INSERT INTO work_item_runtime(work_item_id) VALUES (?)").run(item.id);
-      this.appendEvent("WorkItem", item.id, "created", item);
+      this.appendEvent("ChangeSet", item.id, "created", item);
       this.#db.exec("COMMIT");
     } catch (error) {
       this.#db.exec("ROLLBACK");
@@ -726,34 +762,43 @@ export class MerroStore {
     }
   }
 
-  findNonTerminalWorkItem(projectSlug: string, sourceType: WorkItem["sourceType"], sourceRef: string): WorkItem | null {
+  availableChangeName(name: string, reserved: ReadonlySet<string> = new Set()): string {
+    const base = semanticSlug(name);
+    let slug = base;
+    for (let suffix = 2; reserved.has(slug) || this.#db.prepare("SELECT 1 FROM work_items WHERE slug = ?").get(slug); suffix++) {
+      slug = `${base.slice(0, 63 - String(suffix).length)}-${suffix}`;
+    }
+    return slug;
+  }
+
+  findNonTerminalChangeSet(projectSlug: string, numbers: readonly number[]): ChangeSet | null {
     const row = this.#db.prepare(`
       SELECT w.*, s.guidance FROM work_items w
       LEFT JOIN work_item_settings s ON s.work_item_id = w.id
       WHERE w.project_slug = ? AND w.source_type = ? AND w.source_ref = ?
         AND w.state NOT IN ('Done', 'Obsolete', 'Cancelled')
       ORDER BY w.generation DESC LIMIT 1
-    `).get(projectSlug, sourceType, sourceRef);
-    return row ? workItemFromRow(row) : null;
+    `).get(projectSlug, "issue", [...numbers].sort((a, b) => a - b).join(","));
+    return row ? changeSetFromRow(row) : null;
   }
 
-  setWorkItemPriority(id: string, priority: WorkItem["priority"]): void {
-    const item = this.getWorkItem(id);
-    if (!item) throw new Error(`unknown WorkItem: ${id}`);
+  setChangeSetPriority(id: string, priority: ChangeSet["priority"]): void {
+    const item = this.getChangeSet(id);
+    if (!item) throw new Error(`unknown ChangeSet: ${id}`);
     if (item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled") return;
     this.#db.prepare("UPDATE work_items SET priority = ?, updated_at = ? WHERE id = ?").run(priority, now(), id);
-    this.appendEvent("WorkItem", id, "priority_changed", { from: item.priority, to: priority });
+    this.appendEvent("ChangeSet", id, "priority_changed", { from: item.priority, to: priority });
   }
 
-  nextGeneration(projectSlug: string, sourceType: WorkItem["sourceType"], sourceRef: string): number {
+  nextGeneration(projectSlug: string, numbers: readonly number[]): number {
     const row = this.#db.prepare(`
       SELECT COALESCE(MAX(generation), 0) AS generation FROM work_items
       WHERE project_slug = ? AND source_type = ? AND source_ref = ?
-    `).get(projectSlug, sourceType, sourceRef);
+    `).get(projectSlug, "issue", [...numbers].sort((a, b) => a - b).join(","));
     return Number(row?.generation ?? 0) + 1;
   }
 
-  listWorkItems(objectiveId?: string, inScopeOnly = false): WorkItem[] {
+  listChangeSets(objectiveId?: string, inScopeOnly = false): ChangeSet[] {
     const rows = objectiveId === undefined
       ? this.#db.prepare(`
           SELECT w.*, s.guidance FROM work_items w
@@ -766,43 +811,43 @@ export class MerroStore {
           JOIN objective_work_items ow ON ow.work_item_id = w.id
           WHERE ow.objective_id = ? ${inScopeOnly ? "AND ow.in_scope = 1" : ""} ORDER BY w.created_at, w.id
         `).all(objectiveId);
-    return rows.map(workItemFromRow);
+    return rows.map(changeSetFromRow);
   }
 
-  saveWorkItemGuidance(id: string, guidance: string): void {
+  saveChangeSetGuidance(id: string, guidance: string): void {
     this.#db.prepare(`
       INSERT INTO work_item_settings(work_item_id, guidance) VALUES (?, ?)
       ON CONFLICT(work_item_id) DO UPDATE SET guidance = excluded.guidance
     `).run(id, guidance);
-    this.appendEvent("WorkItem", id, "guidance_changed", { guidance });
+    this.appendEvent("ChangeSet", id, "guidance_changed", { guidance });
   }
 
-  attachWorkItem(objectiveId: string, workItemId: string): void {
+  attachChangeSet(objectiveId: string, changeSetId: string): void {
     const result = this.#db.prepare(`
       INSERT INTO objective_work_items(objective_id, work_item_id)
       VALUES (?, ?)
       ON CONFLICT(objective_id, work_item_id) DO UPDATE SET in_scope = 1 WHERE in_scope = 0
-    `).run(objectiveId, workItemId);
+    `).run(objectiveId, changeSetId);
     if (Number(result.changes) > 0) {
-      this.appendEvent("WorkItem", workItemId, "attached_to_objective", { objectiveId });
+      this.appendEvent("ChangeSet", changeSetId, "attached_to_objective", { objectiveId });
     }
   }
 
-  detachWorkItem(objectiveId: string, workItemId: string): void {
+  detachChangeSet(objectiveId: string, changeSetId: string): void {
     // Retain the attachment until the current Task finishes, but stop counting it as ownership immediately.
-    const result = this.activeTask(workItemId)
-      ? this.#db.prepare("UPDATE objective_work_items SET in_scope = 0 WHERE objective_id = ? AND work_item_id = ? AND in_scope = 1").run(objectiveId, workItemId)
-      : this.#db.prepare("DELETE FROM objective_work_items WHERE objective_id = ? AND work_item_id = ?").run(objectiveId, workItemId);
+    const result = this.activeTask(changeSetId)
+      ? this.#db.prepare("UPDATE objective_work_items SET in_scope = 0 WHERE objective_id = ? AND work_item_id = ? AND in_scope = 1").run(objectiveId, changeSetId)
+      : this.#db.prepare("DELETE FROM objective_work_items WHERE objective_id = ? AND work_item_id = ?").run(objectiveId, changeSetId);
     if (Number(result.changes) === 0) return;
-    this.appendEvent("WorkItem", workItemId, "detached_from_objective", { objectiveId, deferred: this.activeTask(workItemId) !== null });
-    const item = this.getWorkItem(workItemId);
+    this.appendEvent("ChangeSet", changeSetId, "detached_from_objective", { objectiveId, deferred: this.activeTask(changeSetId) !== null });
+    const item = this.getChangeSet(changeSetId);
     if (!item || item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled") return;
     const priorities = this.#db.prepare(`
       SELECT o.priority FROM objectives o JOIN objective_work_items ow ON ow.objective_id = o.id
       WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1
-    `).all(workItemId).map((row) => row.priority as Priority);
+    `).all(changeSetId).map((row) => row.priority as Priority);
     const highest = priorities.sort((left, right) => priorityRank(left) - priorityRank(right))[0];
-    if (highest && highest !== item.priority) this.setWorkItemPriority(workItemId, highest);
+    if (highest && highest !== item.priority) this.setChangeSetPriority(changeSetId, highest);
   }
 
   settleScopeDetachments(): void {
@@ -811,61 +856,61 @@ export class MerroStore {
     )`).run();
   }
 
-  hasActiveObjectiveForWorkItem(workItemId: string): boolean {
+  hasActiveObjectiveForChangeSet(changeSetId: string): boolean {
     return this.#db.prepare(`
       SELECT 1 FROM objective_work_items ow JOIN objectives o ON o.id = ow.objective_id
       WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1 LIMIT 1
-    `).get(workItemId) !== undefined;
+    `).get(changeSetId) !== undefined;
   }
 
-  getWorkItem(id: string): WorkItem | null {
+  getChangeSet(id: string): ChangeSet | null {
     const row = this.#db.prepare(`
       SELECT w.*, s.guidance FROM work_items w
       LEFT JOIN work_item_settings s ON s.work_item_id = w.id
       WHERE w.id = ?
     `).get(id);
-    return row ? workItemFromRow(row) : null;
+    return row ? changeSetFromRow(row) : null;
   }
 
-  getFinalSummary(workItemId: string): FinalSummaryRecord | null {
-    const row = this.#db.prepare("SELECT * FROM final_summaries WHERE work_item_id = ?").get(workItemId);
+  getFinalSummary(changeSetId: string): FinalSummaryRecord | null {
+    const row = this.#db.prepare("SELECT * FROM final_summaries WHERE work_item_id = ?").get(changeSetId);
     if (!row) return null;
     let payload: unknown;
     try {
       payload = JSON.parse(String(row.payload_json));
     } catch (error) {
-      throw new Error(`invalid final summary for WorkItem ${workItemId}`, { cause: error });
+      throw new Error(`invalid final summary for ChangeSet ${changeSetId}`, { cause: error });
     }
-    return { workItemId, payload, createdAt: String(row.created_at) };
+    return { changeSetId, payload, createdAt: String(row.created_at) };
   }
 
   listFinalSummaries(): FinalSummaryRecord[] {
     return this.#db.prepare("SELECT * FROM final_summaries ORDER BY created_at, work_item_id").all()
       .map((row) => {
-        const workItemId = String(row.work_item_id);
-        const summary = this.getFinalSummary(workItemId);
-        if (!summary) throw new Error(`missing final summary for WorkItem ${workItemId}`);
+        const changeSetId = String(row.work_item_id);
+        const summary = this.getFinalSummary(changeSetId);
+        if (!summary) throw new Error(`missing final summary for ChangeSet ${changeSetId}`);
         return summary;
       });
   }
 
-  completeWorkItemAfterMerge(id: string, payload: unknown): boolean {
+  completeChangeSetAfterMerge(id: string, payload: unknown): boolean {
     const serialized = JSON.stringify(payload);
     if (serialized === undefined) throw new Error("final summary must be JSON serializable");
     this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const item = this.getWorkItem(id);
-      if (!item) throw new Error(`unknown WorkItem: ${id}`);
+      const item = this.getChangeSet(id);
+      if (!item) throw new Error(`unknown ChangeSet: ${id}`);
       const existing = this.getFinalSummary(id);
       if (existing) {
-        if (item.state !== "Done") throw new Error(`WorkItem ${id} has a final summary but is not Done`);
+        if (item.state !== "Done") throw new Error(`ChangeSet ${id} has a final summary but is not Done`);
         this.#db.exec("COMMIT");
         return false;
       }
       if (item.state !== "AwaitingMerge" && item.state !== "Blocked" && item.state !== "Done") {
-        throw new Error(`WorkItem ${id} is not awaiting a pull request merge`);
+        throw new Error(`ChangeSet ${id} is not awaiting a pull request merge`);
       }
-      if (this.activeTask(id)) throw new Error(`WorkItem ${id} still has an active Task`);
+      if (this.activeTask(id)) throw new Error(`ChangeSet ${id} still has an active Task`);
       const createdAt = now();
       this.#db.prepare("INSERT INTO final_summaries(work_item_id, payload_json, created_at) VALUES (?, ?, ?)")
         .run(id, serialized, createdAt);
@@ -875,7 +920,7 @@ export class MerroStore {
           SET state = 'Done', blocked_reason = NULL, blocked_resume_state = NULL, updated_at = ?
           WHERE id = ?
         `).run(createdAt, id);
-        this.appendEvent("WorkItem", id, "state_changed", {
+        this.appendEvent("ChangeSet", id, "state_changed", {
           from: item.state,
           to: "Done",
           reason: "pull_request_merged",
@@ -883,7 +928,7 @@ export class MerroStore {
           blockedResumeState: null,
         });
       }
-      this.appendEvent("WorkItem", id, "final_summary_written", { createdAt });
+      this.appendEvent("ChangeSet", id, "final_summary_written", { createdAt });
       this.#db.exec("COMMIT");
       return true;
     } catch (error) {
@@ -892,19 +937,19 @@ export class MerroStore {
     }
   }
 
-  completeWorkItemAfterExternalMerge(id: string): void {
-    const item = this.getWorkItem(id);
-    if (!item) throw new Error(`unknown WorkItem: ${id}`);
+  completeChangeSetAfterExternalMerge(id: string): void {
+    const item = this.getChangeSet(id);
+    if (!item) throw new Error(`unknown ChangeSet: ${id}`);
     if (item.state !== "AwaitingMerge" && item.state !== "Blocked") {
-      throw new Error(`WorkItem ${id} is not awaiting an external pull request merge`);
+      throw new Error(`ChangeSet ${id} is not awaiting an external pull request merge`);
     }
-    if (this.activeTask(id)) throw new Error(`WorkItem ${id} still has an active Task`);
+    if (this.activeTask(id)) throw new Error(`ChangeSet ${id} still has an active Task`);
     this.#db.prepare(`
       UPDATE work_items
       SET state = 'Done', blocked_reason = NULL, blocked_resume_state = NULL, updated_at = ?
       WHERE id = ?
     `).run(now(), id);
-    this.appendEvent("WorkItem", id, "state_changed", {
+    this.appendEvent("ChangeSet", id, "state_changed", {
       from: item.state,
       to: "Done",
       reason: "pull_request_merged_externally",
@@ -913,18 +958,18 @@ export class MerroStore {
     });
   }
 
-  completeWorkItemAfterExternalIssueClosure(id: string): void {
-    const item = this.getWorkItem(id);
-    if (!item) throw new Error(`unknown WorkItem: ${id}`);
+  completeChangeSetAfterExternalIssueClosure(id: string): void {
+    const item = this.getChangeSet(id);
+    if (!item) throw new Error(`unknown ChangeSet: ${id}`);
     if (item.state === "Done") return;
     if (item.state === "Obsolete" || item.state === "Cancelled") return;
-    if (this.activeTask(id)) throw new Error(`WorkItem ${id} still has an active Task`);
+    if (this.activeTask(id)) throw new Error(`ChangeSet ${id} still has an active Task`);
     this.#db.prepare(`
       UPDATE work_items
       SET state = 'Done', blocked_reason = NULL, blocked_resume_state = NULL, updated_at = ?
       WHERE id = ?
     `).run(now(), id);
-    this.appendEvent("WorkItem", id, "state_changed", {
+    this.appendEvent("ChangeSet", id, "state_changed", {
       from: item.state,
       to: "Done",
       reason: "issue_closed_externally",
@@ -933,31 +978,31 @@ export class MerroStore {
     });
   }
 
-  transitionWorkItem(id: string, to: WorkItemState, blockedReason: BlockReason | null = null): void {
-    const item = this.getWorkItem(id);
-    if (!item) throw new Error(`unknown WorkItem: ${id}`);
+  transitionChangeSet(id: string, to: ChangeSetState, blockedReason: BlockReason | null = null): void {
+    const item = this.getChangeSet(id);
+    if (!item) throw new Error(`unknown ChangeSet: ${id}`);
 
     if (to === "Blocked" && blockedReason === null) {
-      throw new Error("Blocked WorkItem requires a BlockReason");
+      throw new Error("Blocked ChangeSet requires a BlockReason");
     }
     if (to !== "Blocked" && blockedReason !== null) {
       throw new Error("BlockReason is only valid when entering or updating Blocked");
     }
 
-    assertWorkItemTransition(item.state, to, item.blockedResumeState);
+    assertChangeSetTransition(item.state, to, item.blockedResumeState);
     if (to === "Obsolete" && this.activeTask(id)) {
-      throw new Error(`cannot obsolete WorkItem with an active Task: ${id}`);
+      throw new Error(`cannot obsolete ChangeSet with an active Task: ${id}`);
     }
 
     let nextBlockedReason: BlockReason | null = null;
-    let nextBlockedResumeState: FlowWorkItemState | null = null;
+    let nextBlockedResumeState: FlowChangeSetState | null = null;
     if (to === "Blocked") {
       nextBlockedReason = blockedReason;
       nextBlockedResumeState = item.state === "Blocked"
         ? item.blockedResumeState
-        : item.state as FlowWorkItemState;
+        : item.state as FlowChangeSetState;
       if (nextBlockedResumeState === null) {
-        throw new Error("Blocked WorkItem requires a resume state");
+        throw new Error("Blocked ChangeSet requires a resume state");
       }
     }
 
@@ -969,7 +1014,7 @@ export class MerroStore {
       SET state = ?, ready_since = ?, blocked_reason = ?, blocked_resume_state = ?, updated_at = ?
       WHERE id = ?
     `).run(to, readySince, nextBlockedReason, nextBlockedResumeState, now(), id);
-    this.appendEvent("WorkItem", id, "state_changed", {
+    this.appendEvent("ChangeSet", id, "state_changed", {
       from: item.state,
       to,
       blockedReason: nextBlockedReason,
@@ -977,7 +1022,7 @@ export class MerroStore {
     });
   }
 
-  createTask(input: { id: string; workItemId: string; role: TaskRole; attempt: number; runtime?: TaskRuntimeRecord }): void {
+  createTask(input: { id: string; changeSetId: string; role: TaskRole; attempt: number; runtime?: TaskRuntimeRecord }): void {
     if (input.runtime && input.runtime.taskId !== input.id) {
       throw new Error("Task runtime identity does not match Task ID");
     }
@@ -986,7 +1031,7 @@ export class MerroStore {
       this.#db.prepare(`
         INSERT INTO tasks(id, work_item_id, role, attempt, status, started_at)
         VALUES (?, ?, ?, ?, 'active', ?)
-      `).run(input.id, input.workItemId, input.role, input.attempt, now());
+      `).run(input.id, input.changeSetId, input.role, input.attempt, now());
       if (input.runtime) this.saveTaskRuntime(input.runtime);
       this.appendEvent("Task", input.id, "created", { ...input, runtime: undefined });
       this.#db.exec("COMMIT");
@@ -1034,10 +1079,10 @@ export class MerroStore {
     return row ? taskFromRow(row) : null;
   }
 
-  listTasks(workItemId?: string): Task[] {
-    const rows = workItemId === undefined
+  listTasks(changeSetId?: string): Task[] {
+    const rows = changeSetId === undefined
       ? this.#db.prepare("SELECT * FROM tasks ORDER BY started_at, id").all()
-      : this.#db.prepare("SELECT * FROM tasks WHERE work_item_id = ? ORDER BY started_at, id").all(workItemId);
+      : this.#db.prepare("SELECT * FROM tasks WHERE work_item_id = ? ORDER BY started_at, id").all(changeSetId);
     return rows.map(taskFromRow);
   }
 
@@ -1069,12 +1114,12 @@ export class MerroStore {
     if (updated.changes !== 1) throw new Error(`cleanup completion requires a finalized Task with runtime: ${taskId}`);
   }
 
-  activeTask(workItemId: string): Task | null {
-    const row = this.#db.prepare("SELECT * FROM tasks WHERE work_item_id = ? AND status = 'active'").get(workItemId);
+  activeTask(changeSetId: string): Task | null {
+    const row = this.#db.prepare("SELECT * FROM tasks WHERE work_item_id = ? AND status = 'active'").get(changeSetId);
     return row ? taskFromRow(row) : null;
   }
 
-  statusSummary(): { projects: number; objectives: number; workItems: number; activeTasks: number; blockedWorkItems: number } {
+  statusSummary(): { projects: number; objectives: number; changeSets: number; activeTasks: number; blockedChangeSets: number } {
     const count = (table: string, where = "") => {
       const row = this.#db.prepare(`SELECT COUNT(*) AS count FROM ${table} ${where}`).get();
       return Number(row?.count ?? 0);
@@ -1082,9 +1127,9 @@ export class MerroStore {
     return {
       projects: count("projects"),
       objectives: count("objectives", "WHERE state = 'Active'"),
-      workItems: count("work_items", "WHERE state NOT IN ('Done','Obsolete','Cancelled')"),
+      changeSets: count("work_items", "WHERE state NOT IN ('Done','Obsolete','Cancelled')"),
       activeTasks: count("tasks", "WHERE status = 'active'"),
-      blockedWorkItems: count("work_items", "WHERE state = 'Blocked'"),
+      blockedChangeSets: count("work_items", "WHERE state = 'Blocked'"),
     };
   }
 
@@ -1105,26 +1150,26 @@ export class MerroStore {
       const objectives = requested
         ? requested.state === "Active" ? [requested] : []
         : this.listObjectives().filter((objective) => objective.state === "Active");
-      const affectedWorkItemIds = new Set(objectives.flatMap((objective) =>
-        this.listWorkItems(objective.id).map((item) => item.id),
+      const affectedChangeSetIds = new Set(objectives.flatMap((objective) =>
+        this.listChangeSets(objective.id).map((item) => item.id),
       ));
       for (const objective of objectives) this.setObjectiveState(objective.id, "Stopped");
 
-      for (const workItemId of affectedWorkItemIds) {
-        const item = this.getWorkItem(workItemId);
+      for (const changeSetId of affectedChangeSetIds) {
+        const item = this.getChangeSet(changeSetId);
         if (!item || item.state === "Done" || item.state === "Obsolete" || item.state === "Cancelled") continue;
-        if (this.hasActiveObjectiveForWorkItem(item.id)) {
+        if (this.hasActiveObjectiveForChangeSet(item.id)) {
           const priorities = this.#db.prepare(`
             SELECT o.priority FROM objectives o
             JOIN objective_work_items ow ON ow.objective_id = o.id
             WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1
           `).all(item.id).map((row) => row.priority as Priority);
           const highest = priorities.sort((left, right) => priorityRank(left) - priorityRank(right))[0];
-          if (highest && highest !== item.priority) this.setWorkItemPriority(item.id, highest);
+          if (highest && highest !== item.priority) this.setChangeSetPriority(item.id, highest);
           continue;
         }
         if (this.activeTask(item.id)) continue;
-        this.transitionWorkItem(item.id, "Obsolete");
+        this.transitionChangeSet(item.id, "Obsolete");
         for (const decision of this.pendingDecisions()) {
           if ((decision.kind === "merge" || decision.kind === "merge_conflict") && decision.subjectId === item.id) {
             this.resolveDecision(decision.id, "resolved");

@@ -1,9 +1,9 @@
-import type { Relation, SchedulingInput, WorkItem } from "./model.js";
+import type { Relation, SchedulingInput, ChangeSet } from "./model.js";
 import { priorityRank } from "./model.js";
 import { effectiveRelations, findRequiresCycle } from "./relations.js";
 
 export interface ScheduleResult {
-  selected: WorkItem[];
+  selected: ChangeSet[];
   cycle: string[] | null;
 }
 
@@ -27,7 +27,7 @@ function transitiveDownstreamCount(id: string, relations: readonly Relation[]): 
   return seen.size;
 }
 
-function requirementsSatisfied(item: WorkItem, byId: ReadonlyMap<string, WorkItem>, relations: readonly Relation[]): boolean {
+function requirementsSatisfied(item: ChangeSet, byId: ReadonlyMap<string, ChangeSet>, relations: readonly Relation[]): boolean {
   for (const relation of relations) {
     if (relation.kind !== "Requires" || relation.from !== item.id) continue;
     if (byId.get(relation.to)?.state !== "Done") return false;
@@ -47,16 +47,16 @@ function conflictsWithAny(itemId: string, peerIds: ReadonlySet<string>, relation
 export function schedule(input: SchedulingInput): ScheduleResult {
   const relations = effectiveRelations(input.relations);
   const cycle = findRequiresCycle(relations);
-  const byId = new Map(input.workItems.map((item) => [item.id, item]));
+  const byId = new Map(input.changeSets.map((item) => [item.id, item]));
   const available = input.maxConcurrentTasks === "unlimited"
     ? Number.POSITIVE_INFINITY
     : Math.max(0, input.maxConcurrentTasks - input.activeTaskCount);
 
-  const activeIds = input.activeWorkItemIds
-    ? new Set(input.activeWorkItemIds)
-    : new Set(input.workItems.filter((item) => item.state === "Implementing" || item.state === "Reviewing").map((item) => item.id));
+  const activeIds = input.activeChangeSetIds
+    ? new Set(input.activeChangeSetIds)
+    : new Set(input.changeSets.filter((item) => item.state === "Implementing" || item.state === "Reviewing").map((item) => item.id));
 
-  const candidates = input.workItems
+  const candidates = input.changeSets
     .filter((item) => item.state === "Ready" || item.state === "Implementing" || item.state === "Reviewing")
     .filter((item) => !activeIds.has(item.id))
     .filter((item) => requirementsSatisfied(item, byId, relations))
@@ -73,7 +73,7 @@ export function schedule(input: SchedulingInput): ScheduleResult {
       return left.id.localeCompare(right.id);
     });
 
-  const selected: WorkItem[] = [];
+  const selected: ChangeSet[] = [];
   const selectedIds = new Set<string>();
   for (const candidate of candidates) {
     if (selected.length >= available) break;
