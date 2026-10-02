@@ -11,7 +11,7 @@ Read before changing Task files, the result tool, container/tmux launch, process
 - Mounts: clone (rw for implement, ro for review), per-Task scratch dir, copied Pi config dir (`pi_config: copy`, never the real one) or empty (`clean`). Model auth via env passthrough or copied auth file. Docker bind mounts use CSV-escaped `--mount` fields, never colon-delimited host-path parsing, including setup and dependency checkouts.
 - `worker_github: on` passes `GH_TOKEN` derived from the user's `gh` auth. Push, PR, and merge remain Main-only by contract. Branch protection is the real guard. `off` removes the token.
 - Network on by default. `sandbox: none` runs the same Task on the host in the clone.
-- Image: Merro generic (Node, git, common build tools), overridable per Project by image name or Dockerfile.
+- Image: generic Merro (Node, git, common build tools) is tagged with the host Pi version so Workers have the same model/provider registry; overridable per Project by image name or Dockerfile.
 
 ## Pi runtime boundary
 
@@ -24,7 +24,7 @@ Main Pi loads Merro's orchestration extension. Every Docker and host Worker Pi r
 ## tmux
 
 - Session `merro-<project>` created when a Project's first Task starts, detached, no Main window. Never auto-attached.
-- Window per Task (`impl-188`, `rev-188`), one pane, workers may not open more.
+- Window per Task (`impl-188`, `rev-188`), named by issue number or local WorkItem slug rather than Task UUID; one pane, Workers may not open more.
 - Session env `MERRO_PROJECT`, `MERRO_OWNER=workspace:<uuid>`, mirrored by `@merro_project` and `@merro_owner` session options. The owner is atomically persisted in `.merro/runtime/workspace-owner`, independent of Project paths; retain it across workspace moves and while workers live. Invalid identity fails inventory closed.
 - Task window options `@merro_task_id`, `@merro_work_item_id`, `@merro_clone_path`, `@merro_runtime_kind` identify owned live panes for reconciliation. Docker labels `merro.task_id`, `merro.project`, `merro.owner`, `merro.work_item_id`, `merro.clone_path` identify containers even if tmux is gone. Containers with old path-hash owners or no owner require an exact workspace Task scratch mount or stored matching Task/container identity as ownership proof, not the current Project path.
 - Legacy path-hash tmux markers migrate only after a stored runtime matches the pane, session, window, and live process identity. Host proof requires PID and start time; Docker proof requires container identity. This changes namespace metadata, not Task status or processes. Otherwise, mismatched session markers block that Project and are reported without adoption.

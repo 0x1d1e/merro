@@ -87,6 +87,22 @@ test("refusing an unowned session never stops its existing workers during launch
   assert.ok(calls.every((call) => /^tmux (?:has-session|show-option)$/.test(call)));
 });
 
+test("planned readable tmux window proves Task identity through its ownership marker", async () => {
+  const runtime = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "none" }, commands: {
+    async run(file, args) {
+      if (file !== "tmux") throw new Error(`unexpected command: ${file}`);
+      if (args[0] === "display-message") return { stdout: "%4 123 0 node", stderr: "" };
+      if (args[0] === "show-option") return { stdout: args.at(-1) === "@merro_task_id" ? "task-uuid" : "", stderr: "" };
+      throw new Error(`unexpected tmux command: ${args.join(" ")}`);
+    },
+  } });
+  const record = runtime.plan({ taskId: "task-uuid", workItemId: "example:issue-188:g1", role: "implement",
+    project, clonePath: "/clone", taskFile: "Test", expectedCommit: "a".repeat(40), projectSettings: null });
+
+  assert.equal(record.tmuxWindow, "impl-188");
+  assert.deepEqual(await runtime.inspect(record, "task-uuid"), { alive: true, identityMatches: true, reason: null });
+});
+
 for (const dead of [false, true]) {
   test(`host process inspection preserves uncertainty and recognizes dead panes (${dead})`, async () => {
     const runtime = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "none" }, commands: {

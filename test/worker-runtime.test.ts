@@ -8,10 +8,16 @@ import { promisify } from "node:util";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { Project } from "../src/domain/model.js";
 import { CommandError, type CommandRunner } from "../src/runtime/commands.js";
-import { WorkerRuntime } from "../src/runtime/worker-runtime.js";
+import { taskWindowName, WorkerRuntime } from "../src/runtime/worker-runtime.js";
 
 const exists = async (path: string): Promise<boolean> => access(path).then(() => true, () => false);
 const execFileAsync = promisify(execFile);
+
+test("Task tmux names use readable WorkItem references", () => {
+  assert.equal(taskWindowName("implement", "kinetix:issue-188:g1"), "impl-188");
+  assert.equal(taskWindowName("review", "kinetix:local:refresh-cli:g2"), "rev-local-refresh-cli");
+  assert.equal(taskWindowName("implement", "legacy-work"), "impl-legacy-work");
+});
 
 test("Docker worker uses the built Merro image, owns its tmux session, and isolates a read-only review", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-worker-runtime-"));
@@ -141,7 +147,12 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.ok(containerArgs.includes("--cap-drop"));
   const start = calls.find((call) => call.file === "tmux" && call.args[0] === "new-session");
   assert.ok(start);
-  assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-task-1");
+  assert.equal(start.args[start.args.indexOf("-n") + 1], "rev-1");
+  assert.ok(containerArgs.includes("merro-worker:pi-0.99.1"));
+  const imageBuild = calls.find((call) => call.file === "docker" && call.args[0] === "build");
+  assert.ok(imageBuild);
+  assert.ok(imageBuild.args.includes("merro-worker:pi-0.99.1"));
+  assert.ok(imageBuild.args.includes("PI_VERSION=0.99.1"));
   assert.ok(start.args.includes("@merro_owner"));
   assert.ok(start.args.includes("@merro_task_id"));
   const owner = (await readFile(join(workspacePath, "workspace-owner"), "utf8")).trim();
@@ -173,6 +184,51 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.equal(calls.filter(call => call.file === "tmux" && call.args[0] === "new-session").length, 1);
   assert.equal(calls.filter(call => call.file === "tmux" && call.args[0] === "new-window").length, 1);
   await restarted.cleanup(successor);
+});
+
+test("generic Docker image tracks the host Pi version instead of reusing the stale default tag", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-worker-image-version-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project: Project = {
+    slug: "versioned",
+    path: root,
+    baseRemote: "origin",
+    pushRemote: "origin",
+    defaultBranch: "main",
+  };
+  const inspected: string[] = [];
+  const builds: string[][] = [];
+  const runs: string[][] = [];
+  const commands: CommandRunner = {
+    async run(file, args) {
+      if (file === "pi") return { stdout: "1.0.0\n", stderr: "" };
+      if (file === "docker" && args[0] === "image" && args[1] === "inspect") {
+        const image = String(args.at(-1));
+        inspected.push(image);
+        if (image === "merro-worker:0.1.0") return { stdout: "stale image", stderr: "" };
+        throw new Error("image not present");
+      }
+      if (file === "docker" && args[0] === "build") {
+        builds.push([...args]);
+        return { stdout: "", stderr: "" };
+      }
+      if (file === "docker" && args[0] === "run") {
+        runs.push([...args]);
+        return { stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected command: ${file} ${args.join(" ")}`);
+    },
+  };
+  const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: DEFAULT_CONFIG, commands });
+  await runtime.prepareClone(project, join(root, "clone"), {
+    guidance: "", image: null, setupCommand: "npm install", sandbox: "docker", network: "on", workerGithub: false,
+  });
+
+  assert.deepEqual(inspected, ["merro-worker:pi-1.0.0"]);
+  assert.equal(builds.length, 1);
+  assert.ok(builds[0]!.includes("merro-worker:pi-1.0.0"));
+  assert.ok(builds[0]!.includes("PI_VERSION=1.0.0"));
+  assert.ok(runs[0]!.includes("merro-worker:pi-1.0.0"));
 });
 
 test("cleanup preserves mismatched results and active input, removes auth and launch material, and is idempotent", async (t) => {
@@ -308,6 +364,7 @@ for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"
       config: { ...DEFAULT_CONFIG, worker_github: "on", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
         async run(file, args) {
           if (file === "gh") return { stdout: "launch-secret\n", stderr: "" };
+          if (file === "pi") return { stdout: "1.0.0\n", stderr: "" };
           if (file === "tmux") {
             if (args[0] === "has-session") throw new Error("missing session");
             if (args[0] === "new-session") {
@@ -362,6 +419,7 @@ test("Docker launch rollback reports real tmux cleanup failures alongside the or
     config: { ...DEFAULT_CONFIG, worker_github: "off", pi_config: "clean" }, piConfigPath: join(root, "missing"), commands: {
       async run(file, args) {
         if (file === "docker" && args[0] === "image") return { stdout: "[]", stderr: "" };
+        if (file === "pi") return { stdout: "1.0.0\n", stderr: "" };
         if (file === "tmux") {
           if (args[0] === "has-session") throw new Error("missing session");
           if (args[0] === "new-session") throw original;

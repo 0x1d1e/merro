@@ -15,7 +15,7 @@ import { renderTaskFile } from "./task-file.js";
 import { MainLock } from "./main-lock.js";
 import { workItemPathName } from "./filesystem-identity.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
-import { WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
+import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
 
 type GitAdapter = Pick<GitClient, "discoverProject" | "createWorkItemClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint">
@@ -834,7 +834,7 @@ export class MainOrchestrator {
         taskId,
         runtimeKind: null,
         tmuxSession: `merro-${project.slug}`,
-        tmuxWindow: `${role}-${taskId}`,
+        tmuxWindow: taskWindowName(role, item.id),
         paneId: null,
         containerId: null,
         processPid: null,

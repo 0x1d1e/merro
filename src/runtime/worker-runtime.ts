@@ -10,7 +10,7 @@ import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js
 import { CommandError, type CommandRunner, systemCommandRunner } from "./commands.js";
 import { dockerBindMount } from "./docker-mount.js";
 
-const GENERIC_IMAGE = "merro-worker:0.1.0";
+const GENERIC_IMAGE = "merro-worker";
 const TASK_MOUNT = "/merro-task";
 const CLONE_MOUNT = "/work";
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
@@ -83,8 +83,11 @@ function projectSession(project: Project): string {
   return `merro-${safeName(project.slug)}`;
 }
 
-function taskWindow(input: WorkerLaunchInput): string {
-  return `${input.role === "implement" ? "impl" : "rev"}-${safeName(input.taskId)}`;
+export function taskWindowName(role: TaskRole, workItemId: string): string {
+  const issue = /^[^:]+:issue-(\d+):g\d+$/.exec(workItemId);
+  const local = /^[^:]+:local:(.+):g\d+$/.exec(workItemId);
+  const label = issue?.[1] ?? (local ? `local-${local[1]}` : workItemId);
+  return `${role === "implement" ? "impl" : "rev"}-${safeName(label)}`;
 }
 
 function missingTmuxTarget(error: unknown): boolean {
@@ -189,7 +192,7 @@ export class WorkerRuntime {
       taskId: input.taskId,
       runtimeKind: sandbox === "docker" ? "docker" : "host",
       tmuxSession: projectSession(input.project),
-      tmuxWindow: taskWindow(input),
+      tmuxWindow: taskWindowName(input.role, input.workItemId),
       paneId: null,
       containerId: null,
       processPid: null,
@@ -517,7 +520,8 @@ export class WorkerRuntime {
       const pid = Number(result[1]);
       const startedAt = record.processStartedAt === null ? null : await this.#hostProcessStartedAt(pid);
       const hasProcessIdentity = record.paneId !== null || record.processPid !== null;
-      const taskWindowMatches = hasProcessIdentity || record.tmuxWindow.endsWith(safeName(taskId));
+      const taskWindowMatches = hasProcessIdentity || record.tmuxWindow.endsWith(safeName(taskId))
+        || (await this.#commands.run("tmux", ["show-option", "-wqv", "-t", `${record.tmuxSession}:${record.tmuxWindow}`, "@merro_task_id"])).stdout.trim() === taskId;
       const identityMatches = taskWindowMatches
         && (record.paneId === null || result[0] === record.paneId)
         && (record.processPid === null || Number(result[1]) === record.processPid)
@@ -721,18 +725,22 @@ export class WorkerRuntime {
       return configured;
     }
 
-    const cached = this.#resolvedImages.get(GENERIC_IMAGE);
+    const piVersion = (await this.#commands.run("pi", ["--version"])).stdout.trim();
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(piVersion)) {
+      throw new Error(`pi --version returned an unsupported version: ${piVersion || "empty output"}`);
+    }
+    const image = `${GENERIC_IMAGE}:pi-${piVersion}`;
+    const cached = this.#resolvedImages.get(image);
     if (cached) return cached;
     try {
-      await this.#commands.run("docker", ["image", "inspect", GENERIC_IMAGE]);
+      await this.#commands.run("docker", ["image", "inspect", image]);
     } catch {
-      const piVersion = (await this.#commands.run("pi", ["--version"])).stdout.trim();
       await this.#commands.run("docker", [
-        "build", "--tag", GENERIC_IMAGE, "--build-arg", `PI_VERSION=${piVersion}`,
+        "build", "--tag", image, "--build-arg", `PI_VERSION=${piVersion}`,
         "--file", join(packageRoot, "docker", "worker.Dockerfile"), packageRoot,
       ]);
     }
-    this.#resolvedImages.set(GENERIC_IMAGE, GENERIC_IMAGE);
-    return GENERIC_IMAGE;
+    this.#resolvedImages.set(image, image);
+    return image;
   }
 }

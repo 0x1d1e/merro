@@ -12,7 +12,7 @@ import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../s
 import { MainOrchestrator } from "../src/runtime/main.js";
 import { registerCommands, type PiExtensionLike } from "../src/tools/commands.js";
 import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
-import { WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
+import { taskWindowName, WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
 async function approveProposal(tools: Map<string, Parameters<MainToolAPI["registerTool"]>[0]>, args: Record<string, unknown>) {
@@ -450,7 +450,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         taskId: input.taskId,
         runtimeKind: "host",
         tmuxSession: `merro-${input.project.slug}`,
-        tmuxWindow: `${input.role}-${input.taskId}`,
+        tmuxWindow: taskWindowName(input.role, input.workItemId),
         paneId: "%1",
         containerId: null,
         processPid: 1,
@@ -1010,7 +1010,7 @@ for (const labeled of [true, false]) {
     await harness.main.runPass();
     const input = harness.launches[0]!;
     workers.push({ taskId: labeled ? input.taskId : null, projectSlug: "example", workItemId: input.workItemId,
-      clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: `implement-${input.taskId}`, paneId: "%1", containerId: null });
+      clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("implement", input.workItemId), paneId: "%1", containerId: null });
     await harness.restartMain().runPass();
     assert.equal(harness.launches.length, 1);
     assert.equal(harness.notifications.some((message) => /orphan/i.test(message)), false);
@@ -1029,7 +1029,7 @@ test("legacy pane matching does not confuse a current Task with a finalized Task
   await harness.main.runPass();
   const current = harness.launches[1]!;
   workers.push({ taskId: null, projectSlug: "example", workItemId: current.workItemId,
-    clonePath: current.clonePath, tmuxSession: "merro-example", tmuxWindow: `review-${current.taskId}`, paneId: "%1", containerId: null });
+    clonePath: current.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("review", current.workItemId), paneId: "%1", containerId: null });
   await harness.restartMain().runPass();
   assert.equal(harness.notifications.some((message) => /orphan|Worker for finalized Task/i.test(message)), false);
   assert.equal(harness.launches.length, 2);
@@ -1251,7 +1251,7 @@ test("live workers attached to finalized Tasks gate successors and retain their 
   store.finalizeTask({ id: input.taskId, outcome: "failed", summary: "Stopped record", resultJson: "{}" });
   store.close();
   workers.push({ taskId: input.taskId, projectSlug: "example", workItemId: input.workItemId,
-    clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: `implement-${input.taskId}`, paneId: "%1", containerId: null });
+    clonePath: input.clonePath, tmuxSession: "merro-example", tmuxWindow: taskWindowName("implement", input.workItemId), paneId: "%1", containerId: null });
   await harness.restartMain().runPass();
   assert.equal(harness.launches.length, 1);
   assert.ok(harness.notifications.some((message) => message.includes("Worker for finalized Task")));
