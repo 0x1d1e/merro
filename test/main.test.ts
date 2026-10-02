@@ -317,6 +317,7 @@ interface HarnessOptions {
   notifyCommand?: string;
   workerModels?: MerroConfig["worker_models"];
   workerThinking?: MerroConfig["worker_thinking"];
+  repositoryFailure?: () => Error | null;
   commands?: import("../src/runtime/commands.js").CommandRunner;
   result?: (input: WorkerLaunchInput, launchNumber: number, defaultResult: Record<string, unknown>) => Record<string, unknown> | null;
 }
@@ -408,6 +409,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       };
     },
     async repository(reference: string) {
+      const failure = options.repositoryFailure?.();
+      if (failure) throw failure;
       const slug = reference.match(/(?:\/|:)([^/:]+?)(?:\.git)?$/)?.[1] ?? "example";
       const project = projects.get(slug) ?? [...projects.values()].find((candidate) => reference === candidate.baseRemote || reference === candidate.pushRemote);
       const projectSlug = project?.slug ?? slug;
@@ -1996,6 +1999,50 @@ test("reject unsafe Project slugs before repository discovery", async (t) => {
   for (const slug of ["../escape", "..", ".", "/tmp/escape", "nested/path", "back\\\\slash"]) {
     await assert.rejects(harness.main.addProject(harness.workspacePath, slug), /invalid Project slug/);
   }
+});
+
+test("GitHub connection outage explains automatic recovery without replacing the live Worker", async (t) => {
+  let unavailable = false;
+  let stops = 0;
+  const harness = await createHarness(t, {
+    repositoryFailure: () => unavailable ? new Error("error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com") : null,
+    result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+    stop: async () => { stops++; },
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+
+  unavailable = true;
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const blocked = (await harness.main.statusSnapshot()).changeSets[0];
+  assert.ok(blocked);
+  assert.equal(blocked.state, "Blocked");
+  assert.equal(blocked.blockedReason, "project_unavailable");
+  assert.equal(blocked.blockedResumeState, "Implementing");
+  const messages = harness.notifications.filter((message) => /blocked|is unavailable/.test(message));
+  assert.equal(messages.filter((message) => message.includes(" blocked\n\n")).length, 1);
+  for (const message of messages) {
+    assert.match(message, /GitHub API temporarily unavailable/);
+    assert.match(message, /retry automatically/);
+    assert.doesNotMatch(message, /merro-continue/);
+    assert.match(message, /error connecting to api.github.com/);
+  }
+
+  unavailable = false;
+  await harness.main.runPass();
+  const recovered = (await harness.main.statusSnapshot()).changeSets[0];
+  assert.ok(recovered);
+  assert.equal(recovered.state, "Implementing");
+  assert.equal(recovered.blockedReason, null);
+  assert.equal(harness.launches.length, 1);
+  assert.equal(stops, 0);
+  assert.equal(harness.cleanupCalls.length, 0);
+  assert.equal(harness.notifications.filter((message) => /Project example is available again/.test(message)).length, 1);
+  await harness.main.runPass();
+  assert.equal(harness.notifications.filter((message) => /Project example is available again/.test(message)).length, 1);
 });
 
 test("adopt a moved Project path only for the same repository identity", async (t) => {

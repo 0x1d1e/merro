@@ -240,13 +240,13 @@ export class GitHubMergeError extends Error {
 
 type RetryDecision<T> = { type: "retry" } | { type: "fail" } | { type: "done"; value: T };
 
-function isTransientGitHubFailure(error: unknown): boolean {
+export function isTransientGitHubFailure(error: unknown): boolean {
   const code = error instanceof CommandError ? error.causeCode : null;
   if (code && /^(?:ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|ECONNABORTED)$/.test(code)) return true;
   const message = error instanceof CommandError ? `${error.stderr} ${error.message}` : error instanceof Error ? error.message : String(error);
   return /\b(?:ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|ECONNABORTED)\b/.test(message)
     || /(?:HTTP|status|response(?: code)?)[^\n]*\b(?:408|429|500|502|503|504)\b/i.test(message)
-    || /API rate limit exceeded|secondary rate limit|GitHub server error/i.test(message);
+    || /API rate limit exceeded|secondary rate limit|GitHub server error|error connecting to api\.github\.com\b/i.test(message);
 }
 
 function isGitHubAvailabilityFailure(error: unknown): boolean {

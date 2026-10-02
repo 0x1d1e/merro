@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { CommandOptions, CommandOutput, CommandRunner } from "../src/runtime/commands.js";
+import { CommandError, type CommandOptions, type CommandOutput, type CommandRunner } from "../src/runtime/commands.js";
 import { GitHubClient, GitHubMergeError } from "../src/github/client.js";
 
 class FakeCommands implements CommandRunner {
@@ -144,6 +144,22 @@ test("transient GitHub failures retry with a bounded retry while permanent failu
     new Error("HTTP 503: Service Unavailable"),
   ]);
   await assert.rejects(new GitHubClient(exhaustedCommands).repository(project.baseRemote), /HTTP 503/);
+  assert.equal(exhaustedCommands.calls.length, 3);
+});
+
+test("gh connection errors retry before succeeding or exhausting the bounded attempts", async () => {
+  const connectionError = () => new CommandError("gh", ["repo", "view", project.baseRemote],
+    Object.assign(new Error("Command failed"), { code: 1 }),
+    "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com");
+  const recoveredCommands = new FakeCommands([
+    connectionError(),
+    { stdout: repository("acme/widget"), stderr: "" },
+  ]);
+  assert.equal((await new GitHubClient(recoveredCommands).repository(project.baseRemote)).nameWithOwner, "acme/widget");
+  assert.equal(recoveredCommands.calls.length, 2);
+
+  const exhaustedCommands = new FakeCommands([connectionError(), connectionError(), connectionError()]);
+  await assert.rejects(new GitHubClient(exhaustedCommands).repository(project.baseRemote), /error connecting to api.github.com/);
   assert.equal(exhaustedCommands.calls.length, 3);
 });
 

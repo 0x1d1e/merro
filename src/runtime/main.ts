@@ -8,7 +8,7 @@ import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
 import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
-import { GitHubClient, GitHubMergeError, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
+import { GitHubClient, GitHubMergeError, isTransientGitHubFailure, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
 import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
@@ -1044,19 +1044,25 @@ export class MainOrchestrator {
         const repository = await this.#github.repository(discovered.baseRemote);
         const reconciled = { ...discovered, defaultBranch: repository.defaultBranch };
         store.updateProject(reconciled);
+        let resumed = false;
         for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === current.slug)) {
           if (item.state === "Blocked" && item.blockedReason === "project_unavailable" && item.blockedResumeState) {
             store.transitionChangeSet(item.id, item.blockedResumeState);
+            resumed = true;
           }
         }
+        if (resumed) this.#notify(`Project ${current.slug} is available again; affected changes resumed.`, "info");
       } catch (error) {
         unavailable.add(current.slug);
+        const cause = isTransientGitHubFailure(error)
+          ? `GitHub API temporarily unavailable. Check your internet connection or https://githubstatus.com.\n${errorText(error)}`
+          : errorText(error);
         for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === current.slug)) {
           if (!terminal(item) && item.state !== "Blocked") {
-            this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${errorText(error)}`);
+            this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${cause}`);
           }
         }
-        this.#notify(`Project ${current.slug} is unavailable: ${errorText(error)}`, "warning");
+        this.#notify(`Project ${current.slug} is unavailable: ${cause}\nMain will retry automatically and resume affected changes after recovery.`, "warning");
       }
     }
     return unavailable;
@@ -1861,9 +1867,11 @@ export class MainOrchestrator {
       .filter((dependent): dependent is ChangeSet => dependent !== null)
       .map((dependent) => `${changeName(dependent)} (${dependent.state})`);
     const dependentsNote = dependents.length > 0 ? ` Direct dependents: ${dependents.join(", ")}.` : "";
-    const recovery = retryable
-      ? `Retry available after fixing the cause: /merro-continue ${changeName(item)}`
-      : "Fix the underlying GitHub policy/API response; Main will retry on reconciliation. /merro-continue cannot retry this deterministic blocker.";
+    const recovery = reason === "project_unavailable"
+      ? "Main will retry automatically and resume this change after Project reconciliation succeeds. No manual continuation is needed."
+      : retryable
+        ? `Retry available after fixing the cause: /merro-continue ${changeName(item)}`
+        : "Fix the underlying GitHub policy/API response; Main will retry on reconciliation. /merro-continue cannot retry this deterministic blocker.";
     const message = `${changeName(item)} blocked\n\n${publicText(detail, this.#names)}.${dependentsNote}\n${recovery}`;
     this.#notify(message, "warning");
     this.#queueNotification("blocked", item.id, message);
