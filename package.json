@@ -1,6 +1,6 @@
 {
   "name": "@prightcord/merro",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pi package that coordinates multiple coding workers from one Main Pi session.",
   "type": "module",
   "files": [

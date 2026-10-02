@@ -6,11 +6,12 @@ Talk to Main in Pi. Main proposes a plan, launches visible native Pi workers, re
 
 ## Install and initialize
 
-Requirements: Node.js >=22.13.0, Pi supporting `--tui-mode regular` with a configured provider, Git, tmux and authenticated `gh`. Repositories need working Git fetch/push authentication and a configured Git author identity.
+Workspace requirements: Node.js >=22.13.0, Pi supporting `--tui-mode regular` with a configured provider, and tmux. Project registration and delivery also require Git, authenticated `gh`, working Git fetch/push authentication and a configured Git author identity.
 
 ```sh
 pi install git:github.com/PrightCord/Merro
-cd ~/Projects/kinetix
+mkdir -p ~/merro-workspace
+cd ~/merro-workspace
 pi
 ```
 
@@ -20,10 +21,10 @@ Inside Pi:
 /merro init
 ```
 
-Initialization validates dependencies and GitHub access, records the repository as a Project and creates:
+Initialization works in any writable directory, without a Git repository, remote URL or GitHub login. It validates Pi/tmux and creates:
 
 ```text
-kinetix/
+merro-workspace/
 ├── .merro/
 │   ├── config.json
 │   ├── state.db
@@ -31,7 +32,7 @@ kinetix/
 └── .wt/
 ```
 
-Local state and working copies are excluded through `.git/info/exclude`, without changing project source. Initialization is idempotent: existing config and state remain intact.
+Inside an existing Git working tree, local state and working copies are excluded through `.git/info/exclude`, without changing project source. Otherwise no Git files are created. Initialization is idempotent: existing config, Projects and state remain intact.
 
 Merro only uses **cwd/.merro**. It neither initializes on startup nor searches parent directories. Elsewhere tools say:
 
@@ -39,7 +40,13 @@ Merro only uses **cwd/.merro**. It neither initializes on startup nor searches p
 Merro is not initialized here. Run /merro init.
 ```
 
-Return to the same directory to resume. Use one Main per workspace. Ask Main to register additional repositories by path and semantic Project name when needed.
+Return to the same directory to resume. Use one Main per workspace. Initialization does not register Projects automatically. Before planning work, ask Main to register a GitHub repository by local path and semantic Project name:
+
+```text
+Register ~/Projects/kinetix as kinetix.
+```
+
+The workspace itself needs no remote; registered Projects still require GitHub repositories.
 
 ## Plan and approve
 
@@ -90,7 +97,7 @@ Workers may outlive Main. Reopen Pi in the workspace to reconcile existing worke
 
 | Command | Action |
 |---|---|
-| `/merro init` | Explicitly initialize this Git directory |
+| `/merro init` | Explicitly initialize this directory, Git optional |
 | `/status` | Show changes, issues, state, worker, CI and activity |
 | `/merro-run` | Reconcile and schedule approved work |
 | `/merro-approve [change]` | Approve a pending merge/conflict decision |
@@ -138,4 +145,5 @@ The CI script installs dependencies, checks boundaries/types, builds and tests. 
 - [Lifecycle](docs/lifecycle.md): scheduling, recovery and merge contracts
 - [Worker protocol](docs/worker-protocol.md): Task input/result and process identity
 - [Acceptance](docs/acceptance.md): regression and native-runtime checks
-- [ADR-0008](docs/adr/0008-changeset-delivery-and-native-pi.md): current delivery/runtime decision, superseding ADR-0004 and ADR-0006
+- [ADR-0008](docs/adr/0008-changeset-delivery-and-native-pi.md): delivery/runtime decision, superseding ADR-0004 and ADR-0006
+- [ADR-0009](docs/adr/0009-repository-independent-workspace-init.md): repository-independent initialization

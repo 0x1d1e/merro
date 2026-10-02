@@ -25,7 +25,7 @@ async function withStore<T>(cwd: string, action: (store: MerroStore) => T | Prom
   finally { try { store?.close(); } finally { await lock.release(); } }
 }
 export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?: MainOrchestrator, onInitialized?: () => Promise<void>): void {
-  pi.registerCommand("merro", { description: "Initialize this Git repository: /merro init", async handler(args, ctx) {
+  pi.registerCommand("merro", { description: "Initialize Merro in this directory: /merro init", async handler(args, ctx) {
     if (args.trim() !== "init") throw new Error("Usage: /merro init");
     await initializeWorkspace(cwd);
     report(ctx, "Merro initialized.");

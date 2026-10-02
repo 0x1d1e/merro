@@ -5,7 +5,7 @@ Run `scripts/run-ci.sh`. Tests cross the interfaces used by Main, Pi commands/to
 ## Automated gates
 
 - Uninitialized cwd refuses with `/merro init` guidance. Startup creates nothing and ignores initialized parents.
-- `/merro init` validates dependencies, records repository identity, creates `.merro`/`.wt` and excludes local state. Repeated init and startup preserve custom config and existing state.
+- `/merro init` validates Pi/tmux and creates `.merro`/`.wt` in a writable directory without requiring Git, remotes or GitHub access. It registers no Projects and excludes local state when inside a Git working tree. Repeated init and startup preserve custom config, registered Projects and existing state.
 - Combined #96/#97/#100 yields one ChangeSet, `.wt/plugin-lifecycle-safety`, semantic branch, sequential implementation/review flow and one PR with every closure. Internal dependencies do not become scheduling edges.
 - Review requires green command verification and receives all issue contents/acceptance criteria, full diff and implementation evidence. Reject creates fresh implementation and review attempts on the same branch.
 - Aggregate public plans, status, Task text, errors, PRs, review comments and notifications have no UUID-pattern matches or known private keys.
@@ -22,7 +22,7 @@ Primary coverage: `test/workspace.test.ts`, `test/main.test.ts`, `test/worker-li
 With real Pi/provider, tmux, Git and authenticated GitHub access, use a disposable repository/workspace:
 
 1. Load Merro before initialization: `/status` refuses and no state appears.
-2. `/merro init`, propose one combined change, approve conversationally.
+2. `/merro init`, register a GitHub Project by path/name, propose one combined change, approve conversationally.
 3. Attach to `merro-<project> / impl-<change>`. Confirm the actual Pi TUI, repository/normal host instructions and expected config/extensions are present; no print/JSON reconstruction.
 4. Observe implementation, green local verification, fresh review and one PR with all issue closures. A rejection must launch fresh Pi processes without changing branch.
 5. Exit/reopen Main while a Worker runs. Same Worker remains, state/activity survive, no duplicate window.

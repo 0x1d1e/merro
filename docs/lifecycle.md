@@ -4,7 +4,7 @@ Read before changing ChangeSet states, relations, scheduling, PR/merge flow or r
 
 ## Workspace and approval
 
-Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly; startup opens and reconciles it without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
+Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly in any writable directory, without requiring a Git repository, remote or GitHub access. Projects are registered separately by path/name. Startup opens and reconciles state without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
 
 Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; replacement or restart expires it. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
 
