@@ -1,4 +1,5 @@
 import type { BaseUpdate, TaskRole } from "../domain/model.js";
+import { renderMarkdownGuidance, type MarkdownGuidance } from "./guidance.js";
 
 export interface TaskFileInput {
   role: TaskRole;
@@ -10,6 +11,7 @@ export interface TaskFileInput {
   objective: string;
   userGuidance: string;
   projectGuidance: string;
+  markdownGuidance?: readonly MarkdownGuidance[];
   repositoryInstructions: readonly { path: string; text: string }[];
   dependencies: readonly {
     change: string;
@@ -65,6 +67,7 @@ export function renderTaskFile(input: TaskFileInput): string {
     section("Scope", `${input.title}\n\n${input.scope}`),
     section("User guidance", input.userGuidance),
     section("Project guidance", input.projectGuidance),
+    section("Markdown guidance", renderMarkdownGuidance(input.markdownGuidance ?? [])),
     input.repositoryInstructions.length === 0
       ? ""
       : section("Repository instructions", input.repositoryInstructions.map(({ path, text }) => `### ${path}\n\n${text}`).join("\n\n")),

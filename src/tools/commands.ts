@@ -28,7 +28,7 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
   pi.registerCommand("merro", { description: "Initialize Merro in this directory: /merro init", async handler(args, ctx) {
     if (args.trim() !== "init") throw new Error("Usage: /merro init");
     await initializeWorkspace(cwd);
-    report(ctx, "Merro initialized.");
+    report(ctx, "Merro initialized.\n\nNext: Register ~/Projects/my-app as my-app\nThen: Fix #42.");
     await onInitialized?.();
   } });
   pi.registerCommand("status", { description: "Show Merro changes", async handler(_args, ctx) {

@@ -1,12 +1,10 @@
 # Merro
 
-A Pi package coordinating coding work through **Pi + tmux + Git + GitHub**.
+Merro turns GitHub issues into reviewed pull requests from a Pi conversation. It shows you a plan, runs visible coding and review Workers in tmux, opens a PR, and asks before merging.
 
-Talk to Main in Pi. Main proposes a plan, launches visible native Pi workers, reconciles their results, opens PRs and asks before merging. Host Pi is the default; Docker is optional. Merro is not a generic agent harness or a separate CLI.
+## Install
 
-## Install and initialize
-
-Workspace requirements: Node.js >=22.13.0, Pi supporting `--tui-mode regular` with a configured provider, and tmux. Project registration and delivery also require Git, authenticated `gh`, working Git fetch/push authentication and a configured Git author identity.
+You need Node.js >=22.13.0, Pi with a configured provider and `--tui-mode regular` support, tmux, Git, and authenticated GitHub CLI (`gh auth login`). Your repository also needs working Git fetch/push authentication and a configured Git author name/email. Docker is optional.
 
 ```sh
 pi install git:github.com/PrightCord/Merro
@@ -15,124 +13,140 @@ cd ~/merro-workspace
 pi
 ```
 
+## Initialize
+
 Inside Pi:
 
 ```text
 /merro init
 ```
 
-Initialization works in any writable directory, without a Git repository, remote URL or GitHub login. It validates Pi/tmux and creates:
-
 ```text
-merro-workspace/
-├── .merro/
-│   ├── config.json
-│   ├── state.db
-│   └── runtime/
-└── .wt/
+Merro initialized.
+
+Next: Register ~/Projects/my-app as my-app
+Then: Fix #42.
 ```
 
-Inside an existing Git working tree, local state and working copies are excluded through `.git/info/exclude`, without changing project source. Otherwise no Git files are created. Initialization is idempotent: existing config, Projects and state remain intact.
+The workspace can be any writable directory. Initialization needs Pi/tmux, not a Git repository or GitHub login. It preserves existing configuration and work.
 
-Merro only uses **cwd/.merro**. It neither initializes on startup nor searches parent directories. Elsewhere tools say:
+## Register a Project
 
-```text
-Merro is not initialized here. Run /merro init.
-```
-
-Return to the same directory to resume. Use one Main per workspace. Initialization does not register Projects automatically. Before planning work, ask Main to register a GitHub repository by local path and semantic Project name:
+Tell Pi the local path and the name you want to use:
 
 ```text
-Register ~/Projects/kinetix as kinetix.
+Register ~/Projects/my-app as my-app.
 ```
 
-The workspace itself needs no remote; registered Projects still require GitHub repositories.
+Use an existing GitHub repository checkout. You can register more Projects later; the workspace itself needs no remote.
 
-## Plan and approve
+## Give work
 
 ```text
-Do #96, #97 and #100 together in one PR.
-Name the change plugin-lifecycle-safety.
+Fix #42 in my-app.
 ```
 
-Main presents:
+Merro shows the issues, change name, branch, PR count, and implementation/review models, then asks `Approve?`. Reply:
 
 ```text
-Plan
-
-kinetix: #96 #97 #100
-Change: plugin-lifecycle-safety
-Branch: chore/plugin-lifecycle-safety
-Delivery: one change per Project
-PRs: 1
-Implementation: one worker per change
-Review: one fresh worker per change
-
-Approve?
+approve
 ```
 
-Reply `approve`, or select the pending plan by name. No identifier is required. A replacement plan or changed authoritative scope requires fresh approval.
-
-All selected issues in each Project form one **ChangeSet** by default: one `.wt/plugin-lifecycle-safety` clone, branch and PR. Ask for separate delivery when issues should ship independently. Combined query selections are frozen at approval; separate delivery can retain a live label/milestone query. Cross-Project work uses separate changes and dependency relations.
-
-```text
-implementation -> green local verification -> fresh review -> PR -> merge approval
-                         ^                      |
-                         +-- fresh implementer -+ reject
-```
-
-A reviewer receives issue contents, acceptance criteria, full `base...HEAD` diff, implementation summary, verification results and repository instructions. Rework keeps the same working copy and branch, but uses new Pi processes. PRs contain Summary, Verification and Issues sections with every `Closes #n`.
-
-## Watch and resume
+Your first Worker starts. Use `/status` in Pi, or watch its native Pi terminal:
 
 ```sh
-tmux attach -t merro-kinetix
+tmux attach -t merro-my-app
 ```
 
-Windows use semantic names such as `impl-plugin-lifecycle-safety` and `rev-plugin-lifecycle-safety`. They show the actual Pi TUI, not reconstructed output. Watch without steering; ask Main to stop and restart the attempt if requirements change.
+## Get a reviewed PR
 
-Workers may outlive Main. Reopen Pi in the workspace to reconcile existing workers without duplicating healthy Tasks. Ambiguous identity pauses scheduling rather than guessing ownership or launching a replacement.
+Merro runs implementation, green local verification, then a fresh review. Blocking findings get a fresh implementer and reviewer on the same branch. Once review passes, Merro opens a PR with a summary, verification and issue closures, then asks for merge approval. Reply `approve`, or use `/merro-approve <change name>` for a pending merge. Plans and merges need separate approvals.
+
+For several issues in one PR, say:
+
+```text
+Fix #42 and #43 together in my-app. Name the change safer-plugin-removal.
+```
+
+Selected issues form one change per Project by default. Ask for separate PRs when needed. Cross-Project work uses separate changes.
+
+## Customize with Markdown
+
+Create only the files you want inside the workspace:
+
+```text
+.merro/
+├── config.json
+├── WORKSPACE.md
+├── IMPLEMENTER.md
+├── REVIEWER.md
+└── projects/
+    ├── kinetix.md
+    └── kinetix-plugins.md
+```
+
+All Markdown files are optional. Plain instructions, no schema or special syntax:
+
+| File | Applies to |
+|---|---|
+| `WORKSPACE.md` | Workspace-wide instructions, coding/review conventions, delivery preferences |
+| `IMPLEMENTER.md` | Additional implementer instructions |
+| `REVIEWER.md` | Additional reviewer instructions |
+| `projects/<slug>.md` | Instructions for that registered Project only |
+
+For example, `.merro/WORKSPACE.md`:
+
+```markdown
+Prefer separate PRs for unrelated issues.
+Run repository CI before submitting implementation.
+Keep PR summaries short and include user-visible changes.
+```
+
+Guidance precedence, highest first:
+
+```text
+current user instruction
+project Markdown
+workspace Markdown (including the applicable role file)
+Merro defaults
+```
+
+**Built-in safety invariants cannot be overridden**, even by user instructions: approval, approved scope, verification, fresh review, result validation and safe Worker ownership still apply. Existing stored Project/ChangeSet guidance remains supported. Repository `AGENTS.md` remains normal Pi/repository guidance; Merro does not replace it.
+
+Main reads workspace and registered Project Markdown each turn, including delivery preferences when planning. Fresh Workers receive the workspace, applicable role and their Project's Markdown in their Task input, on both host and Docker. Missing/blank files are ignored; unreadable files report an error. Edits apply to future turns and Tasks, never steer a running Worker. Ask Main to restart an attempt if requirements change.
+
+## Workspace and resume
+
+Merro uses only the current directory's `.merro`; it does not search parents or initialize on startup. Initialization also creates `.wt` for working copies. Inside an existing Git working tree, these local directories are excluded through `.git/info/exclude`, without changing source files.
+
+Reopen Pi in the same workspace to resume. Workers may outlive Pi; healthy Workers are reconciled, not duplicated. Use one Main Pi session per workspace. Watch Workers without typing into them; changed requirements need a fresh attempt.
 
 ## Commands
 
 | Command | Action |
 |---|---|
-| `/merro init` | Explicitly initialize this directory, Git optional |
-| `/status` | Show changes, issues, state, worker, CI and activity |
+| `/merro init` | Initialize this directory |
+| `/status` | Show changes, issues, Workers, CI and activity |
 | `/merro-run` | Reconcile and schedule approved work |
 | `/merro-approve [change]` | Approve a pending merge/conflict decision |
 | `/merro-reject [change]` | Reject a merge or abandon conflict resolution |
 | `/merro-continue <change>` | Retry a retryable blocker after fixing its cause |
-| `/stop [goal or change]` | Soft-stop Objectives; active Tasks finish |
+| `/stop [goal or change]` | Stop new work; active Workers finish |
 | `/unlock` | Clear stale ownership, never bypass live Main |
-| `/merro-export` | Export normal semantic status to `.merro/export.json` |
+| `/merro-export` | Export status to `.merro/export.json` |
 
-Pi's `/export` exports its conversation instead. Plans are approved conversationally, not through the merge command.
+Pi's `/export` exports its conversation instead. Plans are approved conversationally, not through the merge command. Main checks current review, GitHub policy, required checks/reviews and mergeability before squash-merging. Rejecting a merge keeps the PR and branch.
 
-Merge approval is per PR. Main checks current review, GitHub policy, required checks/reviews and mergeability before squash-merging. Rejection keeps the PR and branch. External merges are reconciled as completion.
+## Runtime settings and safety
 
-## Configuration and safety
+Instructions belong in Markdown. Runtime settings remain in `.merro/config.json`; restart Main after editing it. Defaults and validation: [`src/config.ts`](src/config.ts).
 
-Edit `.merro/config.json`, then restart Main. Initial configuration is:
-
-```json
-{
-  "max_concurrent_tasks": 3,
-  "max_review_rounds": 3,
-  "worker_models": { "implement": null, "review": null },
-  "worker_thinking": { "implement": null, "review": null }
-}
-```
-
-Both limits accept a positive integer or `"unlimited"`. Set `worker_models` and `worker_thinking` independently for `implement` and `review`; `null` uses Pi's default. Model values are Pi model IDs, and thinking values pass through to Pi's `--thinking` option. Different changes may implement/review concurrently, but each ChangeSet has at most one active Worker. Hitting the review cap blocks the change; explicit continuation grants another round.
-
-Host workers inherit normal HOME, Pi config, auth, models, packages and extensions. Merro adds its lifecycle/result extensions and disables nested Main orchestration in workers. **Host mode is not a security sandbox.** Reviewers must not edit, but host filesystem permissions do not enforce that promise.
-
-Optional `"sandbox": "docker"` requires Docker and a suitable image/toolchain. Docker stages Pi config into Task scratch and mounts the reviewer clone read-only. Container providers must be reachable from inside Docker; `localhost` points to the container, not the host. `"network": "off"` requires Docker.
-
-`"worker_github": "on"` is the default and passes a token obtained from `gh auth token`. `"off"` withholds GitHub tokens. Worker push/PR/merge restrictions are contractual; repository permissions and branch protection remain the security boundary.
-
-Optional `notify_command` runs for `blocked`, `merge_ready` and `objective_done`. It receives `MERRO_EVENT`, semantic `MERRO_CHANGE` and `MERRO_MESSAGE`. Failures warn without aborting reconciliation. All supported defaults and validation live in [`src/config.ts`](src/config.ts).
+- `max_concurrent_tasks` and `max_review_rounds`: positive integers or `"unlimited"`, default 3. Each change has at most one active Worker. Explicit continuation grants another round after the review cap.
+- `worker_models` and `worker_thinking`: independent `implement`/`review` choices, default `null` for Pi defaults. Models are Pi model IDs; thinking values pass through to `--thinking`.
+- `sandbox`: `"none"` by default. Host Workers inherit normal HOME, Pi config, auth, models, packages and extensions. **Host mode is not a security sandbox.** Reviewer non-editing is contractual, not enforced by host filesystem permissions.
+- `sandbox: "docker"`: needs Docker and a suitable image/toolchain. Review mounts are read-only. Container providers must be reachable from Docker; `localhost` means the container. `network: "off"` requires Docker.
+- `worker_github`: `"on"` by default, passing a token from `gh auth token`; `"off"` withholds it. Worker push/PR/merge restrictions are contractual; repository permissions and branch protection remain the security boundary.
+- `notify_command`: optional notifications for `blocked`, `merge_ready` and `objective_done`, with `MERRO_EVENT`, `MERRO_CHANGE` and `MERRO_MESSAGE`. Failures warn without aborting work.
 
 ## Develop
 
@@ -141,11 +155,11 @@ scripts/run-ci.sh
 pi --no-extensions --extension ./src/index.ts
 ```
 
-The CI script installs dependencies, checks boundaries/types, builds and tests. Use `--skip-install` only with current dependencies. `--no-extensions` avoids loading an installed Merro alongside the local checkout.
+CI installs dependencies, checks boundaries/types, builds and tests. Use `--skip-install` only with current dependencies. `--no-extensions` avoids loading an installed Merro alongside the checkout.
 
-- [CONTEXT.md](CONTEXT.md): canonical terms and invariants
+Maintainer references, not prerequisites for using Merro:
+
+- [CONTEXT.md](CONTEXT.md): terms and invariants
 - [Lifecycle](docs/lifecycle.md): scheduling, recovery and merge contracts
 - [Worker protocol](docs/worker-protocol.md): Task input/result and process identity
 - [Acceptance](docs/acceptance.md): regression and native-runtime checks
-- [ADR-0008](docs/adr/0008-changeset-delivery-and-native-pi.md): delivery/runtime decision, superseding ADR-0004 and ADR-0006
-- [ADR-0009](docs/adr/0009-repository-independent-workspace-init.md): repository-independent initialization

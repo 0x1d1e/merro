@@ -12,6 +12,7 @@ import { GitHubClient, GitHubMergeError, isTransientGitHubFailure, type BranchPo
 import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
+import { loadMarkdownGuidance } from "./guidance.js";
 import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { requireWorkspace } from "./workspace.js";
@@ -976,6 +977,7 @@ export class MainOrchestrator {
         objective: objective.goal,
         userGuidance: item.guidance ?? "",
         projectGuidance: projectSettings?.guidance ?? "",
+        markdownGuidance: await loadMarkdownGuidance(this.#workspacePath, [project.slug], role),
         repositoryInstructions: instructions,
         dependencies: dependencyContext, latestReview, expectedCommit, baseUpdate,
       });

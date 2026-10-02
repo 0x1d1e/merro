@@ -6,6 +6,8 @@ Run `scripts/run-ci.sh`. Tests cross the interfaces used by Main, Pi commands/to
 
 - Uninitialized cwd refuses with `/merro init` guidance. Startup creates nothing and ignores initialized parents.
 - `/merro init` validates Pi/tmux and creates `.merro`/`.wt` in a writable directory without requiring Git, remotes or GitHub access. It registers no Projects and excludes local state when inside a Git working tree. Repeated init and startup preserve custom config, registered Projects and existing state.
+- Init reports the next registration/work steps. The command/tool walkthrough registers a Project, plans #42, waits for approval, starts its first Worker, and reaches a reviewed PR without lifecycle knowledge.
+- Optional Markdown reaches Main planning and fresh Task input without new config keys. Workspace/Project/role scoping, current-turn reads, future-Task snapshots, Pi/repository guidance preservation, and non-overridable safety are covered. Repeated init preserves Markdown; absent/blank files need no setup.
 - Combined #96/#97/#100 yields one ChangeSet, `.wt/plugin-lifecycle-safety`, semantic branch, sequential implementation/review flow and one PR with every closure. Internal dependencies do not become scheduling edges.
 - Review requires green command verification and receives all issue contents/acceptance criteria, full diff and implementation evidence. Reject creates fresh implementation and review attempts on the same branch.
 - Aggregate public plans, status, Task text, errors, PRs, review comments and notifications have no UUID-pattern matches or known private keys.
@@ -15,14 +17,14 @@ Run `scripts/run-ci.sh`. Tests cross the interfaces used by Main, Pi commands/to
 - Lifecycle events yield busy/progress/idle/finished; finished never regresses. Initial task input is accepted; subsequent interactive steering is blocked. Changed requirements cancel and replace the exact attempt.
 - Existing integrity/recovery gates remain: immutable finalization, stale/mismatched results, commit validation, infrastructure retry cap, review cap, relations/concurrency, external PR/base/policy mutations, safe cleanup and merge approval.
 
-Primary coverage: `test/workspace.test.ts`, `test/main.test.ts`, `test/worker-lifecycle.test.ts`, `test/worker-runtime.test.ts`, `test/owned-workers.test.ts`, `test/worker-isolation.test.ts`, `test/store.test.ts`, `test/main-result-validation.test.ts`.
+Primary coverage: `test/workspace.test.ts`, `test/guidance.test.ts`, `test/main.test.ts`, `test/worker-lifecycle.test.ts`, `test/worker-runtime.test.ts`, `test/owned-workers.test.ts`, `test/worker-isolation.test.ts`, `test/store.test.ts`, `test/main-result-validation.test.ts`.
 
 ## Native-runtime smoke check
 
 With real Pi/provider, tmux, Git and authenticated GitHub access, use a disposable repository/workspace:
 
 1. Load Merro before initialization: `/status` refuses and no state appears.
-2. `/merro init`, register a GitHub Project by path/name, propose one combined change, approve conversationally.
+2. Follow only the README quickstart: `/merro init`, register a GitHub Project by path/name, give issue work, approve conversationally. Confirm the init next steps and first Worker. Optionally add workspace/role/Project Markdown and verify only applicable instructions appear in fresh Task input.
 3. Attach to `merro-<project> / impl-<change>`. Confirm the actual Pi TUI, repository/normal host instructions and expected config/extensions are present; no print/JSON reconstruction.
 4. Observe implementation, green local verification, fresh review and one PR with all issue closures. A rejection must launch fresh Pi processes without changing branch.
 5. Exit/reopen Main while a Worker runs. Same Worker remains, state/activity survive, no duplicate window.

@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { CommandError, systemCommandRunner } from "../src/runtime/commands.js";
 import { initializeWorkspace, INITIALIZATION_REQUIRED, requireWorkspace } from "../src/runtime/workspace.js";
 import { MerroStore } from "../src/store/store.js";
+import { initializedState } from "./fixtures.js";
 
 const entrypoint = pathToFileURL(resolve("dist/src/index.js")).href;
 
@@ -14,12 +15,16 @@ test("Pi startup and tools refuse an uninitialized cwd without guessing its init
   const parent = await mkdtemp(join(tmpdir(), "merro-no-init-"));
   t.after(() => rm(parent, { recursive: true, force: true }));
   await mkdir(join(parent, ".merro"));
+  await writeFile(join(parent, ".merro", "WORKSPACE.md"), "Parent workspace instructions must not leak.");
   const cwd = join(parent, "child");
   await mkdir(cwd);
   const startup = `import assert from 'node:assert/strict'; import merro from ${JSON.stringify(entrypoint)};
     const commands=new Map(), tools=new Map(), events=new Map();
     await merro({registerCommand(name, command){commands.set(name,command)},registerTool(tool){tools.set(tool.name,tool)},on(name,handler){events.set(name,handler)}});
     await events.get('session_start')();
+    const options={sections:{normal:'Pi instructions'}};
+    await events.get('before_agent_start')({systemPromptOptions:options});
+    assert.deepEqual(options.sections,{normal:'Pi instructions'});
     await assert.rejects(commands.get('status').handler('',{}), {message:${JSON.stringify(INITIALIZATION_REQUIRED)}});
     await assert.rejects(tools.get('merro_status').execute('status',{}), {message:${JSON.stringify(INITIALIZATION_REQUIRED)}});
     await events.get('session_shutdown')();`;
@@ -52,7 +57,10 @@ for (const gitRepository of [false, true]) {
         await commands.get('merro-export').handler('',{});
       } finally { await events.get('session_shutdown')(); }`;
     const result = await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, MERRO_RUNTIME: "" } });
-    assert.match(result.stdout, /Merro initialized/);
+    assert.match(result.stdout, /Merro initialized\.\n\nNext: Register ~\/Projects\/my-app as my-app\nThen: Fix #42\./);
+    for (const file of ["WORKSPACE.md", "IMPLEMENTER.md", "REVIEWER.md", "projects/my-app.md"]) {
+      await assert.rejects(readFile(join(cwd, ".merro", file)), { code: "ENOENT" });
+    }
     await requireWorkspace(cwd);
     assert.deepEqual(JSON.parse(await readFile(join(cwd, ".merro", "export.json"), "utf8")).projects, []);
     await assert.rejects(readFile(join(root, "gh-called")), { code: "ENOENT" });
@@ -98,6 +106,9 @@ test("/merro init excludes local state and preserves explicitly registered Proje
   const customConfig = '{"max_concurrent_tasks":2,"max_review_rounds":3}\n';
   await writeFile(config, customConfig);
   await writeFile(join(cwd, ".merro", "runtime", "sentinel"), "preserved");
+  await mkdir(join(cwd, ".merro", "projects"));
+  const markdown = ["WORKSPACE.md", "IMPLEMENTER.md", "REVIEWER.md", "projects/kinetix.md"];
+  for (const file of markdown) await writeFile(join(cwd, ".merro", file), `Preserved ${file}`);
   const state = join(cwd, ".merro", "state.db");
   const store = new MerroStore(state);
   assert.equal(store.getProject("kinetix")?.baseRemote, "https://github.com/example/kinetix.git");
@@ -110,6 +121,7 @@ test("/merro init excludes local state and preserves explicitly registered Proje
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", restart], { cwd, env });
   assert.equal(await readFile(config, "utf8"), customConfig);
   assert.equal(await readFile(join(cwd, ".merro", "runtime", "sentinel"), "utf8"), "preserved");
+  for (const file of markdown) assert.equal(await readFile(join(cwd, ".merro", file), "utf8"), `Preserved ${file}`);
   const reopened = new MerroStore(state);
   assert.equal(reopened.getObjective("private-goal")?.goal, "Keep existing state");
   reopened.close();
@@ -117,6 +129,46 @@ test("/merro init excludes local state and preserves explicitly registered Proje
   for (const pattern of ["/.wt/", "/.merro/"]) assert.equal(exclude.split("\n").filter((line) => line === pattern).length, 1);
   await writeFile(join(cwd, ".wt", "sentinel"), "ignored");
   assert.equal(await git("status", "--short"), "");
+});
+
+test("Main reads current workspace and registered Project Markdown each turn while preserving Pi context", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "merro-main-markdown-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await initializedState(cwd);
+  const store = new MerroStore(join(cwd, ".merro", "state.db"));
+  for (const slug of ["kinetix", "kinetix-plugins"]) store.createProject({ slug, path: join(cwd, slug), baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" });
+  store.close();
+  await mkdir(join(cwd, ".merro", "projects"));
+  for (const [file, text] of [
+    ["WORKSPACE.md", "Deliver issues separately."],
+    ["IMPLEMENTER.md", "Implementer-only instructions."],
+    ["REVIEWER.md", "Reviewer-only instructions."],
+    ["projects/kinetix.md", "Kinetix-specific instructions."],
+    ["projects/kinetix-plugins.md", "Plugins-specific instructions."],
+    ["projects/unregistered.md", "Unregistered instructions."],
+  ] as const) await writeFile(join(cwd, ".merro", file), text);
+  const startup = `import assert from 'node:assert/strict'; import {writeFile,rm} from 'node:fs/promises'; import merro from ${JSON.stringify(entrypoint)};
+    const events=new Map();
+    await merro({registerCommand(){},registerTool(){},on(name,handler){events.set(name,handler)}});
+    const context=[{path:'AGENTS.md',content:'Normal repository instructions'}];
+    const options={sections:{other_extension:'Preserve this'},contextFiles:context,appendSystemPrompt:'Normal Pi prompt'};
+    const event={systemPromptOptions:options};
+    await events.get('before_agent_start')(event);
+    assert.equal(options.sections.other_extension,'Preserve this');
+    assert.strictEqual(options.contextFiles,context);
+    assert.equal(options.appendSystemPrompt,'Normal Pi prompt');
+    const guidance=options.sections.merro_workspace;
+    for(const text of ['Deliver issues separately.','Kinetix-specific instructions.','Plugins-specific instructions.','built-in safety invariants cannot be overridden','Repository AGENTS.md remains normal Pi/repository guidance']) assert.ok(guidance.includes(text),text);
+    assert.ok(!/Implementer-only|Reviewer-only|Unregistered/.test(guidance));
+    await writeFile('.merro/WORKSPACE.md','Updated delivery preferences.');
+    await events.get('before_agent_start')(event);
+    assert.ok(options.sections.merro_workspace.includes('Updated delivery preferences.'));
+    assert.ok(!options.sections.merro_workspace.includes('Deliver issues separately.'));
+    for(const file of ['WORKSPACE.md','projects/kinetix.md','projects/kinetix-plugins.md']) await rm('.merro/'+file);
+    await events.get('before_agent_start')(event);
+    assert.deepEqual(options.sections,{other_extension:'Preserve this'});
+    await events.get('session_shutdown')();`;
+  await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
 });
 
 test("initialization works without Git installed", async (t) => {

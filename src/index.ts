@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
 import { MainOrchestrator } from "./runtime/main.js";
+import { loadMarkdownGuidance, renderMarkdownGuidance } from "./runtime/guidance.js";
 import { isWorkspace } from "./runtime/workspace.js";
 import { publicText } from "./runtime/presentation.js";
 import { registerCommands, type PiExtensionLike } from "./tools/commands.js";
@@ -8,6 +9,7 @@ import { registerMainTools, type MainToolAPI } from "./tools/main.js";
 
 interface MerroExtensionAPI extends PiExtensionLike, MainToolAPI {
   on(event: "session_start" | "session_shutdown", handler: () => void | Promise<void>): void;
+  on(event: "before_agent_start", handler: (event: { systemPromptOptions: { sections: Record<string, string> } }) => Promise<void>): void;
 }
 
 export default async function merro(pi: MerroExtensionAPI): Promise<void> {
@@ -36,6 +38,13 @@ export default async function merro(pi: MerroExtensionAPI): Promise<void> {
   };
   registerCommands(pi, cwd, main, open);
   registerMainTools(pi, main);
+  pi.on("before_agent_start", async (event) => {
+    delete event.systemPromptOptions.sections.merro_workspace;
+    if (!(await isWorkspace(cwd))) return;
+    const projects = await main.listProjects();
+    const guidance = renderMarkdownGuidance(await loadMarkdownGuidance(cwd, projects.map((project) => project.slug)));
+    if (guidance) event.systemPromptOptions.sections.merro_workspace = guidance;
+  });
   pi.on("session_start", async () => { sessionStarted = true; await open(); });
   pi.on("session_shutdown", () => { sessionStarted = false; if (timer) clearInterval(timer); timer = undefined; });
 }

@@ -18,6 +18,8 @@ Task scratch is `.merro/runtime/tasks/<implement-or-review>-<change>-<attempt>/`
 
 Main writes fresh `.merro-task.md` in the clone, excluded through Git's local exclude file. It contains change name, all issue contents/acceptance criteria, relevant Objective, guidance, repository instructions, dependencies, expected commit and role instructions. Review additionally receives full `base...HEAD` diff, implementation summary and verification, and prior findings. Task text contains no private Task/Objective/Decision/ChangeSet keys. Task history retains the input; safe finalization removes the shared file only when no successor owns it.
 
+Optional workspace Markdown is read when Main composes each fresh Task: `.merro/WORKSPACE.md`, the applicable `IMPLEMENTER.md` or `REVIEWER.md`, and `.merro/projects/<project-slug>.md`. Contents are embedded in Task input for host and Docker; Workers do not need access to Main's `.merro`. Role files apply only to their role, Project files only to their Project. Missing/blank files are harmless; other read errors prevent launch with an actionable message. Edits affect future Tasks, not active Workers. Guidance precedence and non-overridable safety rules are defined in [CONTEXT.md](../CONTEXT.md); repository AGENTS.md remains normal Pi guidance.
+
 ## Lifecycle events and observation
 
 The lifecycle extension writes atomic `worker-state.json` beside the result:

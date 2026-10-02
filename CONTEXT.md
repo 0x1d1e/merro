@@ -54,6 +54,6 @@ Private counter preserving history when a terminal source needs new work. Never 
 4. Merge needs explicit per-PR approval unless the user merged externally. Main never force-pushes or rewrites finalized Task commits.
 5. GitHub owns issue/PR/policy/merge truth; Git owns commits and working copies; tmux/process identity owns worker liveness. Merro owns orchestration metadata.
 6. Requires unblocks only on actual completion, normally merge. Merro never auto-splits or auto-creates issues.
-7. Guidance precedence: current user instruction, ChangeSet guidance, Project guidance, repository instructions.
+7. Guidance precedence: current user instruction, approved ChangeSet guidance, Project guidance (including Markdown), workspace Markdown, Merro defaults. Built-in safety invariants cannot be overridden. Repository AGENTS.md remains normal Pi/repository guidance.
 
 For transitions and operational policy, read [lifecycle.md](docs/lifecycle.md). For worker contracts, read [worker-protocol.md](docs/worker-protocol.md).
