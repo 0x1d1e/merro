@@ -643,7 +643,7 @@ export class WorkerRuntime {
 
   async #cleanupRetainedHostPane(record: TaskRuntimeRecord): Promise<void> {
     const runtimeKind = record.runtimeKind ?? (record.containerId || this.#config.sandbox === "docker" ? "docker" : "host");
-    if (runtimeKind !== "host" || !record.paneId) return;
+    if (runtimeKind !== "host" || !record.paneId || !record.windowId) return;
     try {
       const output = (await this.#commands.run("tmux", [
         "display-message", "-p", "-t", record.paneId, "#{pane_id}\t#{window_id}\t#{pane_dead}",
@@ -655,11 +655,10 @@ export class WorkerRuntime {
       const taskWindowMatches = (await this.#commands.run("tmux", [
         "show-option", "-wqv", "-t", parts[0]!, "@merro_task_id",
       ])).stdout.trim() === record.taskId;
-      const identityMatches = taskWindowMatches && parts[0] === record.paneId
-        && (!record.windowId || parts[1] === record.windowId);
+      const identityMatches = taskWindowMatches && parts[0] === record.paneId && parts[1] === record.windowId;
       if (!identityMatches) throw new Error(`refusing to clean retained pane for Task ${record.taskId}: identity does not match`);
       if (parts[2] !== "1") throw new Error(`refusing to clean live worker pane for Task ${record.taskId}`);
-      await this.#commands.run("tmux", ["kill-window", "-t", record.windowId ?? record.paneId]);
+      await this.#commands.run("tmux", ["kill-window", "-t", record.windowId]);
     } catch (error) {
       if (missingTmuxTarget(error)) return;
       throw error;
