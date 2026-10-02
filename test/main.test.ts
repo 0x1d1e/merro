@@ -3326,11 +3326,12 @@ test("review cap ignores stopped Objective owners and uses the strictest active 
   assert.equal((await capped.main.statusSnapshot()).workItems[0]?.blockedReason, "review_cap");
 });
 
-test("cross-Project Objective reconciles dependencies, rework, external checks, approvals, and merges", async (t) => {
+test("cross-Project dependency DAG gates work through implement, review, fix, and merge", async (t) => {
   let apiReviewCount = 0;
   const { main, launches, pullRequests, setPullRequest } = await createHarness(t, {
     realWorkerPlan: true,
     projects: [
+      { slug: "core", issueNumbers: [10] },
       { slug: "api", issueNumbers: [1] },
       { slug: "web", issueNumbers: [2] },
       { slug: "tools", issueNumbers: [3] },
@@ -3355,39 +3356,78 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
   assert.deepEqual(discovered.map((issue) => issue.number), [1]);
   const started = await main.startObjective({
     goal: "Ship the connected Projects",
-    projectSlugs: ["api", "web", "tools"],
+    projectSlugs: ["core", "api", "web", "tools"],
     issues: [
+      { projectSlug: "core", numbers: [10] },
       { projectSlug: "api", numbers: [1] },
       { projectSlug: "web", numbers: [2] },
       { projectSlug: "tools", numbers: [3] },
     ],
   });
+  const core = started.workItems.find((item) => item.projectSlug === "core");
   const api = started.workItems.find((item) => item.projectSlug === "api");
   const web = started.workItems.find((item) => item.projectSlug === "web");
   const tools = started.workItems.find((item) => item.projectSlug === "tools");
-  assert.ok(api && web && tools);
-  await main.updateRelations([{
-    kind: "Requires",
-    from: web.id,
-    to: api.id,
-    confidence: "explicit",
-    rationale: "The web app requires the API contract.",
-    evidence: "The selected issues describe the same feature.",
-  }]);
-  assert.deepEqual(launches.map((launch) => launch.project.slug).sort(), ["api", "tools"]);
-  assert.ok(!launches.some((launch) => launch.project.slug === "web"));
+  assert.ok(core && api && web && tools);
+  await main.updateRelations([
+    {
+      kind: "Requires", from: api.id, to: core.id, confidence: "explicit",
+      rationale: "The API contract builds on core.", evidence: "The selected issues describe a dependency.",
+    },
+    {
+      kind: "Requires", from: web.id, to: api.id, confidence: "explicit",
+      rationale: "The web app requires the API contract.", evidence: "The selected issues describe a dependency.",
+    },
+    {
+      kind: "Requires", from: web.id, to: tools.id, confidence: "explicit",
+      rationale: "The web app also requires the tools package.", evidence: "The selected issues describe a dependency.",
+    },
+  ]);
+  assert.deepEqual(launches.map((launch) => launch.project.slug).sort(), ["core", "tools"]);
+  assert.ok(!launches.some((launch) => launch.project.slug === "api" || launch.project.slug === "web"));
 
   await main.runPass();
   await main.runPass();
   await main.runPass();
   await main.runPass();
-  const beforeExternalApproval = await main.statusSnapshot();
-  assert.equal(beforeExternalApproval.workItems.find((item) => item.id === api.id)?.state, "AwaitingMerge");
-  assert.equal(beforeExternalApproval.workItems.find((item) => item.id === tools.id)?.state, "AwaitingMerge");
-  assert.equal(beforeExternalApproval.workItems.find((item) => item.id === web.id)?.state, "Planned");
-  assert.equal(beforeExternalApproval.tasks.filter((task) => task.workItemId === api.id && task.role === "implement").length, 2);
-  assert.equal(beforeExternalApproval.tasks.filter((task) => task.workItemId === api.id && task.role === "review").map((task) => task.outcome).join(","), "reject,pass");
-  assert.equal(beforeExternalApproval.decisions.length, 0);
+  const beforeRootMerge = await main.statusSnapshot();
+  assert.equal(beforeRootMerge.workItems.find((item) => item.id === core.id)?.state, "AwaitingMerge");
+  assert.equal(beforeRootMerge.workItems.find((item) => item.id === tools.id)?.state, "AwaitingMerge");
+  assert.equal(beforeRootMerge.workItems.find((item) => item.id === api.id)?.state, "Planned");
+  assert.equal(beforeRootMerge.workItems.find((item) => item.id === web.id)?.state, "Planned");
+
+  for (const [number, pullRequest] of pullRequests) {
+    setPullRequest(number, {
+      reviewDecision: "APPROVED",
+      checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }],
+      reviews: [{ id: `approval-${number}`, author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: pullRequest.headRefOid }],
+    });
+  }
+  await main.runPass();
+  const rootApprovals = (await main.statusSnapshot()).decisions;
+  assert.equal(rootApprovals.length, 2);
+  const coreApproval = rootApprovals.find((decision) => decision.subjectId === core.id);
+  const rootToolsApproval = rootApprovals.find((decision) => decision.subjectId === tools.id);
+  assert.ok(coreApproval && rootToolsApproval);
+  await main.resolveMergeDecision(coreApproval.id, true);
+  assert.equal(launches.at(-1)?.project.slug, "api");
+  assert.ok(!launches.some((launch) => launch.project.slug === "web"));
+
+  await main.runPass();
+  await main.runPass();
+  const apiFix = launches.find((launch) => launch.project.slug === "api" && launch.role === "implement" && launch.taskFile.includes("Latest review"));
+  assert.ok(apiFix);
+  assert.ok(apiFix.taskFile.includes("blocking: Validate the response before returning it."));
+  await main.runPass();
+  await main.runPass();
+  const beforeUpstreamMerges = await main.statusSnapshot();
+  assert.equal(beforeUpstreamMerges.workItems.find((item) => item.id === api.id)?.state, "AwaitingMerge");
+  assert.equal(beforeUpstreamMerges.workItems.find((item) => item.id === web.id)?.state, "Planned");
+  assert.equal(beforeUpstreamMerges.tasks.filter((task) => task.workItemId === api.id && task.role === "implement").length, 2);
+  assert.equal(beforeUpstreamMerges.tasks.filter((task) => task.workItemId === api.id && task.role === "review").map((task) => task.outcome).join(","), "reject,pass");
+  const apiCycle = launches.filter((launch) => launch.workItemId === api.id);
+  assert.deepEqual(apiCycle.map((launch) => launch.role), ["implement", "review", "implement", "review"]);
+  assert.notEqual(apiCycle[1]?.expectedCommit, apiCycle[3]?.expectedCommit);
 
   for (const [number, pullRequest] of pullRequests) {
     setPullRequest(number, {
@@ -3403,16 +3443,21 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
   const toolsApproval = approvals.find((decision) => decision.subjectId === tools.id);
   assert.ok(apiApproval && toolsApproval);
   await main.resolveMergeDecision(apiApproval.id, true);
+  assert.ok(!launches.some((launch) => launch.project.slug === "web"));
+  assert.equal((await main.statusSnapshot()).workItems.find((item) => item.id === web.id)?.state, "Planned");
+  await main.resolveMergeDecision(toolsApproval.id, true);
   assert.equal(launches.at(-1)?.project.slug, "web");
   await main.runPass();
   await main.runPass();
   const webReview = launches.find((launch) => launch.project.slug === "web" && launch.role === "review");
   assert.ok(webReview);
-  assert.equal(webReview.dependencies?.length, 1);
-  const apiCheckout = webReview.dependencies?.[0]?.checkoutPath;
-  assert.ok(apiCheckout);
-  assert.equal((await readFile(join(apiCheckout, "MERRO_COMMIT"), "utf8")).trim(), "e".repeat(40));
+  assert.equal(webReview.dependencies?.length, 2);
+  assert.deepEqual(webReview.dependencies?.map((dependency) => dependency.projectSlug).sort(), ["api", "tools"]);
+  for (const dependency of webReview.dependencies ?? []) {
+    assert.equal((await readFile(join(dependency.checkoutPath, "MERRO_COMMIT"), "utf8")).trim(), "e".repeat(40));
+  }
   assert.ok(webReview.taskFile.includes("Read-only checkout: /merro-dependencies/1"));
+  assert.ok(webReview.taskFile.includes("Read-only checkout: /merro-dependencies/2"));
 
   const webPullRequest = [...pullRequests.entries()].find(([, pr]) => pr.headRefName.includes("2"));
   assert.ok(webPullRequest);
@@ -3425,12 +3470,11 @@ test("cross-Project Objective reconciles dependencies, rework, external checks, 
   const pending = (await main.statusSnapshot()).decisions;
   const webApproval = pending.find((decision) => decision.subjectId === web.id);
   assert.ok(webApproval);
-  await main.resolveMergeDecision(toolsApproval.id, true);
   await main.resolveMergeDecision(webApproval.id, true);
   const completed = await main.statusSnapshot();
   assert.ok(completed.workItems.every((item) => item.state === "Done"));
   assert.equal(completed.objectives[0]?.state, "Done");
-  assert.equal(completed.tasks.filter((task) => task.status === "finalized").length, 8);
+  assert.equal(completed.tasks.filter((task) => task.status === "finalized").length, 10);
 });
 
 test("deleted local clone is restored from the reviewed remote head", async (t) => {
