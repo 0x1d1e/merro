@@ -525,7 +525,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
           workerScript = command.slice(6, -1);
           return { stdout: "%7\n", stderr: "" };
         }
-        if (args[0] === "display-message") return { stdout: args.at(-1) === "#{window_id}" ? "@7" : args.at(-1) === "#{pane_pid}" ? "123\n" : "%7 123 0 node merro-sandbox-none impl-safety @7 1\n", stderr: "" };
+        if (args[0] === "display-message") return { stdout: args.at(-1) === "#{window_id}" ? "@7" : args.at(-1) === "#{pane_pid}" ? "123\n" : "%7\t123\t0\tnode\tmerro-sandbox-none\timpl-safety\t@7\t1\t\t\n", stderr: "" };
         return { stdout: "", stderr: "" };
       }
       if (file === "ps") return { stdout: args.at(-1) === "tpgid=" ? "123" : args[0] === "-eo" ? "123 123 node /usr/bin/node /opt/pi-coding-agent/dist/cli.js" : `${processStart}\n`, stderr: "" };
@@ -665,8 +665,9 @@ test("dead host pane preserves exit diagnostics and cleanup removes the retained
   assert.equal(presence.exitStatus, 0);
   assert.equal(presence.exitSignal, 15);
   assert.match(presence.reason ?? "", /signal 15/);
-  assert.ok(presence.diagnosticPath);
-  const diagnostics = await readFile(presence.diagnosticPath, "utf8");
+  const diagnosticPath = presence.diagnosticPath;
+  assert.ok(diagnosticPath);
+  const diagnostics = await readFile(diagnosticPath, "utf8");
   assert.match(diagnostics, /status=0/);
   assert.match(diagnostics, /signal=15/);
   assert.match(diagnostics, /reviewer was still working/);
@@ -674,5 +675,5 @@ test("dead host pane preserves exit diagnostics and cleanup removes the retained
   await runtime.cleanup(record);
   assert.equal(killed, true);
   assert.equal(await exists(join(workspacePath, "tasks", "implement-safety")), false);
-  assert.equal(await exists(presence.diagnosticPath), true);
+  assert.equal(await exists(diagnosticPath), true);
 });
