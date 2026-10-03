@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import type { MerroConfig, WorkerSettings } from "../config.js";
 import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type ChangeSet } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
@@ -17,7 +17,7 @@ import { normalizedVerification, renderPullRequestContent } from "./pr-content.j
 import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { requireWorkspace } from "./workspace.js";
-import { presentWorkspace, publicText, workerName } from "./presentation.js";
+import { formatChecks, objectiveName, presentChangeDetails, presentWorkspace, publicText, workerName } from "./presentation.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
@@ -37,6 +37,7 @@ export interface MainOptions {
   github?: GitHubAdapter;
   workers?: WorkerAdapter;
   notify?: (message: string, level?: "info" | "warning" | "error") => void;
+  progress?: (message: string) => void;
 }
 
 export interface ObjectiveProposal {
@@ -307,6 +308,11 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function conciseDiagnostic(value: string): string {
+  const line = value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+  return line.length > 240 ? `${line.slice(0, 237).trimEnd()}...` : line;
+}
+
 function isCommitSha(value: string | null): value is string {
   return value !== null && /^[0-9a-f]{40,64}$/i.test(value);
 }
@@ -317,6 +323,7 @@ export class MainOrchestrator {
   readonly #workRoot: string;
   readonly #config: MerroConfig;
   readonly #notify: (message: string, level?: "info" | "warning" | "error") => void;
+  readonly #progress: (message: string) => void;
   readonly #git: GitAdapter;
   readonly #github: GitHubAdapter;
   readonly #workers: WorkerAdapter;
@@ -334,6 +341,7 @@ export class MainOrchestrator {
     this.#config = options.config;
     const notify = options.notify ?? ((message: string) => console.log(message));
     this.#notify = (message, level) => notify(publicText(message, this.#names), level);
+    this.#progress = (message) => options.progress?.(publicText(message, this.#names));
     const commands = options.commands ?? systemCommandRunner;
     this.#commands = commands;
     this.#git = options.git ?? new GitClient(commands);
@@ -365,23 +373,11 @@ export class MainOrchestrator {
   }
 
   async publicSnapshot(): Promise<ReturnType<typeof presentWorkspace>> {
-    return this.#withStore(async (store) => {
-      const snapshot = presentWorkspace(store);
-      for (const item of store.listChangeSets()) {
-        const task = store.activeTask(item.id);
-        const runtime = task && store.getTaskRuntime(task.id);
-        const change = snapshot.changes.find((change) => change.name === changeName(item));
-        if (!runtime || !change) continue;
-        try {
-          const state: unknown = JSON.parse(await readFile(join(dirname(runtime.resultPath), "worker-state.json"), "utf8"));
-          if (typeof state === "object" && state !== null && "state" in state && ["busy", "idle", "finished"].includes(String(state.state))) {
-            change.workerState = String(state.state);
-            if ("lastActivity" in state) change.lastActivity = publicText(String(state.lastActivity), this.#names);
-          }
-        } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") change.lastActivity = "Worker state unreadable; reconciliation will verify identity."; }
-      }
-      return snapshot;
-    });
+    return this.#withStore((store) => presentWorkspace(store));
+  }
+
+  async changeDetails(name: string) {
+    return this.#withStore((store) => presentChangeDetails(store, semanticSlug(name)));
   }
 
   async statusSummary(): Promise<ReturnType<MerroStore["statusSummary"]>> {
@@ -507,7 +503,9 @@ export class MainOrchestrator {
 
     const groups: Array<{ name: string | null; projectSlug: string; issues: GitHubIssue[] }> = [];
     if (explicit) {
-      selections.forEach((selection, index) => groups.push({ name: selection.name, projectSlug: selection.projectSlug, issues: selectedGroups[index]! }));
+      for (const [index, selection] of selections.entries()) {
+        groups.push({ name: selection.name, projectSlug: selection.projectSlug, issues: selectedGroups[index]! });
+      }
     } else {
       for (const project of projects) {
         const issues = [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue);
@@ -643,7 +641,6 @@ export class MainOrchestrator {
         items.push(store.getChangeSet(item.id)!);
       }
       store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations, [], explicitRelations);
-      this.#notify(`Started ${items.map(changeName).join(", ")}.`);
       return { objective, changeSets: items };
     });
   }
@@ -693,55 +690,152 @@ export class MainOrchestrator {
       if (["Reviewing", "Reviewed", "Publishing", "AwaitingMerge"].includes(item.state)) store.transitionChangeSet(item.id, "Implementing");
       const workRuntime = store.getChangeSetRuntime(item.id);
       if (workRuntime) { workRuntime.infrastructureRetries = 0; store.saveChangeSetRuntime(workRuntime); }
-      this.#notify(`Stopped the previous attempt for ${item.slug}. Starting a fresh implementation with the changed requirements.`);
+      this.#progress(`${changeName(item)} · Updating requirements and restarting.`);
     });
     await this.runPass();
   }
 
-  async resolveDecisionForChange(name: string, approved: boolean): Promise<void> {
-    const id = await this.decisionForChange(name);
-    const kind = await this.#withStore((store) => store.getDecision(id)?.kind);
-    if (kind === "merge_conflict") await this.resolveMergeConflictDecision(id, approved ? "resolved" : "abandon");
-    else await this.resolveMergeDecision(id, approved);
+  async resolveDecisionForChange(name: string | undefined, approved: boolean): Promise<string> {
+    const requested = name?.trim() || undefined;
+    const alreadyMerged = () => this.#withStore((store) => {
+      const exact = requested ? store.getChangeSet(requested) : null;
+      const normalized = requested ? exact ? changeName(exact) : semanticSlug(requested) : undefined;
+      const matches = store.listChangeSets().filter((item) => (!normalized || changeName(item) === normalized)
+        && item.state === "Done" && !!store.getChangeSetRuntime(item.id)?.mergedCommitSha);
+      if (matches.length !== 1) return null;
+      const item = matches[0]!;
+      const runtime = store.getChangeSetRuntime(item.id)!;
+      return `Already merged: ${changeName(item)} · PR #${runtime.pullRequestNumber ?? "?"} merged.`;
+    });
+    let decisionId: string;
+    try {
+      decisionId = await this.decisionForChange(requested ?? "");
+    } catch (error) {
+      if (approved) {
+        const message = await alreadyMerged();
+        if (message) return message;
+      }
+      throw error;
+    }
+    const kind = await this.#withStore((store) => store.getDecision(decisionId)?.kind);
+    try {
+      if (kind === "merge_conflict") await this.resolveMergeConflictDecision(decisionId, approved ? "resolved" : "abandon");
+      else await this.resolveMergeDecision(decisionId, approved);
+    } catch (error) {
+      if (approved) {
+        const message = await alreadyMerged();
+        if (message) return message;
+      }
+      throw error;
+    }
+    const resolved = await this.#withStore((store) => {
+      const decision = store.getDecision(decisionId);
+      const item = decision && store.getChangeSet(decision.subjectId);
+      const runtime = item && store.getChangeSetRuntime(item.id);
+      return item && runtime ? { name: changeName(item), state: item.state, pr: runtime.pullRequestNumber } : null;
+    });
+    if (!resolved) return "Decision resolved.";
+    if (approved && resolved.state === "Done") return `Merged: ${resolved.name} · PR #${resolved.pr ?? "?"}.`;
+    if (kind === "merge_conflict") return approved ? `Approved a fresh implementation for ${resolved.name}.` : `Left ${resolved.name} unchanged.`;
+    return approved ? `Merge approved for ${resolved.name}.` : `Left PR #${resolved.pr ?? "?"} open.`;
   }
 
   async decisionForChange(name = ""): Promise<string> {
     return this.#withStore((store) => {
+      const exact = name ? store.getChangeSet(name) : null;
+      const normalized = name ? exact ? changeName(exact) : semanticSlug(name) : "";
       const matches = store.pendingDecisions().filter((decision) => {
         const item = store.getChangeSet(decision.subjectId);
-        return !name || item && changeName(item) === semanticSlug(name);
+        return !normalized || item && changeName(item) === normalized;
       });
-      if (matches.length !== 1) throw new Error(matches.length ? "Which change? Name the change you want to approve." : "No pending decision for that change.");
+      if (matches.length > 1) {
+        const names = matches.map((decision) => {
+          const item = store.getChangeSet(decision.subjectId);
+          return item ? changeName(item) : "change";
+        });
+        throw new Error(`Choose a change: ${names.join(", ")}.`);
+      }
+      if (matches.length === 0) throw new Error(name ? `No pending decision for ${normalized}.` : "No pending decisions.");
       return matches[0]!.id;
     });
   }
 
   async stopObjectives(objectiveId?: string): Promise<number> {
     const stopped = await this.#withStore((store) => {
-      const objective = objectiveId ? store.listObjectives().find((entry) => entry.id === objectiveId || entry.goal === objectiveId
-        || store.listChangeSets(entry.id).some((item) => changeName(item) === objectiveId)) : undefined;
-      if (objectiveId && !objective) throw new Error("No active objective matches that name.");
+      const objectives = store.listObjectives();
+      const exactObjective = objectiveId ? objectives.find((entry) => entry.id === objectiveId) : undefined;
+      const exactChange = objectiveId ? store.getChangeSet(objectiveId) : null;
+      const objectiveSlug = objectiveId ? exactObjective ? objectiveName(exactObjective.goal)
+        : exactChange ? changeName(exactChange) : semanticSlug(objectiveId) : undefined;
+      const objective = objectiveId ? objectives.find((entry) => entry.id === objectiveId || entry.goal === objectiveId
+        || objectiveName(entry.goal) === objectiveSlug
+        || store.listChangeSets(entry.id).some((item) => changeName(item) === objectiveSlug)) : undefined;
+      if (objectiveId && !objective) throw new Error("No active Objective matches that name.");
       return store.stopActiveObjectives(objective?.id);
     });
     await this.runPass();
     return stopped;
   }
 
-  async continueChangeSet(changeSetId: string): Promise<void> {
-    await this.#withStore((store) => {
-      const item = store.getChangeSet(changeSetId) ?? store.listChangeSets().find((item) => changeName(item) === semanticSlug(changeSetId));
-      if (!item || (item.state !== "Blocked" && item.state !== "PublishBlocked") || !item.blockedResumeState) throw new Error(`ChangeSet ${changeSetId} is not Blocked`);
-      if (item.blockedReason === "policy_unknown" && store.latestBlock(item.id)?.retryable === false) {
-        throw new Error(`${changeName(item)} is blocked by deterministic GitHub branch policy. Fix the rules or API response; /merro-continue cannot help and Main will retry during reconciliation.`);
+  async retryChangeSet(name?: string): Promise<string> {
+    const result = await this.#withStore((store) => {
+      const requested = name?.trim() || undefined;
+      const changes = store.listChangeSets();
+      const exact = requested ? store.getChangeSet(requested) : null;
+      const normalized = requested ? exact ? changeName(exact) : semanticSlug(requested) : undefined;
+      const selected = normalized ? exact ?? changes.find((item) => changeName(item) === normalized) : undefined;
+      if (normalized && !selected) return { message: `Nothing to retry. No change named ${normalized}.` };
+      if (selected?.state === "Done") {
+        const runtime = store.getChangeSetRuntime(selected.id);
+        return { message: runtime?.mergedCommitSha
+          ? `Already done: ${changeName(selected)} · PR #${runtime.pullRequestNumber ?? "?"} merged.`
+          : `Already done: ${changeName(selected)}.` };
       }
-      store.transitionChangeSet(item.id, item.blockedResumeState);
+      const retryable = (item: ChangeSet) => (item.state === "Blocked" || item.state === "PublishBlocked")
+        && !!item.blockedResumeState
+        && item.blockedReason !== "github_unavailable"
+        && item.blockedReason !== "project_unavailable"
+        && store.latestBlock(item.id)?.retryable !== false;
+      let candidates = (normalized ? selected ? [selected] : [] : changes).filter(retryable);
+      if (!normalized && candidates.length > 1) return { message: `Choose a change to retry: ${candidates.map(changeName).join(", ")}.` };
+      const item = candidates[0];
+      if (!item) {
+        if (selected?.state === "AwaitingMerge" && store.getChangeSetRuntime(selected.id)?.githubReviewDecision?.toUpperCase() === "REVIEW_REQUIRED") {
+          return { message: `Nothing to retry. ${changeName(selected)} needs GitHub reviewer approval.` };
+        }
+        if (!normalized) {
+          const waiting = changes.filter((candidate) => candidate.state === "AwaitingMerge"
+            && store.getChangeSetRuntime(candidate.id)?.githubReviewDecision?.toUpperCase() === "REVIEW_REQUIRED");
+          if (waiting.length === 1) return { message: `Nothing to retry. ${changeName(waiting[0]!)} needs GitHub reviewer approval.` };
+          if (waiting.length > 1) return { message: `Nothing to retry. These changes need GitHub reviewer approval: ${waiting.map(changeName).join(", ")}.` };
+        }
+        const blocked = selected && (selected.state === "Blocked" || selected.state === "PublishBlocked") ? selected
+          : !normalized ? changes.find((candidate) => (candidate.state === "Blocked" || candidate.state === "PublishBlocked")
+            && candidate.blockedReason === "policy_unknown" && store.latestBlock(candidate.id)?.retryable === false) : undefined;
+        if (blocked?.blockedReason === "policy_unknown") {
+          return { message: `Nothing to retry. ${changeName(blocked)} is blocked by a GitHub branch rule Merro cannot interpret. Change the rule; Merro will check again automatically.` };
+        }
+        if (selected && (selected.state === "Blocked" || selected.state === "PublishBlocked")
+          && (selected.blockedReason === "github_unavailable" || selected.blockedReason === "project_unavailable")) {
+          return { message: `Nothing to retry. Merro will retry ${changeName(selected)} automatically when GitHub is available.` };
+        }
+        return { message: normalized ? `Nothing to retry. ${changeName(selected!)} is not waiting for a retry.` : "Nothing to retry." };
+      }
+      store.transitionChangeSet(item.id, item.blockedResumeState!);
       const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
       if (item.blockedReason === "review_cap" || item.blockedReason === "task_failed") runtime.infrastructureRetries = 0;
       if (item.blockedReason === "review_cap") runtime.reviewRound = 0;
       store.saveChangeSetRuntime(runtime);
-      this.#notify(`Continued ${changeName(item)}.`);
+      return { name: changeName(item) };
     });
+    if ("message" in result) return result.message;
     await this.runPass();
+    return `Retrying ${result.name}.`;
+  }
+
+  async continueChangeSet(changeSetId: string): Promise<void> {
+    const result = await this.retryChangeSet(changeSetId);
+    if (!result.startsWith("Retrying ")) throw new Error(result);
   }
 
   async resolveMergeDecision(decisionId: string, approved: boolean): Promise<void> {
@@ -829,7 +923,7 @@ export class MainOrchestrator {
           store.resolveDecision(decisionId, "resolved");
           runtime.reviewedDiffHash = null;
           store.saveChangeSetRuntime(runtime);
-          this.#notify(`Merge approval for ChangeSet ${item.id} expired because the pull request diff changed or is no longer merge-ready.`, "warning");
+          this.#notify(`${changeName(item)} · Merge approval expired because the pull request changed. Review is next.`, "warning");
           return;
         }
         if (runtime.reviewedDiffHash === null) {
@@ -1196,7 +1290,7 @@ export class MainOrchestrator {
             resumed = true;
           }
         }
-        if (resumed) this.#notify(`Project ${current.slug} is available again; affected changes resumed.`, "info");
+        if (resumed) this.#progress(`${current.slug} · GitHub is available again.`);
       } catch (error) {
         unavailable.add(current.slug);
         const cause = isTransientGitHubFailure(error)
@@ -1207,7 +1301,7 @@ export class MainOrchestrator {
             this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${cause}`);
           }
         }
-        this.#notify(`Project ${current.slug} is unavailable: ${cause}\nMain will retry automatically and resume affected changes after recovery.`, "warning");
+        this.#notify(`${current.slug} · GitHub is unavailable. Merro will retry automatically.`, "warning");
       }
     }
     return unavailable;
@@ -1340,7 +1434,7 @@ export class MainOrchestrator {
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = "OPEN";
     store.saveChangeSetRuntime(runtime);
-    this.#notify(`Reopened issue #${issue.number} created ChangeSet generation ${generation}.`);
+    this.#progress(`Issue #${issue.number} reopened · ${changeName(item)} is working again.`);
   }
 
   async #validateNewExplicitRelations(
@@ -1422,13 +1516,16 @@ export class MainOrchestrator {
             unsafeProjects.add(item.projectSlug);
             changeSetIds.add(item.id);
           } else for (const registered of projects) unsafeProjects.add(registered.slug);
-          this.#notify(`${recordedTask ? "Worker for finalized Task" : "Orphan worker"} in Project ${item?.projectSlug ?? project.slug}${item ? ` for ${item.slug}` : ""}. Inspect tmux ${worker.tmuxSession ?? "unavailable"} / ${worker.tmuxWindow ?? "unavailable"}${worker.containerId ? " and its Docker worker" : ""}. Scheduling gated; worker not adopted or stopped.`, "warning");
+          const concern = recordedTask
+            ? "A background process is still attached to completed work"
+            : "Merro found unrecognized background work";
+          this.#notify(`${item ? changeName(item) : project.slug} · ${concern} in ${project.slug}. New work is paused to protect changes; inspect and stop the process before resuming. Merro will not adopt or stop it.`, "warning");
         }
       } catch (error) {
         // An incomplete inventory cannot prove that a clone is unowned.
         unsafeProjects.add(project.slug);
         for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === project.slug)) changeSetIds.add(item.id);
-        this.#notify(`Could not enumerate owned workers for Project ${project.slug}; scheduling gated: ${errorText(error)}`, "warning");
+        this.#notify(`${project.slug} · Merro could not inspect background work: ${errorText(error)}. New work is paused to protect changes; it will check again automatically.`, "warning");
       }
     }
     return { unsafeProjects, count: orphanIds.size, changeSetIds, liveTaskIds };
@@ -1468,15 +1565,15 @@ export class MainOrchestrator {
         try {
           presence = await this.#workers.inspect(runtime, task.id);
         } catch (inspectionError) {
-          const detail = `Could not inspect active Task ${task.id}; reconciliation will retry: ${errorText(inspectionError)}`;
+          const detail = `Merro could not verify current work for ${changeName(item)}; reconciliation will retry: ${errorText(inspectionError)}`;
           if (item.issues.length) this.#blockForGitHubUnavailable(store, item, detail);
-          else this.#notify(detail, "warning");
+          else this.#notify(`${changeName(item)} · Could not inspect the active work: ${errorText(inspectionError)}. Scheduling is paused; Merro will retry automatically.`, "warning");
           continue;
         }
         if (presence.alive) {
           if (!presence.identityMatches) {
             unsafeProjects.add(item.projectSlug);
-            this.#notify(`${item.slug}: ${presence.reason ?? "Worker identity is ambiguous"}. Scheduling paused; inspect the worker before retrying.`, "warning");
+            this.#notify(`${changeName(item)} · Merro cannot verify the current process${presence.reason ? `: ${presence.reason}` : ""}. Scheduling is paused until it can be checked safely.`, "warning");
           }
           continue;
         }
@@ -1498,7 +1595,7 @@ export class MainOrchestrator {
         if (workRuntime.infrastructureRetries < 1) {
           workRuntime.infrastructureRetries += 1;
           store.saveChangeSetRuntime(workRuntime);
-          this.#notify(`Retrying ChangeSet ${item.id} once after worker infrastructure failure.`, "warning");
+          // Infrastructure retry is reflected by the current Working state, not a permanent progress message.
         } else {
           this.#block(store, item, "task_failed", `Worker exited without a valid result after one infrastructure retry: ${reason}`);
         }
@@ -1556,7 +1653,8 @@ export class MainOrchestrator {
         await this.#workers.cleanup(runtime, { preserveResult, preserveTaskInput: activeInputs.has(runtime.taskFilePath) });
         store.markTaskCleanupCompleted(task.id);
       } catch (error) {
-        this.#notify(`Could not clean up finalized Task ${task.id}; reconciliation will retry: ${errorText(error)}`, "warning");
+        const item = store.getChangeSet(task.changeSetId);
+        this.#notify(`${item ? changeName(item) : "A completed change"} · Cleanup failed: ${errorText(error)}. Merro will retry automatically.`, "warning");
       }
     }
   }
@@ -1590,8 +1688,8 @@ export class MainOrchestrator {
         workRuntime.baseUpdate = null;
         store.saveChangeSetRuntime(workRuntime);
       }
-      const message = `${changeName(item)} implementation complete; local verification passed. Review is next.`;
-      this.#notify(message);
+      const message = `${changeName(item)} · Local verification passed; reviewing the change.`;
+      this.#progress(message);
       this.#queueNotification("implementation_complete", item.id, message);
       if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) store.transitionChangeSet(item.id, "Reviewing");
       return;
@@ -1608,8 +1706,9 @@ export class MainOrchestrator {
       store.finalizePassingReview({ id: task.id, summary: review.summary, resultJson: JSON.stringify(review), reviewedCommit: review.reviewed_commit });
     } else {
       store.finalizeTask({ id: task.id, outcome: "reject", summary: review.summary, resultJson: JSON.stringify(review), reviewedCommit: review.reviewed_commit });
-      const message = `${changeName(item)} review complete; changes requested. Fresh implementation and review are next.`;
-      this.#notify(message);
+      const count = review.findings.filter((finding) => finding.severity === "blocking").length;
+      const message = `${changeName(item)} · Review found ${count} issue${count === 1 ? "" : "s"}; fixing automatically.`;
+      this.#progress(message);
       this.#queueNotification("review_complete", item.id, message);
     }
     if (this.#obsoleteIfUnowned(store, store.getChangeSet(item.id) ?? item, unsafeProjects)) return;
@@ -1630,8 +1729,8 @@ export class MainOrchestrator {
 
   #notifyReviewComplete(store: MerroStore, item: ChangeSet, task: Task): void {
     if (store.hasEvent("Task", task.id, "review_complete_notified")) return;
-    const message = `${changeName(item)} review complete; publication pending.`;
-    this.#notify(message);
+    const message = `${changeName(item)} · Review passed; opening PR.`;
+    this.#progress(message);
     this.#queueNotification("review_complete", item.id, message);
     store.appendEvent("Task", task.id, "review_complete_notified", {});
   }
@@ -1653,6 +1752,9 @@ export class MainOrchestrator {
       if (item.state === "Reviewed" || retrying) {
         store.transitionChangeSet(item.id, "Publishing");
         item = store.getChangeSet(item.id)!;
+      }
+      if (!store.hasEvent("ChangeSet", item.id, "publication_started_notified")) {
+        store.appendEvent("ChangeSet", item.id, "publication_started_notified", {});
       }
       try {
         if (!project || !workRuntime?.clonePath || !workRuntime.branchName || !reviewTask?.resultJson) throw new Error("Project branch or passing review is missing. Restore reviewed state before retrying.");
@@ -1697,7 +1799,7 @@ export class MainOrchestrator {
         workRuntime.reviewedDiffHash = await this.#git.effectiveDiffFingerprint(project, workRuntime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid);
         store.saveChangeSetRuntime(workRuntime);
         store.transitionChangeSet(item.id, "AwaitingMerge");
-        this.#notify(`${changeName(item)} publication complete: ${pullRequest.url}. Awaiting checks and merge approval.`);
+        this.#progress(`${changeName(item)} · PR opened: #${pullRequest.number}.`);
       } catch (error) {
         this.#blockPublication(store, item, error, retrying);
       }
@@ -1712,9 +1814,11 @@ export class MainOrchestrator {
     store.transitionChangeSet(item.id, "PublishBlocked", reason);
     if (automaticRetry && previous?.reason === reason && previous.detail === detail) return;
     store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable: true });
-    const message = `${changeName(item)} review complete, publication blocked: ${detail}\n${reason === "github_unavailable" ? "Main will retry publication automatically after GitHub recovers. " : ""}Fix the cause, then /merro-continue ${changeName(item)}. Completed implementation and review will not rerun.`;
+    const view = presentWorkspace(store).changes.find((change) => change.name === changeName(item));
+    const pr = store.getChangeSetRuntime(item.id)?.pullRequestNumber;
+    const message = `${changeName(item)}\nBlocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "Merro could not open the pull request."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
     this.#notify(message, "warning");
-    this.#queueNotification("publication_blocked", item.id, message);
+    this.#queueNotification("publication_blocked", item.id, `${message}\nDetails: ${detail}`);
   }
 
   async #reconcilePullRequests(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<void> {
@@ -1734,7 +1838,7 @@ export class MainOrchestrator {
             this.#savePullRequest(store, runtime, pullRequest);
             if (pullRequest.mergedAt) {
               if (!isCommitSha(pullRequest.mergeCommitSha)) {
-                this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
+                // GitHub confirms the merge; the current status shows that Merro is verifying completion.
                 continue;
               }
               await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
@@ -1764,7 +1868,7 @@ export class MainOrchestrator {
         this.#savePullRequest(store, runtime, pullRequest);
         if (pullRequest.mergedAt) {
           if (!isCommitSha(pullRequest.mergeCommitSha)) {
-            this.#notify(`Merged pull request ${pullRequest.url} has no valid merge commit SHA; reconciliation will retry.`, "warning");
+            // GitHub confirms the merge; the current status shows that Merro is verifying completion.
             continue;
           }
           await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
@@ -1813,7 +1917,7 @@ export class MainOrchestrator {
           }
           if (remoteHead !== pullRequest.headRefOid) {
             this.#resolveMergeDecisions(store, item.id);
-            this.#notify(`Pull request ${pullRequest.url} head does not match its remote branch yet; reconciliation will retry.`, "warning");
+            // GitHub branch updates can lag; the next reconciliation checks again.
             continue;
           }
         }
@@ -1853,7 +1957,7 @@ export class MainOrchestrator {
               detail: "GitHub reports conflicts with the updated base; an implementer must resolve and verify them.",
             },
           });
-          this.#notify(`${changeName(item)} has a base merge conflict: ${pullRequest.url}. Approve a fresh implementation attempt to resolve it?`, "warning");
+          this.#notify(`${changeName(item)}\nNeeds you · PR #${pullRequest.number} · Merge conflicts need a resolution.\nApprove a fresh attempt? /merro approve ${changeName(item)} · Leave unchanged: /merro leave ${changeName(item)}`, "warning");
           continue;
         }
         if (runtime.baseCommit !== null && pullRequest.baseRefOid !== runtime.baseCommit) {
@@ -1875,7 +1979,7 @@ export class MainOrchestrator {
           } else {
             store.transitionChangeSet(item.id, "Implementing");
           }
-          this.#notify(`Pull request ${pullRequest.url} has a failed required check or a new change-request review; scheduling fresh implementation and review.`, "warning");
+          // The single GitHub checks field in /merro explains failed required checks.
           continue;
         }
         if (!runtime.clonePath) throw new Error("cannot compare the pull request diff without a ChangeSet clone");
@@ -1893,7 +1997,7 @@ export class MainOrchestrator {
           }
           await this.#git.syncBranchHead(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
           store.transitionChangeSet(item.id, "Reviewing");
-          this.#notify(`Pull request ${pullRequest.url} changed since its last reviewed diff; scheduling a fresh review.`, "warning");
+          // The Working state shows that Merro is checking the latest changes.
           continue;
         }
         if (runtime.reviewedDiffHash === null) {
@@ -1921,11 +2025,11 @@ export class MainOrchestrator {
             title: pullRequest.title,
             headRefOid: pullRequest.headRefOid,
             diffHash: currentDiffHash,
-            summary: store.listTasks(item.id).filter((task) => task.role === "implement" || task.role === "review").map((task) => task.summary).filter(Boolean),
           },
         });
-        const message = `${changeName(item)} is ready to merge: ${pullRequest.url}. Approve?`;
-        this.#notify(message);
+        const checks = formatChecks({ source: "GitHub", state: runtime.githubChecks === "green" ? "passed" : runtime.githubChecks === "failed" ? "failed" : runtime.githubChecks === "pending" ? "waiting" : "not reported", observedAt: runtime.githubChecksAt ?? null }, true);
+        const message = `${changeName(item)}\nReady to merge · PR #${pullRequest.number}\n${checks} · Merro review passed\n\nApprove merge? /merro approve ${changeName(item)} · Leave open: /merro leave ${changeName(item)}`;
+        this.#notify(message, "warning");
         this.#queueNotification("merge_ready", item.id, message);
       } catch (error) {
         this.#blockForGitHubUnavailable(store, item, `GitHub reconciliation failed: ${errorText(error)}`);
@@ -1939,7 +2043,7 @@ export class MainOrchestrator {
     if (terminal(current)) return;
     if (current.state === "Blocked") {
       if (current.blockedReason !== "github_unavailable" || !current.blockedResumeState) {
-        this.#notify(`ChangeSet ${current.id} remains blocked (${current.blockedReason ?? "unknown"}) after: ${detail}`, "warning");
+        this.#notify(`${changeName(current)} remains blocked. Merro will check again automatically.`, "warning");
         return;
       }
       store.transitionChangeSet(current.id, current.blockedResumeState);
@@ -1981,16 +2085,17 @@ export class MainOrchestrator {
       item.id,
       finalMergeSummary(store, item, runtime, pullRequest),
     );
-    if (newlyCompleted) this.#notify(`ChangeSet ${item.id} merged and Done.`);
+    if (newlyCompleted) this.#notify(`${changeName(item)} done · PR #${pullRequest.number} merged.`);
 
     if (item.issues.length) {
       try {
         const issues = await this.#github.issues(project, issueNumbers(item));
         for (const issue of issues) {
-          if (issue.state.toUpperCase() !== "CLOSED") this.#notify(`GitHub issue #${issue.number} remains open after merging ${pullRequest.url}; verify its Closes directive.`, "warning");
+          if (issue.state.toUpperCase() !== "CLOSED") this.#notify(`Issue #${issue.number} is still open after the pull request merged. Check the issue on GitHub.`, "warning");
         }
       } catch (error) {
-        this.#notify(`Could not verify issue closures for ${changeName(item)} after merging ${pullRequest.url}: ${errorText(error)}`, "warning");
+        const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
+        this.#notify(`${changeName(item)} merged, but Merro could not confirm whether its issues closed. Check GitHub. Details: ${detail}`, "warning");
       }
     }
 
@@ -1998,7 +2103,7 @@ export class MainOrchestrator {
       try {
         await this.#git.deleteClone(this.#workRoot, runtime.clonePath);
       } catch (error) {
-        this.#notify(`Could not clean up terminal ChangeSet clone ${runtime.clonePath}: ${errorText(error)}`, "warning");
+        this.#notify(`${changeName(item)} is done, but Merro could not remove its working copy: ${errorText(error)}. Remove it manually if disk space is a concern.`, "warning");
       }
     }
   }
@@ -2012,6 +2117,8 @@ export class MainOrchestrator {
     const states = pr.checks.map((check) => (check.conclusion ?? check.state).toUpperCase());
     runtime.githubChecks = !states.length ? "none" : states.some((state) => failed.has(state)) ? "failed"
       : states.every((state) => successful.has(state)) ? "green" : "pending";
+    runtime.githubChecksAt = new Date().toISOString();
+    runtime.githubReviewDecision = pr.reviewDecision?.toUpperCase() ?? null;
     runtime.pullRequestHeadSha = pr.headRefOid;
     runtime.pullRequestBaseSha = pr.baseRefOid;
     if (pr.mergedAt && isCommitSha(pr.mergeCommitSha)) runtime.mergedCommitSha = pr.mergeCommitSha;
@@ -2025,7 +2132,7 @@ export class MainOrchestrator {
     if (current && !terminal(current) && !store.activeTask(item.id)) {
       store.transitionChangeSet(item.id, "Obsolete");
       this.#resolvePullRequestDecisions(store, item.id);
-      this.#notify(`ChangeSet ${item.id} is obsolete because no active Objective owns it.`);
+      // Ownerless changes are omitted from the user-facing active-work view.
     }
     return true;
   }
@@ -2067,12 +2174,13 @@ export class MainOrchestrator {
           relations.push(...analysis.relations);
           if (analysis.unresolved.length > 0) {
             gated.add(item.id);
-            this.#notify(`${changeName(item)} awaits relation analysis: unresolved references ${analysis.unresolved.join(", ")} outside approved work.`, "warning");
+            this.#notify(`${changeName(item)} cannot start because ${analysis.unresolved.join(", ")} is outside approved work. Add it to the Objective or remove the dependency.`, "warning");
           }
         }
       } catch (error) {
         gated.add(item.id);
-        this.#notify(`ChangeSet ${item.id} awaits relation analysis: ${errorText(error)}`, "warning");
+        const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
+        this.#notify(`${changeName(item)} · Merro could not refresh dependency information. It will retry automatically. Details: ${detail}`, "warning");
       }
     }
     store.rebuildAutomaticRelations(analyzed, relations, [...occupiedChangeSetIds]);
@@ -2121,20 +2229,15 @@ export class MainOrchestrator {
     if (!changed) return;
     if (current.state !== "Blocked" || current.blockedReason !== reason) store.transitionChangeSet(item.id, "Blocked", reason);
     store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable });
-    const dependents = store.listRelations()
-      .filter((relation) => relation.kind === "Requires" && relation.to === item.id)
-      .map((relation) => store.getChangeSet(relation.from))
-      .filter((dependent): dependent is ChangeSet => dependent !== null)
-      .map((dependent) => `${changeName(dependent)} (${dependent.state})`);
-    const dependentsNote = dependents.length > 0 ? ` Direct dependents: ${dependents.join(", ")}.` : "";
-    const recovery = reason === "project_unavailable"
-      ? "Main will retry automatically and resume this change after Project reconciliation succeeds. No manual continuation is needed."
-      : retryable
-        ? `Retry available after fixing the cause: /merro-continue ${changeName(item)}`
-        : "Fix the underlying GitHub policy/API response; Main will retry on reconciliation. /merro-continue cannot retry this deterministic blocker.";
-    const message = `${changeName(item)} blocked\n\n${publicText(detail, this.#names)}.${dependentsNote}\n${recovery}`;
+    const view = presentWorkspace(store).changes.find((change) => change.name === changeName(item));
+    const pr = store.getChangeSetRuntime(item.id)?.pullRequestNumber;
+    const dependents = store.listRelations().filter((relation) => relation.kind === "Requires" && relation.to === item.id)
+      .map((relation) => store.getChangeSet(relation.from)).filter((dependent): dependent is ChangeSet => dependent !== null)
+      .map(changeName);
+    const waiting = dependents.length ? `\nAlso waiting: ${dependents.join(", ")}.` : "";
+    const message = `${changeName(item)}\nBlocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "This change needs attention."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${waiting}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
     this.#notify(message, "warning");
-    this.#queueNotification("blocked", item.id, message);
+    this.#queueNotification("blocked", item.id, `${message}${detail ? `\nDetails: ${detail}` : ""}`);
   }
 
   #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" {
@@ -2181,7 +2284,7 @@ export class MainOrchestrator {
     runtime.reviewedDiffHash = null;
     store.saveChangeSetRuntime(runtime);
     store.transitionChangeSet(item.id, "Implementing");
-    this.#notify(`Scheduling an implementer to merge and verify the updated base for ${pullRequest.url}, then a fresh review.`, "warning");
+    this.#progress(`${changeName(item)} · The pull request's base changed; Merro is rechecking the changes.`);
   }
 
   #attachIssue(store: MerroStore, objective: Objective, projectSlug: string, issue: GitHubIssue): ChangeSet {
@@ -2248,7 +2351,8 @@ export class MainOrchestrator {
           for (const item of store.listChangeSets(objective.id)) {
             if (item.projectSlug === scope.projectSlug) schedulingGates.add(item.id);
           }
-          this.#notify(`Objective ${objective.id} remains Active: approved scope for Project '${scope.projectSlug}' could not be refreshed: ${errorText(error)}`, "warning");
+          const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
+          this.#notify(`${objectiveName(objective.goal)} · Could not refresh the approved GitHub scope for ${scope.projectSlug}. Merro will retry automatically. Details: ${detail}`, "warning");
         }
       }
       for (const item of store.listChangeSets(objective.id)) {
@@ -2272,7 +2376,8 @@ export class MainOrchestrator {
         } catch (error) {
           refreshed = false;
           schedulingGates.add(item.id);
-          this.#notify(`Objective ${objective.id} scope removal for ${item.id} could not be checked: ${errorText(error)}`, "warning");
+          const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
+          this.#notify(`${changeName(item)} · Could not verify whether it is still in the approved GitHub scope. Merro will retry automatically. Details: ${detail}`, "warning");
         }
       }
       const attached = new Map<string, ChangeSet>();
@@ -2302,7 +2407,8 @@ export class MainOrchestrator {
       return refreshed;
     } catch (error) {
       for (const item of store.listChangeSets(objective.id)) schedulingGates.add(item.id);
-      this.#notify(`Objective ${objective.id} remains Active: approved GitHub scope could not be refreshed: ${errorText(error)}`, "warning");
+      const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
+      this.#notify(`${objectiveName(objective.goal)} · Could not refresh its approved GitHub scope. Merro will retry automatically. Details: ${detail}`, "warning");
       return false;
     }
   }
@@ -2320,7 +2426,7 @@ export class MainOrchestrator {
       if (!await this.#refreshObjectiveScope(store, objective, unavailableProjects, new Set(), unsafeProjects, issueCache)) continue;
       if (!store.listChangeSets(objective.id).every(terminal)) continue;
       store.setObjectiveState(objective.id, "Done");
-      const message = `${objective.goal} is Done.`;
+      const message = `${objectiveName(objective.goal)} done.`;
       this.#notify(message);
       this.#queueNotification("objective_done", objective.id, message);
     }

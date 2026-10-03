@@ -57,7 +57,8 @@ for (const gitRepository of [false, true]) {
         await commands.get('merro-export').handler('',{});
       } finally { await events.get('session_shutdown')(); }`;
     const result = await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, MERRO_RUNTIME: "" } });
-    assert.match(result.stdout, /Merro initialized\.\n\nNext: Register ~\/Projects\/my-app as my-app\nThen: Fix #42\./);
+    assert.match(result.stdout, /Merro initialized\.\n\nNext: ask Main to register a Project and propose an Objective\./);
+    assert.match(result.stdout, /Merro is already initialized\./);
     for (const file of ["WORKSPACE.md", "IMPLEMENTER.md", "REVIEWER.md", "projects/my-app.md"]) {
       await assert.rejects(readFile(join(cwd, ".merro", file)), { code: "ENOENT" });
     }

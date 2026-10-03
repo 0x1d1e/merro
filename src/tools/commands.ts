@@ -4,8 +4,8 @@ import { join } from "node:path";
 import type { MainOrchestrator } from "../runtime/main.js";
 import { MainAlreadyRunningError, MainLock } from "../runtime/main-lock.js";
 import { MerroStore } from "../store/store.js";
-import { initializeWorkspace, requireWorkspace } from "../runtime/workspace.js";
-import { formatStatus, presentWorkspace, publicText } from "../runtime/presentation.js";
+import { initializeWorkspace, isWorkspace, requireWorkspace } from "../runtime/workspace.js";
+import { formatChangeDetails, formatStatus, presentChangeDetails, presentWorkspace, publicText } from "../runtime/presentation.js";
 
 interface CommandContext { ui?: { notify(message: string, level?: "info" | "warning" | "error"): void } }
 export interface PiExtensionLike {
@@ -24,18 +24,76 @@ async function withStore<T>(cwd: string, action: (store: MerroStore) => T | Prom
   try { store = new MerroStore(join(dir, "state.db")); return await action(store); }
   finally { try { store?.close(); } finally { await lock.release(); } }
 }
+
 export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?: MainOrchestrator, onInitialized?: () => Promise<void>): void {
-  pi.registerCommand("merro", { description: "Initialize Merro in this directory: /merro init", async handler(args, ctx) {
-    if (args.trim() !== "init") throw new Error("Usage: /merro init");
-    await initializeWorkspace(cwd);
-    report(ctx, "Merro initialized.\n\nNext: Register ~/Projects/my-app as my-app\nThen: Fix #42.");
-    await onInitialized?.();
-  } });
-  pi.registerCommand("status", { description: "Show Merro changes", async handler(_args, ctx) {
+  const showStatus = async (ctx: CommandContext) => {
     const snapshot = main ? await main.publicSnapshot() : await withStore(cwd, presentWorkspace);
     report(ctx, formatStatus(snapshot));
+  };
+  const showDetails = async (name: string, ctx: CommandContext) => {
+    const details = main
+      ? await main.changeDetails(name)
+      : await withStore(cwd, (store) => presentChangeDetails(store, name));
+    report(ctx, formatChangeDetails(details));
+  };
+  const runMerro = async (args: string, ctx: CommandContext) => {
+    const [verb, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+    const target = rest.join(" ");
+    if (!verb || verb === "status") await requireWorkspace(cwd);
+    try {
+      if (!verb) { await showStatus(ctx); return; }
+      if (verb === "init") {
+        const alreadyInitialized = await isWorkspace(cwd);
+        await initializeWorkspace(cwd);
+        report(ctx, alreadyInitialized ? "Merro is already initialized." : "Merro initialized.\n\nNext: ask Main to register a Project and propose an Objective.");
+        await onInitialized?.();
+        return;
+      }
+      if (verb === "status") { await showStatus(ctx); return; }
+      if (verb === "details") {
+        if (!target) { report(ctx, "Usage: /merro details <change>", "warning"); return; }
+        await showDetails(target, ctx);
+        return;
+      }
+      if (verb === "approve" || verb === "leave") {
+        if (!main) { report(ctx, "Open Main to resolve a merge decision.", "warning"); return; }
+        report(ctx, await main.resolveDecisionForChange(target || undefined, verb === "approve"));
+        return;
+      }
+      if (verb === "retry") {
+        if (!main) { report(ctx, "Open Main to retry a change.", "warning"); return; }
+        report(ctx, await main.retryChangeSet(target || undefined));
+        return;
+      }
+      if (verb === "stop") {
+        if (!main && target) { report(ctx, "Open Main to stop a named Objective.", "warning"); return; }
+        const stopped = main ? await main.stopObjectives(target || undefined) : await withStore(cwd, (store) => store.stopActiveObjectives());
+        report(ctx, stopped ? `Stopped ${stopped} Objective${stopped === 1 ? "" : "s"}. Active changes will finish; no new work will start.` : "Nothing to stop.");
+        return;
+      }
+      if (verb === "run") {
+        if (!main) { report(ctx, "Open Main to check current work.", "warning"); return; }
+        await main.runPass();
+        report(ctx, "Checked current work.");
+        return;
+      }
+      if (!target && !["approve", "leave", "retry", "stop", "run", "status", "details", "init"].includes(verb)) {
+        await showDetails(verb, ctx);
+        return;
+      }
+      report(ctx, "Commands: /merro · /merro init · /merro status · /merro <change> · /merro approve [change] · /merro retry [change] · /merro stop [change]", "warning");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      report(ctx, message, "warning");
+    }
+  };
+
+  pi.registerCommand("merro", { description: "Show work, inspect a change, or manage Merro: /merro [status|<change>|approve|retry|stop]", handler: runMerro });
+  pi.registerCommand("status", { description: "Show concise Merro status", async handler(_args, ctx) {
+    await requireWorkspace(cwd);
+    await showStatus(ctx);
   } });
-  pi.registerCommand("merro-export", { description: "Export normal status to .merro/export.json", async handler(_args, ctx) {
+  pi.registerCommand("merro-export", { description: "Export user-facing status to .merro/export.json", async handler(_args, ctx) {
     const snapshot = main ? await main.publicSnapshot() : await withStore(cwd, presentWorkspace);
     const path = join(cwd, ".merro", "export.json");
     const temporary = `${path}.${randomUUID()}.tmp`;
@@ -45,31 +103,34 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
     } finally { await rm(temporary, { force: true }); }
     report(ctx, "Merro status exported to .merro/export.json");
   } });
-  pi.registerCommand("stop", { description: "Soft-stop objectives by goal or change name; active workers finish", async handler(args, ctx) {
-    const name = args.trim() || undefined;
-    if (!main && name) throw new Error("Open Main to stop an objective by name.");
-    const stopped = main ? await main.stopObjectives(name) : await withStore(cwd, (store) => store.stopActiveObjectives());
-    report(ctx, `Stopped ${stopped} objective(s). Active workers finish; no successors start.`);
+  pi.registerCommand("stop", { description: "Stop active Objectives; running changes finish", async handler(args, ctx) {
+    const target = args.trim() || undefined;
+    if (!main && target) { report(ctx, "Open Main to stop a named Objective.", "warning"); return; }
+    const stopped = main ? await main.stopObjectives(target) : await withStore(cwd, (store) => store.stopActiveObjectives());
+    report(ctx, stopped ? `Stopped ${stopped} Objective${stopped === 1 ? "s" : ""}.` : "Nothing to stop.");
   } });
   pi.registerCommand("unlock", { description: "Clear stale Main ownership; never bypass a live Main", async handler(_args, ctx) {
-    await requireWorkspace(cwd);
-    const lock = new MainLock(join(cwd, ".merro", "main.lock.db"));
-    try { await lock.acquire(); await lock.release(); report(ctx, "Merro lock is clear."); }
-    catch (error) { if (error instanceof MainAlreadyRunningError) report(ctx, error.message, "warning"); else throw error; }
+    try {
+      await requireWorkspace(cwd);
+      const lock = new MainLock(join(cwd, ".merro", "main.lock.db"));
+      try { await lock.acquire(); await lock.release(); report(ctx, "Merro lock is clear."); }
+      catch (error) { if (error instanceof MainAlreadyRunningError) report(ctx, error.message, "warning"); else throw error; }
+    } catch (error) { report(ctx, error instanceof Error ? error.message : String(error), "warning"); }
   } });
   if (!main) return;
+
   for (const [name, approved] of [["merro-approve", true], ["merro-reject", false]] as const) {
-    pi.registerCommand(name, { description: `${approved ? "Approve" : "Reject"} a pending merge/conflict by change name`, async handler(args, ctx) {
-      await main.resolveDecisionForChange(args.trim(), approved);
-      report(ctx, "Decision resolved.");
+    pi.registerCommand(name, { description: `Compatibility alias for /merro ${approved ? "approve" : "leave"} [change]`, async handler(args, ctx) {
+      try { report(ctx, await main.resolveDecisionForChange(args.trim() || undefined, approved)); }
+      catch (error) { report(ctx, error instanceof Error ? error.message : String(error), "warning"); }
     } });
   }
-  pi.registerCommand("merro-continue", { description: "Retry a blocked change: /merro-continue <change name>", async handler(args, ctx) {
-    if (!args.trim()) throw new Error("Name the change to retry.");
-    await main.continueChangeSet(args.trim());
-    report(ctx, `Continued ${args.trim()}.`);
+  pi.registerCommand("merro-retry", { description: "Compatibility alias for /merro retry [change]", async handler(args, ctx) {
+    try { report(ctx, await main.retryChangeSet(args.trim() || undefined)); }
+    catch (error) { report(ctx, error instanceof Error ? error.message : String(error), "warning"); }
   } });
-  pi.registerCommand("merro-run", { description: "Reconcile workers and GitHub, then schedule approved work", async handler(_args, ctx) {
-    await main.runPass(); report(ctx, "Merro reconciled.");
+  pi.registerCommand("merro-run", { description: "Check current work", async handler(_args, ctx) {
+    try { await main.runPass(); report(ctx, "Checked current work."); }
+    catch (error) { report(ctx, error instanceof Error ? error.message : String(error), "warning"); }
   } });
 }

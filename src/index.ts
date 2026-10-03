@@ -7,8 +7,13 @@ import { publicText } from "./runtime/presentation.js";
 import { registerCommands, type PiExtensionLike } from "./tools/commands.js";
 import { registerMainTools, type MainToolAPI } from "./tools/main.js";
 
+interface ExtensionUIContextLike {
+  notify(message: string, type?: "info" | "warning" | "error"): void;
+  setStatus(key: string, text: string | undefined): void;
+}
 interface MerroExtensionAPI extends PiExtensionLike, MainToolAPI {
-  on(event: "session_start" | "session_shutdown", handler: () => void | Promise<void>): void;
+  on(event: "session_start", handler: (event: unknown, ctx?: { ui: ExtensionUIContextLike }) => void | Promise<void>): void;
+  on(event: "session_shutdown", handler: (event: unknown, ctx?: { ui: ExtensionUIContextLike }) => void | Promise<void>): void;
   on(event: "before_agent_start", handler: (event: { systemPromptOptions: { sections: Record<string, string> } }) => Promise<void>): void;
 }
 
@@ -16,9 +21,21 @@ export default async function merro(pi: MerroExtensionAPI): Promise<void> {
   if (process.env.MERRO_RUNTIME === "worker") return;
   const cwd = process.cwd();
   const config = { ...DEFAULT_CONFIG };
-  const main = new MainOrchestrator({ workspacePath: cwd, config, notify(message) {
-    pi.sendMessage?.({ customType: "merro-activity", content: message, display: true });
-  } });
+  const progressStatusKey = "merro-progress";
+  let ui: ExtensionUIContextLike | undefined;
+  const main = new MainOrchestrator({ workspacePath: cwd, config,
+    notify(message, level = "info") {
+      if (ui) {
+        ui.setStatus(progressStatusKey, undefined);
+        ui.notify(message, level);
+      } else {
+        pi.sendMessage?.({ customType: "merro-activity", content: message, display: true });
+      }
+    },
+    progress(message) {
+      ui?.setStatus(progressStatusKey, message.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim());
+    },
+  });
   let timer: NodeJS.Timeout | undefined;
   let passRunning = false;
   let sessionStarted = false;
@@ -45,6 +62,12 @@ export default async function merro(pi: MerroExtensionAPI): Promise<void> {
     const guidance = renderMarkdownGuidance(await loadMarkdownGuidance(cwd, projects.map((project) => project.slug)));
     if (guidance) event.systemPromptOptions.sections.merro_workspace = guidance;
   });
-  pi.on("session_start", async () => { sessionStarted = true; await open(); });
-  pi.on("session_shutdown", () => { sessionStarted = false; if (timer) clearInterval(timer); timer = undefined; });
+  pi.on("session_start", async (_event, ctx) => { ui = ctx?.ui; sessionStarted = true; await open(); });
+  pi.on("session_shutdown", (_event, ctx) => {
+    sessionStarted = false;
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    (ctx?.ui ?? ui)?.setStatus(progressStatusKey, undefined);
+    ui = undefined;
+  });
 }

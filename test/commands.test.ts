@@ -36,7 +36,7 @@ test("commands serialize state access and show workspace status", async (t) => {
 
   await status.handler("", { ui: { notify: (message) => messages.push(message) } });
 
-  assert.match(messages[0] ?? "", /no work planned/);
+  assert.match(messages[0] ?? "", /No Merro work yet\./);
   assert.ok(commands.has("unlock"));
 });
 

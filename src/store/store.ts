@@ -22,7 +22,7 @@ import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
 
@@ -341,6 +341,15 @@ export class MerroStore {
       migratePublicationStates(this.#db);
       version = 15;
     }
+    if (version < 16) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_16);
+        this.#db.prepare("UPDATE schema_meta SET version = 16").run();
+        this.#db.exec("COMMIT");
+        version = 16;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -638,6 +647,8 @@ export class MerroStore {
       pullRequestUrl: row.pull_request_url === null ? null : String(row.pull_request_url),
       pullRequestState: row.pull_request_state === null ? null : String(row.pull_request_state),
       githubChecks: row.github_checks as Exclude<ChangeSetRuntimeRecord["githubChecks"], undefined>,
+      githubChecksAt: row.github_checks_at === null ? null : String(row.github_checks_at),
+      githubReviewDecision: row.github_review_decision === null ? null : String(row.github_review_decision),
       pullRequestHeadSha: row.pull_request_head_sha === null ? null : String(row.pull_request_head_sha),
       pullRequestBaseSha: row.pull_request_base_sha === null ? null : String(row.pull_request_base_sha),
       mergedCommitSha: row.merged_commit_sha === null ? null : String(row.merged_commit_sha),
@@ -657,8 +668,8 @@ export class MerroStore {
         work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
         pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, last_issue_state,
         reviewed_diff_hash, review_round, infrastructure_retries, implementation_attempt, last_reconciled_at,
-        last_rework_trigger, base_update_json, github_checks
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_rework_trigger, base_update_json, github_checks, github_checks_at, github_review_decision
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(work_item_id) DO UPDATE SET
         branch_name = excluded.branch_name, clone_path = excluded.clone_path, base_commit = excluded.base_commit,
         pull_request_number = excluded.pull_request_number, pull_request_url = excluded.pull_request_url,
@@ -667,13 +678,16 @@ export class MerroStore {
         last_issue_state = excluded.last_issue_state, reviewed_diff_hash = excluded.reviewed_diff_hash,
         review_round = excluded.review_round, infrastructure_retries = excluded.infrastructure_retries,
         implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at,
-        last_rework_trigger = excluded.last_rework_trigger, base_update_json = excluded.base_update_json, github_checks = excluded.github_checks
+        last_rework_trigger = excluded.last_rework_trigger, base_update_json = excluded.base_update_json,
+        github_checks = excluded.github_checks, github_checks_at = excluded.github_checks_at,
+        github_review_decision = excluded.github_review_decision
     `).run(
       record.changeSetId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
       record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
       record.mergedCommitSha, record.lastIssueState, record.reviewedDiffHash, record.reviewRound,
       record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt, record.lastReworkTrigger,
       record.baseUpdate ? JSON.stringify(record.baseUpdate) : null, record.githubChecks ?? null,
+      record.githubChecksAt ?? null, record.githubReviewDecision ?? null,
     );
   }
 

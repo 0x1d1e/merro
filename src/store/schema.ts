@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;
@@ -297,4 +297,9 @@ ALTER TABLE relations ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0 CHECK (aut
 export const MIGRATION_12 = `
 ALTER TABLE task_runtime ADD COLUMN cleanup_completed_at TEXT;
 CREATE INDEX task_runtime_pending_cleanup ON task_runtime(task_id) WHERE cleanup_completed_at IS NULL;
+`;
+
+export const MIGRATION_16 = `
+ALTER TABLE work_item_runtime ADD COLUMN github_checks_at TEXT;
+ALTER TABLE work_item_runtime ADD COLUMN github_review_decision TEXT;
 `;

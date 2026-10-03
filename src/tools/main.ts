@@ -122,25 +122,18 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
           : `conflicts with ${externalDependent ? from : to}`;
         relationLines.set(owner, [...(relationLines.get(owner) ?? []), line]);
       }
-      const settings = (role: "implement" | "review") => {
-        const choice = proposal.workerSettings[role];
-        return `model: ${choice.model ?? "Pi default"}, thinking: ${choice.thinking ?? "Pi default"}`;
-      };
-      const workerSettings = { implement: proposal.workerSettings.implement, review: proposal.workerSettings.review };
       const relations = proposal.relations.map((edge) => ({ kind: edge.kind, from: names.get(edge.from) ?? "dependency", to: names.get(edge.to) ?? "dependency" }));
-      const warning = proposal.cycle ? "\nBlocked: dependency cycle." : proposal.unresolved.length ? "\nBlocked: unresolved issue dependencies." : "";
+      const warning = proposal.cycle ? "\nCannot start: dependencies form a cycle." : proposal.unresolved.length ? "\nCannot start: some issue dependencies are unresolved." : "";
       const named = "changeSets" in input;
       const planText = plans.map((plan) => {
         const relations = (relationLines.get(plan.change) ?? []).map((line) => `\n  ${line}`).join("");
         return named
-          ? `${plan.change}\n  ${plan.project} ${plan.issues.map((number) => `#${number}`).join(" ")}\n  Branch: ${plan.branch}${relations}`
-          : `${plan.project}: ${plan.issues.map((number) => `#${number}`).join(" ")}\nChange: ${plan.change}\nBranch: ${plan.branch}${relations}`;
+          ? `${plan.change}\n  ${plan.project} ${plan.issues.map((number) => `#${number}`).join(" ")}${relations}`
+          : `${plan.project}: ${plan.issues.map((number) => `#${number}`).join(" ")}\nChange: ${plan.change}${relations}`;
       }).join("\n\n");
-      const totals = named
-        ? `${plans.length} changes\n${plans.length} PRs\n${proposal.runnableImmediately} runnable immediately`
-        : `Delivery: ${"delivery" in input && input.delivery === "separate" ? "separate changes" : "one change per Project"}\nChanges: ${plans.length}\nPRs: ${plans.length}\nRunnable immediately: ${proposal.runnableImmediately}`;
-      const message = publicText(`Plan\n\n${planText}\n\n${totals}\nImplementation: one worker per change (${settings("implement")})\nReview: one fresh worker per change (${settings("review")})${warning}\n\nApprove?`, names);
-      const details = { plans, relations, runnableImmediately: proposal.runnableImmediately, workerSettings };
+      const totals = `${plans.length} change${plans.length === 1 ? "" : "s"} · ${plans.length} pull request${plans.length === 1 ? "" : "s"}`;
+      const message = publicText(`Plan\n\n${planText}\n\n${totals}${warning}\n\nApprove?`, names);
+      const details = { plans, relations, runnableImmediately: proposal.runnableImmediately };
       pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details });
       return result(message, details);
     } });
@@ -148,19 +141,22 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
     async execute(_id, args) {
       const started = await main.approveObjective(typeof args.change === "string" ? args.change : undefined);
       await main.runPass();
-      return result(`Started ${started.changeSets.map(changeName).join(", ")}.\n${started.changeSets.map((item) => `tmux: merro-${item.projectSlug} / impl-${changeName(item)}`).join("\n")}`);
+      return result(`Working: ${started.changeSets.map(changeName).join(", ")}.`);
     } });
-  pi.registerTool({ name: "merro_continue_change", label: "Continue change", description: "Retry a retryable blocked change after the user fixes its cause. Deterministic unsupported GitHub policy blockers need policy changes and automatic reconciliation, not continuation.",
-    parameters: Type.Object({ change: Type.String() }, { additionalProperties: false }),
-    async execute(_id, args) { const name = text(args, "change"); await main.continueChangeSet(name); return result(`Continued ${name}.`); } });
-  pi.registerTool({ name: "merro_resolve_decision", label: "Resolve decision", description: "Approve or reject a pending merge/conflict decision only after explicit user approval. Select by semantic change name, never by an internal identifier.",
-    parameters: Type.Object({ change: Type.String(), approved: Type.Boolean() }, { additionalProperties: false }),
-    async execute(_id, args) { const name = text(args, "change"); await main.resolveDecisionForChange(name, args.approved === true); return result(`${name}: decision resolved.`); } });
+  pi.registerTool({ name: "merro_retry_change", label: "Retry change", description: "Retry one eligible blocked change after its cause is fixed. Infer the only eligible change when unambiguous; do not retry automatic or GitHub-policy blockers.",
+    parameters: Type.Object({ change: Type.Optional(Type.String()) }, { additionalProperties: false }),
+    async execute(_id, args) { return result(await main.retryChangeSet(typeof args.change === "string" ? args.change : undefined)); } });
+  pi.registerTool({ name: "merro_resolve_decision", label: "Approve or leave open", description: "Approve or leave a pending merge decision only after explicit user approval. Infer a unique decision; approving an already merged change succeeds idempotently.",
+    parameters: Type.Object({ change: Type.Optional(Type.String()), approved: Type.Boolean() }, { additionalProperties: false }),
+    async execute(_id, args) { return result(await main.resolveDecisionForChange(typeof args.change === "string" ? args.change : undefined, args.approved === true)); } });
   pi.registerTool({ name: "merro_restart_change", label: "Restart attempt", description: "After explicit user approval of changed requirements, stop the current attempt and start a fresh implementer. Never send instructions to a running worker.",
     parameters: Type.Object({ change: Type.String(), requirements: Type.String() }, { additionalProperties: false }),
     async execute(_id, args) { const name = text(args, "change"); await main.restartChange(name, text(args, "requirements")); return result(`Fresh implementation started for ${name}.`); } });
   pi.registerTool({ name: "merro_run_pass", label: "Reconcile", description: "Reconcile workers and GitHub; schedule approved work without bypassing decisions.", parameters: empty,
-    async execute() { await main.runPass(); return result("Merro reconciled."); } });
-  pi.registerTool({ name: "merro_status", label: "Status", description: "Show changes, issues, workers, and pending decisions with semantic names.", parameters: empty,
-    async execute() { const snapshot = await main.publicSnapshot(); return result(formatStatus(snapshot), snapshot); } });
+    async execute() { await main.runPass(); return result("Checked current work."); } });
+  pi.registerTool({ name: "merro_status", label: "Status", description: "Show concise user-facing work states, pull requests, CI, and decisions.", parameters: empty,
+    async execute() {
+      const snapshot = await main.publicSnapshot();
+      return result(formatStatus(snapshot), snapshot);
+    } });
 }
