@@ -27,7 +27,7 @@ export interface MarkdownRoadmapPlan {
 }
 
 interface RoadmapRow extends MarkdownRoadmapItem {
-  parallel: string;
+  dependencyCells: Array<{ value: string; allowBareTarget: boolean }>;
   dependencies: RoadmapRow[];
   unresolvedStatement?: string;
   changeName: string;
@@ -100,6 +100,11 @@ function projectForHeading(heading: string, mappings: readonly MarkdownProjectMa
     ?? (mappings.length === 1 ? mappings[0]!.projectSlug : undefined);
 }
 
+function roadmapColumnName(value: string): string {
+  const name = value.toLowerCase().replace(/[^a-z]+/g, " ").trim();
+  return /^(?:dependency|dependencies|prerequisite|prerequisites)$/.test(name) ? "depends on" : name;
+}
+
 function parseTables(markdown: string, mappings: readonly MarkdownProjectMapping[]): RoadmapRow[] {
   const rows: RoadmapRow[] = [];
   let projectHeading: string | undefined = mappings.length === 1 ? mappings[0]!.heading : undefined;
@@ -119,22 +124,29 @@ function parseTables(markdown: string, mappings: readonly MarkdownProjectMapping
       headers = undefined;
       continue;
     }
-    const columnNames = row.map((cell) => cell.toLowerCase().replace(/[^a-z]+/g, " ").trim());
-    if (columnNames.some((cell) => cell === "workstream") && columnNames.some((cell) => cell === "issues")) {
-      const statusIndex = columnNames.findIndex((cell) => cell === "status");
-      const orderIndex = columnNames.findIndex((cell) => cell === "order");
-      const workstreamIndex = columnNames.findIndex((cell) => cell === "workstream");
-      const issuesIndex = columnNames.findIndex((cell) => cell === "issues");
-      const parallelIndex = columnNames.findIndex((cell) => cell === "parallel");
-      if (orderIndex < 0 || parallelIndex < 0) throw new Error("Roadmap tables need Order, Workstream, Issues, and Parallel? columns");
-      headers = [String(statusIndex), String(orderIndex), String(workstreamIndex), String(issuesIndex), String(parallelIndex)];
+    const columnNames = row.map(roadmapColumnName);
+    if (columnNames.includes("workstream") && columnNames.includes("issues")) {
+      const supportedColumns = new Set(["status", "order", "workstream", "issues", "parallel", "depends on"]);
+      const unknownColumn = columnNames.find((name) => !name || !supportedColumns.has(name));
+      if (unknownColumn !== undefined) throw new Error(`Unsupported roadmap table column '${unknownColumn || "(empty)"}'`);
+      if (new Set(columnNames).size !== columnNames.length) throw new Error("Roadmap table columns must be unique");
+      const statusIndex = columnNames.indexOf("status");
+      const orderIndex = columnNames.indexOf("order");
+      const workstreamIndex = columnNames.indexOf("workstream");
+      const issuesIndex = columnNames.indexOf("issues");
+      const parallelIndex = columnNames.indexOf("parallel");
+      const dependsOnIndex = columnNames.indexOf("depends on");
+      if (orderIndex < 0 || (parallelIndex < 0 && dependsOnIndex < 0)) {
+        throw new Error("Roadmap tables need Order, Workstream, Issues, and either Parallel? or Depends on columns");
+      }
+      headers = [String(statusIndex), String(orderIndex), String(workstreamIndex), String(issuesIndex), String(parallelIndex), String(dependsOnIndex)];
       if (!projectSlug) throw new Error(`Map roadmap heading '${projectHeading ?? "(missing)"}' to a registered Project slug`);
       continue;
     }
     if (isSeparator(row)) continue;
     if (!headers) continue;
-    const [statusAt, orderAt, workstreamAt, issuesAt, parallelAt] = headers.map(Number);
-    const columns = [statusAt!, orderAt!, workstreamAt!, issuesAt!, parallelAt!].filter((index) => index >= 0);
+    const [statusAt, orderAt, workstreamAt, issuesAt, parallelAt, dependsOnAt] = headers.map(Number);
+    const columns = [statusAt!, orderAt!, workstreamAt!, issuesAt!, parallelAt!, dependsOnAt!].filter((index) => index >= 0);
     if (row.length !== Math.max(...columns) + 1) {
       throw new Error(`Roadmap row in '${projectHeading}' does not match its table header`);
     }
@@ -152,7 +164,10 @@ function parseTables(markdown: string, mappings: readonly MarkdownProjectMapping
       ...(parsedIssues.unresolved ? { unresolvedStatement: parsedIssues.unresolved } : {}),
       ...(order ? { order } : {}),
       ...(status ? { status } : {}),
-      parallel: row[parallelAt!]!,
+      dependencyCells: [
+        ...(dependsOnAt! < 0 ? [] : [{ value: row[dependsOnAt!]!, allowBareTarget: true }]),
+        ...(parallelAt! < 0 ? [] : [{ value: row[parallelAt!]!, allowBareTarget: false }]),
+      ],
       dependencies: [],
       changeName: semanticSlug(workstream),
     });
@@ -201,11 +216,12 @@ interface RelationClause {
   unsupported?: boolean;
 }
 
-function relationClause(value: string): RelationClause | undefined {
+function relationClause(value: string, allowBareTarget: boolean): RelationClause | undefined {
   const source = value.trim().replace(/[.;,]+$/, "").trim();
-  const targetText = source.replace(/^(?:yes[,;:]?\s+|parallel[,;:]?\s+)/i, "");
-  if (!targetText || /^(?:yes|true|parallel|foundation|none|n\/a)$/i.test(targetText)
-    || /^with\s+\d+[a-z](?:\s*(?:\/|-|\+|,|&|\band\b)\s*\d+[a-z])*$/i.test(targetText)) return undefined;
+  const targetText = allowBareTarget ? source : source.replace(/^(?:yes[,;:]?\s+|parallel[,;:]?\s+)/i, "");
+  if (!targetText || (!allowBareTarget && /^(?:yes|true|parallel|foundation|none|n\/a)$/i.test(targetText))
+    || (allowBareTarget && /^(?:none|n\/a|no|false)$/i.test(targetText))
+    || (!allowBareTarget && /^with\s+\d+[a-z](?:\s*(?:\/|-|\+|,|&|\band\b)\s*\d+[a-z])*$/i.test(targetText))) return undefined;
   if (/^(?:(?:finish|run|do|ship)\s+)?last$/i.test(targetText)) {
     return { target: "last", statement: targetText, last: true };
   }
@@ -221,7 +237,9 @@ function relationClause(value: string): RelationClause | undefined {
     const match = targetText.match(pattern);
     if (match) return { target: match[1]!.replace(/[.;,]+$/, "").trim(), statement: targetText };
   }
-  return { target: source, statement: source, unsupported: true };
+  return allowBareTarget
+    ? { target: source, statement: source }
+    : { target: source, statement: source, unsupported: true };
 }
 
 function resolveDependencyClause(
@@ -290,10 +308,12 @@ function resolveDependencyClause(
 
 function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappings: readonly MarkdownProjectMapping[]): string | undefined {
   const unresolved = new Set<string>();
-  for (const clause of row.parallel.split(";").map((part) => part.trim()).filter(Boolean)) {
-    const parsedClause = relationClause(clause);
-    const statement = parsedClause ? resolveDependencyClause(row, parsedClause, rows, mappings) : undefined;
-    if (statement) unresolved.add(statement);
+  for (const cell of row.dependencyCells) {
+    for (const clause of cell.value.split(";").map((part) => part.trim()).filter(Boolean)) {
+      const parsedClause = relationClause(clause, cell.allowBareTarget);
+      const statement = parsedClause ? resolveDependencyClause(row, parsedClause, rows, mappings) : undefined;
+      if (statement) unresolved.add(statement);
+    }
   }
   row.dependencies = [...new Set(row.dependencies)];
   return [...unresolved].join("; ") || undefined;
@@ -342,10 +362,15 @@ export function interpretMarkdownRoadmap(markdown: string, projectMapInput: read
     };
     planningItems.push(item);
     if (canExecute) selected.set(row.changeName, row);
-    else if (!contextOnly) unresolved.push({
+    if (row.unresolvedStatement) unresolved.push({
       workstream: row.workstream,
       projectSlug: row.projectSlug,
-      statement: row.unresolvedStatement ?? `Blocked by unresolved prerequisite(s): ${blockers.join("; ")}`,
+      statement: row.unresolvedStatement,
+    });
+    else if (!contextOnly && blockers.length) unresolved.push({
+      workstream: row.workstream,
+      projectSlug: row.projectSlug,
+      statement: `Blocked by unresolved prerequisite(s): ${blockers.join("; ")}`,
     });
   }
 
