@@ -11,6 +11,7 @@ import { GitClient } from "../src/vcs/git.js";
 
 for (const sandbox of ["docker", "none"] as const) {
   test(`copied installed Merro is inert in a ${sandbox} worker and its result remains valid`, async (t) => {
+    const initialRuntime = process.env.MERRO_RUNTIME;
     const root = await mkdtemp(join(tmpdir(), "merro-isolation-"));
     t.after(() => rm(root, { recursive: true, force: true }));
     const clone = join(root, "clone");
@@ -97,7 +98,7 @@ for (const sandbox of ["docker", "none"] as const) {
     await assert.rejects(new GitClient().validateTaskCommit(clone, base, head), /uncommitted or untracked/);
     await rm(join(clone, "unknown.txt"));
     assert.equal(await readFile(join(config, "settings.json"), "utf8"), settings);
-    assert.equal(process.env.MERRO_RUNTIME, undefined);
+    assert.equal(process.env.MERRO_RUNTIME, initialRuntime);
   });
 }
 
