@@ -26,7 +26,7 @@ test("Markdown guidance is optional and blank files add no Task content", async 
   }
 });
 
-test("Tasks retain user and repository guidance, scope Markdown by role/Project, and state precedence and safety", async (t) => {
+test("implement Tasks embed scoped guidance while review handoffs rely on Pi guidance", async (t) => {
   const cwd = await workspace(t);
   for (const [path, text] of [
     ["WORKSPACE.md", "Use separate delivery; run CI."],
@@ -38,17 +38,23 @@ test("Tasks retain user and repository guidance, scope Markdown by role/Project,
   for (const role of ["implement", "review"] as const) {
     const guidance = await loadMarkdownGuidance(cwd, ["kinetix"], role);
     assert.deepEqual(guidance.map((file) => file.path), [".merro/WORKSPACE.md", role === "implement" ? ".merro/IMPLEMENTER.md" : ".merro/REVIEWER.md", ".merro/projects/kinetix.md"]);
-    const task = renderTaskFile({ role, change: "fix-42", projectSlug: "kinetix", issues: [42], title: "Fix #42", scope: "Approved scope", objective: "Fix #42", userGuidance: "Current requirements", projectGuidance: "Existing Project guidance", markdownGuidance: guidance, repositoryInstructions: [{ path: "AGENTS.md", text: "Repository convention" }], dependencies: [], latestReview: null, expectedCommit: "a".repeat(40) });
-    for (const text of ["Current requirements", "Existing Project guidance", "Repository convention", "Use separate delivery; run CI.", "Kinetix convention."]) assert.ok(task.includes(text), text);
-    assert.ok(task.includes(role === "implement" ? "Implementer convention." : "Reviewer convention."));
-    assert.ok(!task.includes(role === "implement" ? "Reviewer convention." : "Implementer convention."));
-    assert.ok(!task.includes("Plugins convention."));
-    assert.match(task, /current user instruction and approved ChangeSet requirements, Project Markdown, workspace Markdown, Merro defaults/);
-    assert.match(task, /built-in safety invariants cannot be overridden/);
-    assert.match(task, /Repository AGENTS\.md remains normal Pi\/repository guidance/);
+    const task = renderTaskFile({ role, change: "fix-42", projectSlug: "kinetix", issues: [42], title: "Fix #42", scope: "Approved scope", objective: "Fix #42", userGuidance: "Current requirements", projectGuidance: "Existing Project guidance", markdownGuidance: guidance, repositoryInstructions: [{ path: "AGENTS.md", text: "Repository convention" }], dependencies: [], latestReview: null, expectedCommit: "a".repeat(40), baseCommit: "b".repeat(40) });
+    assert.match(task, /Current requirements/);
     assert.match(task, /## Task instructions/);
-    if (role === "review") assert.match(task, /Do not modify files/);
-    else assert.match(task, /Do not push branches/);
+    if (role === "review") {
+      for (const text of ["Existing Project guidance", "Repository convention", "Use separate delivery; run CI.", "Kinetix convention.", "Reviewer convention."]) assert.ok(!task.includes(text), text);
+      assert.match(task, /normal Pi mechanisms/);
+      assert.match(task, /Do not modify files/);
+      assert.match(task, /Base commit: b{40}/);
+    } else {
+      for (const text of ["Existing Project guidance", "Repository convention", "Use separate delivery; run CI.", "Kinetix convention.", "Implementer convention."]) assert.ok(task.includes(text), text);
+      assert.ok(!task.includes("Reviewer convention."));
+      assert.ok(!task.includes("Plugins convention."));
+      assert.match(task, /current user instruction and approved ChangeSet requirements, Project Markdown, workspace Markdown, Merro defaults/);
+      assert.match(task, /built-in safety invariants cannot be overridden/);
+      assert.match(task, /Repository AGENTS\.md remains normal Pi\/repository guidance/);
+      assert.match(task, /Do not push branches/);
+    }
   }
 });
 
