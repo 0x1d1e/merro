@@ -154,12 +154,12 @@ Machine settings belong in `config.json`, not prompts or review policy. Init wri
   "worktreesDir": ".wt",
   "worker": { "model": "provider/model", "thinking": "high" },
   "reviewer": { "model": "provider/model", "thinking": "high" },
-  "git": { "defaultDelivery": "local" },
+  "git": { "defaultDelivery": "auto" },
   "tmux": { "session": "merro" }
 }
 ```
 
-Omitted settings still use defaults; `null` model/thinking inherits Pi's normal settings. Review is always enabled; delivery defaults to local. `tmux.session` is the prefix for per-Project sessions. Restart Main after changing machine settings. See [runtime settings](docs/runtime-settings.md) for advanced options.
+Omitted settings still use defaults; `null` model/thinking inherits Pi's normal settings. Review is always enabled; delivery follows each Project checkout by default: PR for supported remotes, local otherwise. `tmux.session` is the prefix for per-Project sessions. Restart Main after changing machine settings. See [runtime settings](docs/runtime-settings.md) for advanced options.
 
 ## Local-only is first-class
 
@@ -167,14 +167,14 @@ Omitted settings still use defaults; `null` model/thinking inherits Pi's normal 
 local repo → implement → independent review → fast-forward canonical branch → done
 ```
 
-No GitHub, remote, push, or PR required. Approving the plan authorizes delivery of the reviewed commit to the displayed local target branch. The canonical checkout must be clean and on that branch. If its base diverges, Merro schedules implementation and fresh review before delivery; it never overwrites unrelated changes.
+No GitHub, remote, push, or PR required. After implementation, green verification, and fresh review, Main asks separately before applying the reviewed commit to the displayed local branch. The canonical checkout must be clean and on that branch. If its base moves, Merro schedules fresh implementation, verification, and review, then requests approval again. Main never resolves conflicts or overwrites unrelated changes.
 
 ## Delivery modes
 
-- **Local/direct-to-main** is the default: deliver the exact reviewed commit locally, without pushing.
-- **Branch + PR** is requested explicitly, or configured as the default. Main publishes after review and asks separately before merging, after required GitHub checks and reviews pass.
+- **Local/direct-to-main** is selected when the Project has no supported remote, or when explicitly requested. Main asks for separate local merge approval after green verification and fresh review.
+- **Branch + PR** is selected when the Project has supported remotes, or when explicitly requested. Main publishes after review and asks separately before merging, after required GitHub checks and reviews pass.
 
-A remote's existence never selects PR delivery. Issues in one Project combine into one change by default; ask for separate changes when needed. Cross-Project work has separate changes.
+Issue presence does not change delivery selection. Issues in one Project combine into one change by default; ask for separate changes when needed. Cross-Project work has separate changes.
 
 ## What Merro deliberately does not do
 

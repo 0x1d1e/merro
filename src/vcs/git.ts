@@ -92,8 +92,16 @@ export class GitClient {
     return { path, branchName, baseCommit };
   }
 
-  async deliverLocal(project: Project, path: string, targetBranch: string, reviewedCommit: string): Promise<{ commit: string } | { baseUpdate: BaseUpdate }> {
+  async inspectLocalDelivery(
+    project: Project,
+    path: string,
+    targetBranch: string,
+    reviewedCommit: string,
+    expectedBaseCommit: string,
+  ): Promise<{ baseCommit: string; diffHash: string } | { baseUpdate: BaseUpdate }> {
     if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(reviewedCommit)) throw new Error("Invalid reviewed commit");
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(expectedBaseCommit)) throw new Error("Invalid reviewed base commit");
+    await this.#run("git", ["check-ref-format", "--branch", targetBranch]);
     if (await this.currentCommit(path) !== reviewedCommit) throw new Error("Working copy no longer matches the reviewed commit");
     for (const checkout of [path, project.path]) {
       if ((await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: checkout })).stdout) {
@@ -103,11 +111,31 @@ export class GitClient {
     const branch = (await this.#run("git", ["branch", "--show-current"], { cwd: project.path })).stdout.trim();
     if (branch !== targetBranch) throw new Error(`Local delivery needs ${targetBranch} checked out in Project ${project.slug}`);
     const target = await this.currentCommit(project.path);
+    if (target !== expectedBaseCommit) return { baseUpdate: { baseRefName: targetBranch, baseCommit: target } };
     await this.#run("git", ["fetch", "--no-tags", "--", project.path, `refs/heads/${targetBranch}`], { cwd: path });
     try { await this.#run("git", ["merge-base", "--is-ancestor", target, reviewedCommit], { cwd: path }); }
     catch (error) {
       if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
       return { baseUpdate: { baseRefName: targetBranch, baseCommit: target } };
+    }
+    const diffHash = await this.effectiveDiffFingerprint(project, path, targetBranch, target, reviewedCommit, project.path);
+    return { baseCommit: target, diffHash };
+  }
+
+  async deliverLocal(
+    project: Project,
+    path: string,
+    targetBranch: string,
+    reviewedCommit: string,
+    expectedBaseCommit?: string,
+    expectedDiffHash?: string,
+  ): Promise<{ commit: string } | { baseUpdate: BaseUpdate }> {
+    const expectedBase = expectedBaseCommit ?? await this.currentCommit(project.path);
+    const inspected = await this.inspectLocalDelivery(project, path, targetBranch, reviewedCommit, expectedBase);
+    if ("baseUpdate" in inspected) return inspected;
+    if (expectedDiffHash && inspected.diffHash !== expectedDiffHash) throw new Error("Local reviewed diff changed before merge approval");
+    if (await this.currentCommit(project.path) !== expectedBase) {
+      return { baseUpdate: { baseRefName: targetBranch, baseCommit: await this.currentCommit(project.path) } };
     }
     await this.#run("git", ["fetch", "--no-tags", "--", path, reviewedCommit], { cwd: project.path });
     // Never author a merge commit, force an update, or touch a remote.
@@ -306,12 +334,13 @@ export class GitClient {
     baseRefName: string,
     baseCommit: string,
     headCommit: string,
+    baseRemote?: string,
   ): Promise<string> {
     if (!/^[0-9a-f]{40,64}$/i.test(baseCommit) || !/^[0-9a-f]{40,64}$/i.test(headCommit)) {
       throw new Error("effective diff requires valid base and head commit SHAs");
     }
     await this.#run("git", ["check-ref-format", "--branch", baseRefName]);
-    const remote = await this.#resolveRemote(project.path, project.baseRemote);
+    const remote = baseRemote ?? (project.baseRemote ? await this.#resolveRemote(project.path, project.baseRemote) : project.path);
     await this.#run("git", ["fetch", "--no-tags", remote, `refs/heads/${baseRefName}`], { cwd: path });
     const fetchedBase = (await this.#run("git", ["rev-parse", "FETCH_HEAD"], { cwd: path })).stdout.trim();
     if (fetchedBase !== baseCommit) {

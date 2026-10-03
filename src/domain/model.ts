@@ -1,7 +1,7 @@
 export type DeliveryMode = "local" | "pr";
 export type Priority = "high" | "normal" | "low";
 export type ObjectiveState = "Active" | "Done" | "Stopped";
-export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "Reviewed" | "Publishing" | "AwaitingMerge";
+export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "Reviewed" | "AwaitingLocalMerge" | "Publishing" | "AwaitingMerge";
 export type ChangeSetState =
   | FlowChangeSetState
   | "Blocked"
@@ -132,6 +132,7 @@ export const FLOW_CHANGE_SET_STATES = new Set<FlowChangeSetState>([
   "Implementing",
   "Reviewing",
   "Reviewed",
+  "AwaitingLocalMerge",
   "Publishing",
   "AwaitingMerge",
 ]);

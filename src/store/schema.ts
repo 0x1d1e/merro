@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 export const MIGRATION_17 = `
 ALTER TABLE work_items ADD COLUMN delivery TEXT NOT NULL DEFAULT 'pr' CHECK (delivery IN ('local','pr'));

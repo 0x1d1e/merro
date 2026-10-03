@@ -25,6 +25,7 @@ import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord
 import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
+import { migrateLocalMergeState } from "./local-merge-migration.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -361,6 +362,10 @@ export class MerroStore {
         version = 17;
       } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
     }
+    if (version < 18) {
+      migrateLocalMergeState(this.#db);
+      version = 18;
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -636,6 +641,11 @@ export class MerroStore {
       .all().map(decisionFromRow);
   }
 
+  changeSetDecisions(changeSetId: string): Decision[] {
+    return this.#db.prepare("SELECT * FROM decisions WHERE subject_type = 'ChangeSet' AND subject_id = ? ORDER BY created_at, id")
+      .all(changeSetId).map(decisionFromRow);
+  }
+
   resolveDecision(id: string, state: Exclude<Decision["state"], "pending">): void {
     const decision = this.getDecision(id);
     if (!decision) throw new Error(`unknown Decision: ${id}`);
@@ -773,6 +783,9 @@ export class MerroStore {
 
   createChangeSet(item: ChangeSet): void {
     semanticSlug(item.slug);
+    if (item.state === "AwaitingLocalMerge" && item.delivery !== "local") {
+      throw new Error("AwaitingLocalMerge requires local delivery");
+    }
     if (item.issues.some((issue) => issue.projectSlug !== item.projectSlug || !Number.isSafeInteger(issue.number) || issue.number < 1)
       || new Set(issueNumbers(item)).size !== item.issues.length) throw new Error("ChangeSet sources must be distinct positive issue numbers in its Project.");
     const hasBlockedMetadata = item.blockedReason !== null || item.blockedResumeState !== null;
@@ -945,16 +958,24 @@ export class MerroStore {
     try {
       const item = this.getChangeSet(id);
       const review = this.listTasks(id).at(-1);
-      if (item?.delivery !== "local" || item.state !== "Reviewed" || this.activeTask(id)
+      if (item?.delivery !== "local" || item.state !== "AwaitingLocalMerge" || this.activeTask(id)
         || review?.role !== "review" || review.outcome !== "pass" || review.reviewedCommit !== commit) {
         throw new Error("Local completion requires the latest passing review and no active Task");
       }
       const runtime = this.getChangeSetRuntime(id);
       if (!runtime) throw new Error("Local completion requires working-copy metadata");
+      const approval = this.#db.prepare(`SELECT payload_json FROM decisions
+        WHERE subject_type = 'ChangeSet' AND subject_id = ? AND kind = 'local_merge' AND state = 'approved'
+        ORDER BY resolved_at DESC, created_at DESC LIMIT 1`).get(id);
+      const approvalPayload = approval ? JSON.parse(String(approval.payload_json)) as Record<string, unknown> : null;
+      if (!approvalPayload || approvalPayload.reviewedCommit !== commit || approvalPayload.baseCommit !== runtime.baseCommit
+        || approvalPayload.targetBranch !== item.targetBranch) {
+        throw new Error("Local completion requires approval for the reviewed commit and current target base");
+      }
       this.saveChangeSetRuntime({ ...runtime, mergedCommitSha: commit });
       this.transitionChangeSet(id, "Done");
       this.#db.prepare("INSERT INTO final_summaries(work_item_id, payload_json, created_at) VALUES (?, ?, ?)")
-        .run(id, JSON.stringify({ change: item.slug, delivery: "local", branch: item.targetBranch, commit }), now());
+        .run(id, JSON.stringify({ change: item.slug, delivery: "local", branch: item.targetBranch, baseCommit: runtime.baseCommit, commit }), now());
       this.appendEvent("ChangeSet", id, "final_summary_written", { createdAt: now() });
       this.appendEvent("ChangeSet", id, "completed", { reason: "local_delivery", commit });
       this.#db.exec("COMMIT");
@@ -1253,7 +1274,7 @@ export class MerroStore {
         if (this.activeTask(item.id)) continue;
         this.transitionChangeSet(item.id, "Obsolete");
         for (const decision of this.pendingDecisions()) {
-          if ((decision.kind === "merge" || decision.kind === "merge_conflict") && decision.subjectId === item.id) {
+          if ((decision.kind === "merge" || decision.kind === "merge_conflict" || decision.kind === "local_merge") && decision.subjectId === item.id) {
             this.resolveDecision(decision.id, "resolved");
           }
         }

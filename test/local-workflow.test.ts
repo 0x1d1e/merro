@@ -84,7 +84,7 @@ test("remote registration clones into configured workspace paths without GitHub 
   await assert.rejects(linked.addProject(remote, "escape"), /must not be a symlink/);
 });
 
-for (const scenario of ["remote-free", "with-remote", "base-moved", "dirty-target"] as const) {
+for (const scenario of ["remote-free", "with-remote", "base-moved", "approval-base-moved", "requirements-restart", "dirty-target", "merge-declined"] as const) {
 test(`tool flow approves, implements, reviews and delivers locally without gh: ${scenario}`, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-local-flow-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -96,8 +96,9 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     return file === "git" ? systemCommandRunner.run(file, args, options) : initCommands.run(file, args);
   } });
   const launches: WorkerLaunchInput[] = [];
+  let implementationAttempts = 0;
   const options = {
-    workspacePath: workspace, config: scenario === "with-remote" ? validateConfig({ worktreesDir: "scratch/changes", tmux: { session: "work" } }) : { ...DEFAULT_CONFIG },
+    workspacePath: workspace, config: scenario === "with-remote" ? validateConfig({ worktreesDir: "scratch/changes", git: { defaultDelivery: "local" }, tmux: { session: "work" } }) : { ...DEFAULT_CONFIG },
     github: new Proxy({}, { get(_target, name) { return () => { throw new Error(`GitHub must not be called: ${String(name)}`); }; } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>,
     workers: {
       async prepareClone() {}, async listOwnedWorkers() { return []; },
@@ -109,7 +110,9 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
         launches.push(input);
         if (input.role === "implement") {
           if (input.baseUpdate) await systemCommandRunner.run("git", ["merge", "--no-ff", "--no-commit", input.baseUpdate.baseCommit], { cwd: input.clonePath });
-          await writeFile(join(input.clonePath, "file.txt"), "implemented\n");
+          implementationAttempts++;
+          const content = scenario === "requirements-restart" && implementationAttempts > 1 ? "updated\n" : "implemented\n";
+          await writeFile(join(input.clonePath, "file.txt"), content);
           await systemCommandRunner.run("git", ["add", "."], { cwd: input.clonePath });
           await systemCommandRunner.run("git", ["commit", "-m", "fix: requested change"], { cwd: input.clonePath });
         }
@@ -128,7 +131,9 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
   const call = (name: string, args: Record<string, unknown> = {}) => tools.get(name)!.execute(name, args);
   await call("merro_add_project", { path: "../repo", slug: "app" });
-  await assert.rejects(call("merro_propose_objective", { goal: "Unapproved PR", delivery_mode: "pr", change_sets: [{ name: "pr-request", project_slug: "app" }] }), scenario === "with-remote" ? /GitHub must not be called/ : /no remote/);
+  if (scenario !== "with-remote") {
+    await assert.rejects(call("merro_propose_objective", { goal: "Unapproved PR", delivery_mode: "pr", change_sets: [{ name: "pr-request", project_slug: "app" }] }), /no supported remote/);
+  }
   const plan = await call("merro_propose_objective", { goal: "Make the requested change", change_sets: [{ name: "requested-change", project_slug: "app" }] });
   assert.match(plan.content[0]!.text, /local/i);
   assert.match(plan.content[0]!.text, /0 pull requests/);
@@ -157,7 +162,53 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   }
   assert.deepEqual(launches.map((input) => input.role), scenario === "base-moved" ? ["implement", "review", "implement", "review"] : ["implement", "review"]);
   assert.equal(launches[0]!.clonePath, join(workspace, options.config.worktreesDir, "app", "requested-change"));
-  assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "implemented\n");
+  const pendingMerge = await main.statusSnapshot();
+  assert.equal(pendingMerge.changeSets[0]!.state, "AwaitingLocalMerge");
+  assert.deepEqual(pendingMerge.decisions.map((decision) => decision.kind), ["local_merge"]);
+  assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
+  const publicStatus = await main.publicSnapshot();
+  assert.equal(publicStatus.changes[0]!.status, "Ready to merge");
+  assert.equal(publicStatus.decisions[0]!.summary, "Approve local merge?");
+  const formattedStatus = await call("merro_status");
+  assert.match(formattedStatus.content[0]?.text ?? "", /Approve local merge\?/);
+  assert.match(formattedStatus.content[0]?.text ?? "", /Leave unchanged/);
+  assert.doesNotMatch(formattedStatus.content[0]?.text ?? "", /Leave open/);
+  if (scenario === "merge-declined") {
+    await call("merro_resolve_decision", { change: "requested-change", approved: false });
+    assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
+    const declined = await main.publicSnapshot();
+    assert.equal(declined.changes[0]!.blocked?.message, "Local merge was declined; no changes were applied.");
+    assert.match(declined.changes[0]!.blocked?.next ?? "", /merro retry requested-change/);
+    assert.equal((await main.statusSnapshot()).decisions.length, 0);
+    return;
+  }
+  if (scenario === "requirements-restart") {
+    await main.restartChange("requested-change", "Add the required follow-up change.");
+    for (let pass = 0; pass < 3; pass++) await main.runPass();
+    const restarted = await main.statusSnapshot();
+    assert.equal(restarted.changeSets[0]!.state, "AwaitingLocalMerge");
+    assert.deepEqual(restarted.decisions.map((decision) => decision.kind), ["local_merge"]);
+    assert.deepEqual(launches.map((input) => input.role), ["implement", "review", "implement", "review"]);
+    assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
+  }
+  if (scenario === "approval-base-moved") {
+    await writeFile(join(source.path, "external.txt"), "external change\n");
+    await source.git("add", ".");
+    await source.git("commit", "-m", "chore: advance local base during approval");
+    const staleApproval = await call("merro_resolve_decision", { change: "requested-change", approved: true });
+    assert.match(staleApproval.content[0]?.text ?? "", /fresh implementation, verification, review, and approval/);
+    for (let pass = 0; pass < 3; pass++) await main.runPass();
+    const refreshed = await main.statusSnapshot();
+    assert.equal(refreshed.changeSets[0]!.state, "AwaitingLocalMerge");
+    assert.deepEqual(refreshed.decisions.map((decision) => decision.kind), ["local_merge"]);
+    assert.deepEqual(launches.map((input) => input.role), ["implement", "review", "implement", "review"]);
+    assert.ok(launches[2]!.baseUpdate);
+    assert.equal(await readFile(join(source.path, "external.txt"), "utf8"), "external change\n");
+    assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
+  }
+  const approval = await call("merro_resolve_decision", { change: "requested-change", approved: true });
+  assert.match(approval.content[0]?.text ?? "", /Applied locally: requested-change · main/);
+  assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), scenario === "requirements-restart" ? "updated\n" : "implemented\n");
   assert.equal(await source.git("branch", "--show-current"), "main");
   assert.equal(await source.git("status", "--porcelain"), "");
   const snapshot = await main.statusSnapshot();
@@ -166,3 +217,32 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   assert.equal(snapshot.decisions.length, 0);
 });
 }
+
+test("checkout-detected delivery selects PRs for Projects with remotes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-auto-delivery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = await repository(root);
+  await source.git("remote", "add", "origin", "https://github.invalid/example/app.git");
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  await initializeWorkspace(workspace, { async run(file, args, options) {
+    return file === "git" ? systemCommandRunner.run(file, args, options) : initCommands.run(file, args);
+  } });
+  const repositoryLookups: string[] = [];
+  const github = new Proxy({}, { get(_target, name) {
+    if (name === "repository") return async (reference: string) => {
+      repositoryLookups.push(reference);
+      return { defaultBranch: "main" };
+    };
+    throw new Error(`Unexpected GitHub call: ${String(name)}`);
+  } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>;
+  const main = new MainOrchestrator({ workspacePath: workspace, config: { ...DEFAULT_CONFIG }, github });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  await tools.get("merro_add_project")!.execute("register", { path: "../repo", slug: "app" });
+  const proposal = await tools.get("merro_propose_objective")!.execute("plan", {
+    goal: "Update the remote-backed project", change_sets: [{ name: "remote-change", project_slug: "app" }],
+  });
+  assert.equal((proposal.details as { plans: Array<{ delivery: string }> }).plans[0]!.delivery, "pr");
+  assert.deepEqual(repositoryLookups, ["https://github.invalid/example/app.git"]);
+});

@@ -3,7 +3,7 @@ import { lstat, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { MerroConfig, WorkerSettings } from "../config.js";
-import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet } from "../domain/model.js";
+import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../domain/relations.js";
@@ -24,7 +24,7 @@ import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-run
 import { GitClient } from "../vcs/git.js";
 
 type GitAdapter = Pick<GitClient, "discoverProject" | "createChangeSetClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint">
-  & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone" | "cloneProject" | "deliverLocal">>;
+  & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone" | "cloneProject" | "inspectLocalDelivery" | "deliverLocal">>;
 type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "issues" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest" | "beginPass">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup" | "listOwnedWorkers">
@@ -570,8 +570,8 @@ export class MainOrchestrator {
   }
 
   async #prepareObjective(store: MerroStore, input: ObjectiveRequest) {
-    const delivery = input.deliveryMode ?? this.#config.git.defaultDelivery;
-    if (delivery !== "local" && delivery !== "pr") throw new Error("Delivery mode must be local or pr");
+    const requestedDelivery = input.deliveryMode ?? this.#config.git.defaultDelivery;
+    if (requestedDelivery !== "auto" && requestedDelivery !== "local" && requestedDelivery !== "pr") throw new Error("Delivery mode must be auto, local or pr");
     const explicit = "changeSets" in input;
     let projects: Project[];
     let issueScopes: ObjectiveIssueScope[];
@@ -607,12 +607,13 @@ export class MainOrchestrator {
       selections = issueScopes.map((scope) => ({ name: null, projectSlug: scope.projectSlug, scope }));
     }
 
-    if (delivery === "pr") {
-      for (const project of projects) {
-        if (!project.baseRemote || !project.pushRemote) throw new Error(`Project '${project.slug}' has no remote; use local delivery`);
-        const repository = await this.#github.repository(project.baseRemote);
-        project.defaultBranch = repository.defaultBranch;
-      }
+    const deliveryByProject = new Map(projects.map((project) => [project.slug,
+      requestedDelivery === "auto" ? project.baseRemote && project.pushRemote ? "pr" as const : "local" as const : requestedDelivery]));
+    for (const project of projects) {
+      if (deliveryByProject.get(project.slug) !== "pr") continue;
+      if (!project.baseRemote || !project.pushRemote) throw new Error(`Project '${project.slug}' has no supported remote; use local delivery`);
+      const repository = await this.#github.repository(project.baseRemote);
+      project.defaultBranch = repository.defaultBranch;
     }
     const projectBySlug = new Map(projects.map((project) => [project.slug, project]));
     const issueRows = new Map<string, GitHubIssue>();
@@ -658,11 +659,17 @@ export class MainOrchestrator {
     const requestedRelations = "relations" in input ? input.relations ?? [] : [];
     const changeSets = groups.map(({ name, projectSlug, issues }): ChangeSet => {
       const numbers = issues.map((issue) => issue.number);
+      const requestedProjectDelivery = deliveryByProject.get(projectSlug);
+      if (!requestedProjectDelivery) throw new Error(`unknown Project delivery mode: ${projectSlug}`);
+      const preserveExistingDelivery = requestedDelivery === "auto" && this.#config.git.defaultDelivery === "auto";
       const existing = numbers.length ? store.findNonTerminalChangeSet(projectSlug, numbers)
         : name ? store.listChangeSets().find((item) => item.projectSlug === projectSlug && item.slug === name && !terminal(item)) ?? null : null;
       if (existing) {
         if (name && existing.slug !== name) throw new Error(`These issues already belong to ChangeSet '${existing.slug}', not '${name}'`);
-        if ((existing.delivery ?? "pr") !== delivery) throw new Error(`ChangeSet '${existing.slug}' already has ${existing.delivery ?? "pr"} delivery; obtain a new plan instead`);
+        const existingDelivery = existing.delivery ?? "pr";
+        if (!preserveExistingDelivery && existingDelivery !== requestedProjectDelivery) {
+          throw new Error(`ChangeSet '${existing.slug}' already has ${existingDelivery} delivery; obtain a new plan instead`);
+        }
         plannedNames.add(existing.slug);
         if (name) namesToIds.set(name, existing.id);
         return existing;
@@ -677,7 +684,8 @@ export class MainOrchestrator {
       const id = issues.length === 1 ? sourceId(projectSlug, issues[0]!.number, generation) : `${projectSlug}:change:${slug}:g${generation}`;
       this.#names.set(id, slug);
       if (name) namesToIds.set(name, id);
-      return { id, slug, projectSlug, delivery, targetBranch: projectBySlug.get(projectSlug)!.defaultBranch, issues: numbers.map((number) => ({ projectSlug, number })), generation,
+      return { id, slug, projectSlug, delivery: requestedProjectDelivery,
+        targetBranch: projectBySlug.get(projectSlug)!.defaultBranch, issues: numbers.map((number) => ({ projectSlug, number })), generation,
         state: "Planned", priority: input.priority ?? "normal", readySince: null, blockedReason: null, blockedResumeState: null };
     });
 
@@ -832,9 +840,13 @@ export class MainOrchestrator {
         store.transitionChangeSet(item.id, item.blockedResumeState!);
         item = store.getChangeSet(item.id)!;
       }
-      if (["Reviewing", "Reviewed", "Publishing", "AwaitingMerge"].includes(item.state)) store.transitionChangeSet(item.id, "Implementing");
+      if (["Reviewing", "Reviewed", "AwaitingLocalMerge", "Publishing", "AwaitingMerge"].includes(item.state)) store.transitionChangeSet(item.id, "Implementing");
       const workRuntime = store.getChangeSetRuntime(item.id);
-      if (workRuntime) { workRuntime.infrastructureRetries = 0; store.saveChangeSetRuntime(workRuntime); }
+      if (workRuntime) {
+        workRuntime.infrastructureRetries = 0;
+        if (item.delivery === "local") workRuntime.reviewedDiffHash = null;
+        store.saveChangeSetRuntime(workRuntime);
+      }
       this.#progress(`${changeName(item)} · Updating requirements and restarting.`);
     });
     await this.runPass();
@@ -866,6 +878,7 @@ export class MainOrchestrator {
     const kind = await this.#withStore((store) => store.getDecision(decisionId)?.kind);
     try {
       if (kind === "merge_conflict") await this.resolveMergeConflictDecision(decisionId, approved ? "resolved" : "abandon");
+      else if (kind === "local_merge") await this.resolveLocalMergeDecision(decisionId, approved);
       else await this.resolveMergeDecision(decisionId, approved);
     } catch (error) {
       if (approved) {
@@ -878,9 +891,12 @@ export class MainOrchestrator {
       const decision = store.getDecision(decisionId);
       const item = decision && store.getChangeSet(decision.subjectId);
       const runtime = item && store.getChangeSetRuntime(item.id);
-      return item && runtime ? { name: changeName(item), state: item.state, pr: runtime.pullRequestNumber } : null;
+      return item && runtime ? { name: changeName(item), state: item.state, pr: runtime.pullRequestNumber, targetBranch: item.targetBranch } : null;
     });
     if (!resolved) return "Decision resolved.";
+    if (kind === "local_merge") return approved
+      ? resolved.state === "Done" ? `Applied locally: ${resolved.name} · ${resolved.targetBranch}.` : `Local base changed; fresh implementation, verification, review, and approval are required.`
+      : `Local merge declined for ${resolved.name}; no changes applied.`;
     if (approved && resolved.state === "Done") return `Merged: ${resolved.name} · PR #${resolved.pr ?? "?"}.`;
     if (kind === "merge_conflict") return approved ? `Approved a fresh implementation for ${resolved.name}.` : `Left ${resolved.name} unchanged.`;
     return approved ? `Merge approved for ${resolved.name}.` : `Left PR #${resolved.pr ?? "?"} open.`;
@@ -993,6 +1009,10 @@ export class MainOrchestrator {
       await this.resolveMergeConflictDecision(decisionId, approved ? "resolved" : "abandon");
       return;
     }
+    if (decisionKind === "local_merge") {
+      await this.resolveLocalMergeDecision(decisionId, approved);
+      return;
+    }
     if (decisionKind !== "merge") throw new Error(`pending merge Decision not found: ${decisionId}`);
 
     await this.#withStore(async (store) => {
@@ -1093,6 +1113,74 @@ export class MainOrchestrator {
         this.#block(store, item, reason, `Merge ${unavailable ? "reconciliation failed" : "was rejected"}: ${errorText(error)}`);
       }
       await this.#finishObjectives(store, new Set(), unsafeProjects);
+    });
+    await this.runPass();
+  }
+
+  async resolveLocalMergeDecision(decisionId: string, approved: boolean): Promise<void> {
+    await this.#withStore(async (store) => {
+      const decision = store.getDecision(decisionId);
+      if (!decision || decision.state !== "pending" || decision.kind !== "local_merge") {
+        throw new Error(`pending local merge Decision not found: ${decisionId}`);
+      }
+      const item = store.getChangeSet(decision.subjectId);
+      const runtime = item && store.getChangeSetRuntime(item.id);
+      const project = item && store.getProject(item.projectSlug);
+      if (!item || item.delivery !== "local" || item.state !== "AwaitingLocalMerge" || !runtime?.clonePath
+        || !runtime.baseCommit || !item.targetBranch || !project || !this.#git.inspectLocalDelivery || !this.#git.deliverLocal) {
+        throw new Error(`local merge Decision ${decisionId} no longer matches an AwaitingLocalMerge ChangeSet`);
+      }
+      if (!approved) {
+        store.resolveDecision(decisionId, "rejected");
+        this.#block(store, item, "merge_rejected", "Local merge declined; the canonical checkout remains unchanged");
+        return;
+      }
+      const { unsafeProjects } = await this.#workerSafetyPreflight(store);
+      if (unsafeProjects.has(project.slug) || store.activeTask(item.id)) {
+        throw new Error(`Worker safety prevents local merge in Project ${project.slug}; retry after workers exit and inventory succeeds. Decision remains pending.`);
+      }
+      const payload = typeof decision.payload === "object" && decision.payload !== null
+        ? decision.payload as Record<string, unknown> : {};
+      const reviewedCommit = typeof payload.reviewedCommit === "string" ? payload.reviewedCommit : null;
+      const baseCommit = typeof payload.baseCommit === "string" ? payload.baseCommit : null;
+      const diffHash = typeof payload.diffHash === "string" ? payload.diffHash : null;
+      const reviewTask = store.listTasks(item.id).at(-1);
+      if (!reviewedCommit || !baseCommit || !diffHash || baseCommit !== runtime.baseCommit
+        || reviewTask?.role !== "review" || reviewTask.outcome !== "pass" || reviewTask.reviewedCommit !== reviewedCommit
+        || payload.targetBranch !== item.targetBranch) {
+        store.resolveDecision(decisionId, "resolved");
+        this.#resolveMergeDecisions(store, item.id);
+        this.#block(store, item, "merge_failed", "Local merge approval no longer matches the passing review; inspect the checkout and retry for a fresh approval");
+        return;
+      }
+      try {
+        const inspection = await this.#git.inspectLocalDelivery(project, runtime.clonePath, item.targetBranch, reviewedCommit, baseCommit);
+        if ("baseUpdate" in inspection) {
+          store.resolveDecision(decisionId, "resolved");
+          this.#queueLocalBaseUpdate(store, item, runtime, inspection.baseUpdate);
+          return;
+        }
+        if (inspection.diffHash !== diffHash || runtime.reviewedDiffHash !== diffHash) {
+          throw new Error("The reviewed diff changed after approval was requested");
+        }
+        const delivered = await this.#git.deliverLocal(project, runtime.clonePath, item.targetBranch, reviewedCommit, baseCommit, diffHash);
+        if ("baseUpdate" in delivered) {
+          store.resolveDecision(decisionId, "resolved");
+          this.#queueLocalBaseUpdate(store, item, runtime, delivered.baseUpdate);
+          return;
+        }
+        store.resolveDecision(decisionId, "approved");
+        store.completeLocalChangeSet(item.id, delivered.commit);
+        this.#notify(`${changeName(item)} done · Applied locally to ${item.targetBranch}.`);
+        await this.#finishObjectives(store, new Set(), unsafeProjects);
+      } catch (error) {
+        if (store.getDecision(decisionId)?.state === "pending") store.resolveDecision(decisionId, "resolved");
+        const current = store.getChangeSet(item.id);
+        if (current && current.state !== "Blocked" && !terminal(current)) {
+          this.#resolveMergeDecisions(store, item.id);
+          this.#block(store, current, "merge_failed", `Local merge failed: ${errorText(error)}`);
+        }
+      }
     });
     await this.runPass();
   }
@@ -1897,7 +1985,7 @@ export class MainOrchestrator {
 
   #notifyReviewComplete(store: MerroStore, item: ChangeSet, task: Task): void {
     if (store.hasEvent("Task", task.id, "review_complete_notified")) return;
-    const message = `${changeName(item)} · Review passed; ${item.delivery === "local" ? "completing locally" : "opening PR"}.`;
+    const message = `${changeName(item)} · Review passed; ${item.delivery === "local" ? "requesting local merge approval" : "opening PR"}.`;
     this.#progress(message);
     this.#queueNotification("review_complete", item.id, message);
     store.appendEvent("Task", task.id, "review_complete_notified", {});
@@ -1916,28 +2004,66 @@ export class MainOrchestrator {
 
   async #reconcileLocalDelivery(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<boolean> {
     let deferred = false;
-    for (const item of store.listChangeSets()) {
-      if (item.delivery !== "local" || item.state !== "Reviewed" || unavailableProjects.has(item.projectSlug)
-        || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
-      if (this.#reviewNotificationsInFlight.has(item.id)) { deferred = true; continue; }
+    for (let item of store.listChangeSets()) {
+      if (item.delivery !== "local" || !["Reviewed", "AwaitingLocalMerge"].includes(item.state)
+        || unavailableProjects.has(item.projectSlug) || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
+      if (item.state === "Reviewed" && this.#reviewNotificationsInFlight.has(item.id)) { deferred = true; continue; }
       try {
         const runtime = store.getChangeSetRuntime(item.id);
         const project = store.getProject(item.projectSlug);
-        const review = store.listTasks(item.id).at(-1);
-        if (!project || !runtime?.clonePath || !item.targetBranch || review?.outcome !== "pass" || !review.reviewedCommit || !this.#git.deliverLocal) throw new Error("Local delivery requires a reviewed working copy and target branch");
-        const delivered = await this.#git.deliverLocal(project, runtime.clonePath, item.targetBranch, review.reviewedCommit);
-        if ("baseUpdate" in delivered) {
-          store.saveChangeSetRuntime({ ...runtime, baseUpdate: delivered.baseUpdate });
-          store.transitionChangeSet(item.id, "Implementing");
-          this.#progress(`${item.slug} · Local base moved; updating and reviewing again.`);
-        } else {
-          store.completeLocalChangeSet(item.id, delivered.commit);
-          this.#notify(`${item.slug} done · Completed locally on ${item.targetBranch}.`);
-          // Keep the clone until finalized Task scratch has been cleaned safely.
+        const reviewTask = store.listTasks(item.id).at(-1);
+        if (!project || !runtime?.clonePath || !runtime.baseCommit || !item.targetBranch
+          || reviewTask?.role !== "review" || reviewTask.outcome !== "pass" || !reviewTask.reviewedCommit
+          || !this.#git.inspectLocalDelivery) {
+          throw new Error("Local merge needs the latest passing review, working copy, and approved target base");
         }
-      } catch (error) { this.#block(store, item, "merge_failed", `Local delivery failed: ${errorText(error)}`); }
+        const review = reviewTask.resultJson ? parseReviewResult(JSON.parse(reviewTask.resultJson)) : null;
+        if (!review || review.status !== "pass" || review.reviewed_commit !== reviewTask.reviewedCommit) {
+          throw new Error("Local merge needs the latest valid passing review result");
+        }
+        const inspection = await this.#git.inspectLocalDelivery(project, runtime.clonePath, item.targetBranch, reviewTask.reviewedCommit, runtime.baseCommit);
+        if ("baseUpdate" in inspection) {
+          this.#queueLocalBaseUpdate(store, item, runtime, inspection.baseUpdate);
+          continue;
+        }
+        if (runtime.reviewedDiffHash !== null && runtime.reviewedDiffHash !== inspection.diffHash) {
+          throw new Error("Local reviewed diff changed; fresh verification and review are required");
+        }
+        if (runtime.reviewedDiffHash === null) {
+          runtime.reviewedDiffHash = inspection.diffHash;
+          store.saveChangeSetRuntime(runtime);
+        }
+        if (item.state === "Reviewed") {
+          store.transitionChangeSet(item.id, "AwaitingLocalMerge");
+          item = store.getChangeSet(item.id)!;
+        }
+        const pending = store.pendingDecisions().find((decision) => decision.kind === "local_merge" && decision.subjectId === item.id);
+        const payload = { targetBranch: item.targetBranch, baseCommit: inspection.baseCommit,
+          reviewedCommit: reviewTask.reviewedCommit, diffHash: inspection.diffHash };
+        if (pending) {
+          if (JSON.stringify(pending.payload) === JSON.stringify(payload)) continue;
+          store.resolveDecision(pending.id, "resolved");
+        }
+        store.createDecision({ id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "local_merge", payload });
+        const verification = finalVerification(store, item, review);
+        const message = `${changeName(item)}\n\nReview passed\nVerification passed\n${verification}\n\nReady to apply to ${item.targetBranch}.\n\nApprove? /merro approve ${changeName(item)} · Leave unchanged: /merro leave ${changeName(item)}`;
+        this.#notify(message, "warning");
+        this.#queueNotification("local_merge_ready", item.id, message);
+      } catch (error) {
+        this.#resolveMergeDecisions(store, item.id);
+        this.#block(store, item, "merge_failed", `Local merge preparation failed: ${errorText(error)}`);
+      }
     }
     return deferred;
+  }
+
+  #queueLocalBaseUpdate(store: MerroStore, item: ChangeSet, runtime: ChangeSetRuntimeRecord, baseUpdate: BaseUpdate): void {
+    this.#resolveMergeDecisions(store, item.id);
+    runtime.baseUpdate = baseUpdate;
+    runtime.reviewedDiffHash = null;
+    store.saveChangeSetRuntime(runtime);
+    store.transitionChangeSet(item.id, "Implementing");
+    this.#progress(`${changeName(item)} · Local base changed; implementing, verifying, and reviewing again.`);
   }
 
   async #reconcilePublication(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<boolean> {
@@ -2260,7 +2386,7 @@ export class MainOrchestrator {
 
   #resolveMergeDecisions(store: MerroStore, changeSetId: string): void {
     for (const decision of store.pendingDecisions()) {
-      if (decision.kind === "merge" && decision.subjectId === changeSetId) {
+      if ((decision.kind === "merge" || decision.kind === "local_merge") && decision.subjectId === changeSetId) {
         store.resolveDecision(decision.id, "resolved");
       }
     }
