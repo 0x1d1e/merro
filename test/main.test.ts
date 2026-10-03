@@ -499,6 +499,59 @@ test("pasted Markdown tables work without a Project heading or Status column", a
   assert.equal(statusDetails.planning.items[0]?.status, "In Progress");
 });
 
+test("Markdown dependency wording fails closed and 'last' waits for all earlier workstreams", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2, 3] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  const proposeMarkdown = tools.get("merro_propose_objective")!;
+
+  const unknown = await proposeMarkdown.execute("unknown-dependency", {
+    goal: "Plan interface-dependent work",
+    markdown: [
+      "| Order | Workstream | Issues | Parallel? |",
+      "|---|---|---|---|",
+      "| 1 | Interfaces | #1 | yes |",
+      "| 2 | Consumer | #2 | depends on interfaces stabilizing |",
+    ].join("\n"),
+    project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
+  });
+  const unknownDetails = unknown.details as {
+    plans: Array<{ change: string }>;
+    planning: { items: Array<{ workstream: string; changeSet?: string }>; unresolved: Array<{ workstream: string; statement: string }> };
+  };
+  assert.deepEqual(unknownDetails.plans.map(({ change }) => change), ["interfaces"]);
+  assert.equal(unknownDetails.planning.items.find(({ workstream }) => workstream === "Consumer")?.changeSet, undefined);
+  assert.deepEqual(unknownDetails.planning.unresolved, [{
+    workstream: "Consumer", projectSlug: "kinetix", statement: "depends on interfaces stabilizing",
+  }]);
+
+  const last = await proposeMarkdown.execute("last-dependency", {
+    goal: "Plan the final release after parallel work",
+    markdown: [
+      "| Order | Workstream | Issues | Parallel? |",
+      "|---|---|---|---|",
+      "| 1A | Sibling A | #1 | yes |",
+      "| 1B | Sibling B | #2 | yes |",
+      "| 2 | Final release | #3 | last |",
+    ].join("\n"),
+    project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
+  });
+  const lastDetails = last.details as {
+    relations: Array<{ kind: string; from: string; to: string }>;
+    planning: { items: Array<{ workstream: string; sourceDependencies?: Array<{ workstream: string; projectSlug: string }> }> };
+    runnableImmediately: number;
+  };
+  assert.deepEqual(lastDetails.relations, [
+    { kind: "Requires", from: "final-release", to: "sibling-a" },
+    { kind: "Requires", from: "final-release", to: "sibling-b" },
+  ]);
+  assert.deepEqual(lastDetails.planning.items.find(({ workstream }) => workstream === "Final release")?.sourceDependencies, [
+    { workstream: "Sibling A", projectSlug: "kinetix" },
+    { workstream: "Sibling B", projectSlug: "kinetix" },
+  ]);
+  assert.equal(lastDetails.runnableImmediately, 2);
+});
+
 test("full Kinetix roadmaps enter through Markdown, retain typed structure, and never reach Workers", async (t) => {
   const fixture = await readFile(join(process.cwd(), "test", "fixtures", "kinetix-roadmap.md"), "utf8");
   const harness = await createHarness(t, {
@@ -585,6 +638,11 @@ test("full Kinetix roadmaps enter through Markdown, retain typed structure, and 
   assert.equal(barrier?.sourceDependencies?.length, 18);
   assert.ok(barrier?.sourceDependencies?.some((dependency) => dependency.workstream === "Security adversarial suite"));
   assert.ok(barrier?.sourceDependencies?.some((dependency) => dependency.workstream === "Freeze 1.x/API compatibility policy"));
+  const finalRelease = item("Final changelog/release docs");
+  assert.equal(finalRelease?.sourceDependencies?.length, 16);
+  assert.ok(finalRelease?.sourceDependencies?.some((dependency) => dependency.workstream === "Finish credential interchange"));
+  assert.ok(finalRelease?.sourceDependencies?.some((dependency) => dependency.workstream === "Performance baselines"));
+  assert.ok(finalRelease?.sourceDependencies?.every((dependency) => dependency.projectSlug === "kinetix"));
   assert.ok(details.planning.unresolved.some((entry) => entry.workstream === "Security adversarial suite" && entry.statement === "after plugin security contract"));
   assert.ok(details.planning.unresolved.some((entry) => entry.workstream === "Freeze 1.x/API compatibility policy" && entry.statement === "after interfaces stabilize"));
   for (const workstream of ["Docs/product audit", "Complete v1 acceptance matrix", "Final changelog/release docs"]) {

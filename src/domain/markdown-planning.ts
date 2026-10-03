@@ -177,25 +177,51 @@ function projectAt(text: string, index: number, aliases: readonly { alias: strin
   return best?.projectSlug;
 }
 
-function relationClause(value: string): string | undefined {
-  const after = value.match(/\bafter\s+(.+)$/i);
-  if (after) return after[1]!.split(/;\s*parallel\b/i)[0]!.trim().replace(/[.;,]+$/, "").trim();
-  if (/\blast\b/i.test(value)) return "last";
+interface RelationClause {
+  target: string;
+  statement: string;
+  last?: boolean;
+  unsupported?: boolean;
+}
+
+function relationClause(value: string): RelationClause | undefined {
+  const source = value.trim().split(/;\s*parallel\b/i)[0]!.trim().replace(/[.;,]+$/, "").trim();
+  const targetText = source.replace(/^(?:yes[,;:]?\s+|parallel[,;:]?\s+)/i, "");
+  if (/^(?:(?:finish|run|do|ship)\s+)?last$/i.test(targetText)) {
+    return { target: "last", statement: targetText, last: true };
+  }
+  const patterns = [
+    /^after\s+(.+)$/i,
+    /^depends\s+(?:on|upon)\s+(.+)$/i,
+    /^requires?\s+(.+)$/i,
+    /^blocked\s+by\s+(.+)$/i,
+    /^waits?\s+for\s+(.+)$/i,
+    /^following\s+(.+)$/i,
+  ];
+  for (const pattern of patterns) {
+    const match = targetText.match(pattern);
+    if (match) return { target: match[1]!.replace(/[.;,]+$/, "").trim(), statement: targetText };
+  }
+  if (/\b(?:after|depend(?:s|ing)?|requires?|blocked|wait(?:s|ing)?|following|last)\b/i.test(source)) {
+    return { target: source, statement: source, unsupported: true };
+  }
   return undefined;
 }
 
 function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappings: readonly MarkdownProjectMapping[]): string | undefined {
-  const clause = relationClause(row.parallel);
-  if (!clause) return undefined;
-  if (clause.toLowerCase() === "last") {
-    const previous = rows.slice(0, rows.indexOf(row)).filter((candidate) => candidate.projectSlug === row.projectSlug).at(-1);
-    if (!previous) return "last (no preceding workstream in this Project)";
-    row.dependencies.push(previous);
+  const parsedClause = relationClause(row.parallel);
+  if (!parsedClause) return undefined;
+  if (parsedClause.last) {
+    const previous = rows.slice(0, rows.indexOf(row)).filter((candidate) => candidate.projectSlug === row.projectSlug);
+    if (!previous.length) return `${parsedClause.statement} (no preceding workstream in this Project)`;
+    row.dependencies.push(...previous);
     return undefined;
   }
+  if (parsedClause.unsupported) return parsedClause.statement;
+  const clause = parsedClause.target;
   if (/\ball\s+3x\s*\/\s*4x\b/i.test(clause)) {
     const barriers = rows.filter((candidate) => candidate !== row && candidate.order && /^[34][a-z0-9]*$/i.test(candidate.order));
-    if (!barriers.length) return clause;
+    if (!barriers.length) return parsedClause.statement;
     row.dependencies.push(...barriers);
     return undefined;
   }
@@ -212,13 +238,13 @@ function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappi
       const sameProject = candidates.filter((candidate) => candidate.projectSlug === row.projectSlug);
       if (sameProject.length) candidates = sameProject;
     }
-    if (candidates.length !== 1) return `${clause} (issue #${number} does not identify one roadmap workstream)`;
+    if (candidates.length !== 1) return `${parsedClause.statement} (issue #${number} does not identify one roadmap workstream)`;
     resolved.add(candidates[0]!);
   }
   for (const match of orderMatches) {
     const order = match[1]!.toLowerCase();
     const candidates = rows.filter((candidate) => candidate.projectSlug === row.projectSlug && candidate.order?.toLowerCase() === order);
-    if (candidates.length !== 1) return `${clause} (order ${match[1]} does not identify one workstream in ${row.projectSlug})`;
+    if (candidates.length !== 1) return `${parsedClause.statement} (order ${match[1]} does not identify one workstream in ${row.projectSlug})`;
     resolved.add(candidates[0]!);
   }
 
@@ -231,12 +257,12 @@ function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappi
   if (words.length) {
     const candidates = rows.filter((candidate) => candidate !== row && candidate.projectSlug === row.projectSlug
       && words.every((word) => candidate.workstream.toLowerCase().split(/[^a-z0-9]+/).includes(word)));
-    if (candidates.length !== 1) return clause;
+    if (candidates.length !== 1) return parsedClause.statement;
     resolved.add(candidates[0]!);
   }
-  if (!resolved.size) return clause;
+  if (!resolved.size) return parsedClause.statement;
   for (const dependency of resolved) {
-    if (dependency === row) return `${clause} (workstream cannot depend on itself)`;
+    if (dependency === row) return `${parsedClause.statement} (workstream cannot depend on itself)`;
     row.dependencies.push(dependency);
   }
   return undefined;
@@ -264,7 +290,7 @@ export function interpretMarkdownRoadmap(markdown: string, projectMapInput: read
   const rows = parseTables(markdown, mappings);
   for (const row of rows) {
     const unresolved = resolveDependencies(row, rows, mappings);
-    if (unresolved) row.unresolvedStatement = unresolved.startsWith("after ") || unresolved === "last" ? unresolved : `after ${unresolved}`;
+    if (unresolved) row.unresolvedStatement = unresolved;
   }
 
   const selected = new Map<string, RoadmapRow>();
