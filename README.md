@@ -45,7 +45,7 @@ A **ChangeSet** is one delivery unit in one Project; an **Objective** is your go
 
 Paths derive from the initialized workspace root containing `.merro`. Start Main there; Merro does not search parent directories. Local registrations stay at their supplied paths. Existing clone destinations are never silently adopted or overwritten.
 
-First init creates the directories above, `.merro/config.json` containing `{}`, three short Markdown templates, and `.merro/projects/`. It does not register Projects, launch agents, start tmux, or contact GitHub. Repeating init reports `Merro already initialized.` without rewriting files or repairing missing directories.
+First init creates the directories above, `.merro/config.json` containing all editable defaults, three short Markdown templates, and `.merro/projects/`. It does not register Projects, launch agents, start tmux, or contact GitHub. Repeating init reports `Merro already initialized.` without rewriting files or repairing missing directories.
 
 ## Core workflow
 
@@ -74,6 +74,29 @@ tmux attach -t merro-kinetix
 Main need not run inside tmux. Watch Workers without typing instructions into them. Changed requirements go through Main, which safely stops and replaces the attempt.
 
 Reopen Pi in the same workspace to resume. Workers may outlive Main; Merro checks their identity rather than duplicating them. Use one Main per workspace.
+
+## Commands
+
+Merro registers one Pi command: `/merro`.
+
+```text
+/merro
+/merro init
+/merro status
+/merro <change>
+/merro approve [change]
+/merro leave [change]
+/merro retry [change]
+/merro stop [objective]
+/merro run
+/merro export
+/merro unlock
+/merro config
+```
+
+`/merro` shows status; a change name shows details. `approve` and `leave` resolve merge Decisions, `retry` resumes eligible blocked work, and `stop` stops Objectives without interrupting active Tasks. `run` checks current work, `export` writes `.merro/export.json`, and `unlock` clears stale ownership without bypassing a live Main.
+
+`/merro config` shows the config file location and effective Merro settings, including defaults for omitted fields. Edit that JSON file directly; `null` model/thinking values inherit normal Pi settings.
 
 ## Natural-language first
 
@@ -123,7 +146,7 @@ Guidance precedence is current user instruction and approved ChangeSet requireme
 
 Main reads customization Markdown each turn; fresh Workers receive the applicable instructions. Edits affect future attempts, never steer active Workers.
 
-Machine settings belong in the optional overrides in `config.json`, not prompts or review policy. For example:
+Machine settings belong in `config.json`, not prompts or review policy. Init writes every setting; edit the fields you need. For example:
 
 ```json
 {
@@ -136,7 +159,7 @@ Machine settings belong in the optional overrides in `config.json`, not prompts 
 }
 ```
 
-Omit settings to use defaults: Pi's normal model/thinking settings, review enabled, local delivery. `tmux.session` is the prefix for per-Project sessions. Restart Main after changing machine settings. See [runtime settings](docs/runtime-settings.md) for advanced options.
+Omitted settings still use defaults; `null` model/thinking inherits Pi's normal settings. Review is always enabled; delivery defaults to local. `tmux.session` is the prefix for per-Project sessions. Restart Main after changing machine settings. See [runtime settings](docs/runtime-settings.md) for advanced options.
 
 ## Local-only is first-class
 

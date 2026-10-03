@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { DEFAULT_CONFIG } from "../src/config.js";
 import { CommandError, systemCommandRunner } from "../src/runtime/commands.js";
 import { initializeWorkspace, INITIALIZATION_REQUIRED, requireWorkspace } from "../src/runtime/workspace.js";
 import { MerroStore } from "../src/store/store.js";
@@ -25,7 +26,7 @@ test("Pi startup and tools refuse an uninitialized cwd without guessing its init
     const options={sections:{normal:'Pi instructions'}};
     await events.get('before_agent_start')({systemPromptOptions:options});
     assert.deepEqual(options.sections,{normal:'Pi instructions'});
-    await assert.rejects(commands.get('status').handler('',{}), {message:${JSON.stringify(INITIALIZATION_REQUIRED)}});
+    await assert.rejects(commands.get('merro').handler('status',{}), {message:${JSON.stringify(INITIALIZATION_REQUIRED)}});
     await assert.rejects(tools.get('merro_status').execute('status',{}), {message:${JSON.stringify(INITIALIZATION_REQUIRED)}});
     await events.get('session_shutdown')();`;
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
@@ -53,8 +54,13 @@ for (const gitRepository of [false, true]) {
         await commands.get('merro').handler('init',{});
         await commands.get('merro').handler('init',{});
         assert.deepEqual((await tools.get('merro_list_projects').execute('list',{})).details,[]);
-        await commands.get('status').handler('',{});
-        await commands.get('merro-export').handler('',{});
+        assert.deepEqual([...commands.keys()],['merro']);
+        await commands.get('merro').handler('status',{});
+        await commands.get('merro').handler('export',{});
+        const messages=[];
+        await commands.get('merro').handler('config',{ui:{notify(message){messages.push(message)}}});
+        assert.ok(messages[0].startsWith('Config: '+process.cwd()+'/.merro/config.json\\n\\n'));
+        assert.deepEqual(JSON.parse(messages[0].slice(messages[0].indexOf('{'))),${JSON.stringify(DEFAULT_CONFIG)});
       } finally { await events.get('session_shutdown')(); }`;
     const result = await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, MERRO_RUNTIME: "" } });
     assert.match(result.stdout, /Merro initialized in /);
@@ -65,6 +71,7 @@ for (const gitRepository of [false, true]) {
     }
     await assert.rejects(readFile(join(cwd, ".merro", "projects/my-app.md")), { code: "ENOENT" });
     await requireWorkspace(cwd);
+    assert.deepEqual(JSON.parse(await readFile(join(cwd, ".merro", "config.json"), "utf8")), DEFAULT_CONFIG);
     assert.deepEqual(JSON.parse(await readFile(join(cwd, ".merro", "export.json"), "utf8")).projects, []);
     await assert.rejects(readFile(join(root, "gh-called")), { code: "ENOENT" });
     if (gitRepository) {

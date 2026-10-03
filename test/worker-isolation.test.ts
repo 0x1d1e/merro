@@ -108,7 +108,7 @@ test("Main entrypoint registers orchestration normally without the worker marker
   const startup = `import merro from ${JSON.stringify(pathToFileURL(resolve("dist/src/index.js")).href)};
     const commands=[], tools=[], events=[];
     await merro({registerCommand(name){commands.push(name)},registerTool(tool){tools.push(tool.name)},on(event){events.push(event)}});
-    if(!commands.includes('merro-approve') || !tools.includes('merro_start_objective') || !events.includes('session_start')) throw Error('Main not initialized');`;
+    if(commands.length !== 1 || commands[0] !== 'merro' || !tools.includes('merro_start_objective') || !events.includes('session_start')) throw Error('Main not initialized');`;
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
   await assert.rejects(readFile(join(cwd, ".merro", "config.json")), { code: "ENOENT" });
 });

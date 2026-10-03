@@ -4,7 +4,7 @@ Read before changing ChangeSet states, relations, scheduling, PR/merge flow or r
 
 ## Workspace and approval
 
-Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly in any writable directory, without requiring a Git repository, remote or GitHub access. First init writes `{}` config, short workspace/role Markdown templates, the Project-guidance directory, and default checkout directories. Existing `.merro` makes init a no-op, not a repair. Projects register separately: remote URLs clone into `<root>/projects/<project>`; supplied local paths register directly. No home scanning or destination adoption. Startup opens and reconciles state without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
+Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly in any writable directory, without requiring a Git repository, remote or GitHub access. First init writes all editable config defaults, short workspace/role Markdown templates, the Project-guidance directory, and default checkout directories. Existing `.merro` makes init a no-op, not a repair. Projects register separately: remote URLs clone into `<root>/projects/<project>`; supplied local paths register directly. No home scanning or destination adoption. Startup opens and reconciles state without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
 
 Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; replacement or restart expires it. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch, delivery mode, target branch, or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
 
@@ -42,13 +42,13 @@ Changed requirements require stopping the exact owned Worker, confirming exit, c
 
 A slot is one active Task, implementation or review. Default global capacity is 3; at most one Task per ChangeSet regardless of its issue count. Order: highest active-owner priority, downstream unblock count, oldest Ready, stable private tie-breaker. Ready changes without a slot remain Ready.
 
-Main reconciles before scheduling, on startup and periodically while open. `/merro-run` requests a pass. Serialized access lets status/export wait behind an active pass without competing for the writer lock.
+Main reconciles before scheduling, on startup and periodically while open. `/merro run` requests a pass. Serialized access lets status/export wait behind an active pass without competing for the writer lock.
 
 ## Failures and recovery
 
 A real failure blocks once with a semantic change name, reason and retry guidance. A missing/dead Worker with no valid result gets one infrastructure retry; the next disappearance blocks. Invalid/stale results, commit mismatch and missing verification are not infrastructure retries.
 
-`/merro-continue <change>` resumes the blocked phase after its cause is fixed. Task failures receive a fresh Task; PublishBlocked resumes publication/reconciliation without repeating completed implementation or review. Known transient `gh` connection failures receive bounded backoff before blocking. Externally fixable causes such as GitHub unavailability auto-resume only after fresh reconciliation. User-owned causes such as rejected merge, closed PR, explicit cycle and review cap need continuation. Idle/wall limits warn without automatically killing work.
+`/merro retry <change>` resumes the blocked phase after its cause is fixed. Task failures receive a fresh Task; PublishBlocked resumes publication/reconciliation without repeating completed implementation or review. Known transient `gh` connection failures receive bounded backoff before blocking. Externally fixable causes such as GitHub unavailability auto-resume only after fresh reconciliation. User-owned causes such as rejected merge, closed PR, explicit cycle and review cap need continuation. Idle/wall limits warn without automatically killing work.
 
 A live unreadable or mismatched identity remains occupied and pauses scheduling. Orphans are reported, never adopted or automatically killed. Unknown ownership gates the workspace; known orphan ownership gates its Project. Inventory failures gate the affected Project. Healthy independent Projects continue.
 

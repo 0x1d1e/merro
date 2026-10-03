@@ -281,7 +281,7 @@ test("live status and export queue behind reconciliation without competing for o
   registerCommands({ registerCommand(name, definition) { commands.set(name, definition); } }, harness.workspacePath, harness.main);
   const messages: string[] = [];
   const ctx = { ui: { notify(message: string) { messages.push(message); } } };
-  await commands.get("status")!.handler("", ctx);
+  await commands.get("merro")!.handler("status", ctx);
   assert.match(messages.pop() ?? "", /No Merro work yet\./);
   await harness.main.startObjective({ goal: "test", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] });
   await harness.main.runPass();
@@ -291,9 +291,9 @@ test("live status and export queue behind reconciliation without competing for o
   hold = true;
   const pass = harness.main.runPass();
   await inside;
-  const status = commands.get("status")!.handler("", ctx);
-  const exported = commands.get("merro-export")!.handler("", ctx);
-  await commands.get("unlock")!.handler("", ctx);
+  const status = commands.get("merro")!.handler("status", ctx);
+  const exported = commands.get("merro")!.handler("export", ctx);
+  await commands.get("merro")!.handler("unlock", ctx);
   assert.match(messages.pop()!, /already holds the workspace lock/);
   release();
   await Promise.all([pass, status, exported]);
@@ -304,11 +304,12 @@ test("live status and export queue behind reconciliation without competing for o
   const before = await harness.main.exportSnapshot();
   const snapshot = JSON.parse(await readFile(join(harness.workspacePath, ".merro", "export.json"), "utf8"));
   assert.deepEqual(snapshot, JSON.parse(JSON.stringify(await harness.main.publicSnapshot())));
-  await commands.get("merro-export")!.handler("", ctx);
+  await commands.get("merro")!.handler("export", ctx);
   assert.deepEqual(await harness.main.exportSnapshot(), before);
   await rm(join(harness.workspacePath, ".merro", "export.json"));
   await mkdir(join(harness.workspacePath, ".merro", "export.json"));
-  await assert.rejects(async () => commands.get("merro-export")!.handler("", ctx), /EISDIR/);
+  await commands.get("merro")!.handler("export", ctx);
+  assert.match(messages.pop()!, /EISDIR/);
 });
 
 test("authoritative proposal and approval persist exactly the acceptance graph", async (t) => {
@@ -1208,8 +1209,8 @@ interface HarnessOptions {
   launchFailure?: boolean | ((input: WorkerLaunchInput) => boolean);
   realWorkerPlan?: boolean;
   notifyCommand?: string;
-  workerModels?: MerroConfig["worker_models"];
-  workerThinking?: MerroConfig["worker_thinking"];
+  workerModels?: Record<"implement" | "review", MerroConfig["worker"]["model"]>;
+  workerThinking?: Record<"implement" | "review", MerroConfig["worker"]["thinking"]>;
   repositoryFailure?: () => Error | null;
   commands?: import("../src/runtime/commands.js").CommandRunner;
   result?: (input: WorkerLaunchInput, launchNumber: number, defaultResult: Record<string, unknown>) => Record<string, unknown> | null;
@@ -1561,8 +1562,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       sandbox: options.realWorkerPlan ? "docker" : "none",
       max_concurrent_tasks: options.maxConcurrentTasks ?? 3,
       notify_command: options.notifyCommand ?? null,
-      worker_models: options.workerModels ?? DEFAULT_CONFIG.worker_models,
-      worker_thinking: options.workerThinking ?? DEFAULT_CONFIG.worker_thinking,
+      worker: { model: options.workerModels?.implement ?? null, thinking: options.workerThinking?.implement ?? null },
+      reviewer: { model: options.workerModels?.review ?? null, thinking: options.workerThinking?.review ?? null },
     },
     ...(options.commands ? { commands: options.commands } : {}),
     notify: (message) => { notifications.push(message); },
@@ -3568,10 +3569,10 @@ test("approve command schedules an implementer to resolve a merge conflict befor
 
   const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
   registerCommands({ registerCommand(name, config) { commands.set(name, config); } }, harness.workspacePath, harness.main);
-  const approve = commands.get("merro-approve");
+  const approve = commands.get("merro");
   assert.ok(approve);
   harness.setBaseMergeConflict(false);
-  await approve.handler((await harness.main.statusSnapshot()).changeSets[0]!.slug, { ui: { notify() {} } });
+  await approve.handler(`approve ${(await harness.main.statusSnapshot()).changeSets[0]!.slug}`, { ui: { notify() {} } });
 
   const state = await harness.main.statusSnapshot();
   assert.equal(state.decisions.length, 0);
@@ -3579,7 +3580,7 @@ test("approve command schedules an implementer to resolve a merge conflict befor
   assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review", "implement"]);
 });
 
-test("reject command abandons a merge_conflict Decision without wedging the ChangeSet", async (t) => {
+test("leave command abandons a merge_conflict Decision without wedging the ChangeSet", async (t) => {
   const harness = await createHarness(t, { baseMergeConflict: true });
   await startDefaultObjective(harness.main);
   await harness.main.runPass();
@@ -3594,9 +3595,9 @@ test("reject command abandons a merge_conflict Decision without wedging the Chan
 
   const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
   registerCommands({ registerCommand(name, config) { commands.set(name, config); } }, harness.workspacePath, harness.main);
-  const reject = commands.get("merro-reject");
+  const reject = commands.get("merro");
   assert.ok(reject);
-  await reject.handler((await harness.main.statusSnapshot()).changeSets[0]!.slug, { ui: { notify() {} } });
+  await reject.handler(`leave ${(await harness.main.statusSnapshot()).changeSets[0]!.slug}`, { ui: { notify() {} } });
 
   const state = await harness.main.statusSnapshot();
   assert.equal(state.decisions.length, 0);
@@ -4032,7 +4033,7 @@ test("Main obsoletes ownerless planned ChangeSets instead of marking them Ready"
   assert.equal(harness.launches.length, 0);
 });
 
-test("/stop obsoletes exclusive work and leaves shared work for an active Objective", async (t) => {
+test("/merro stop obsoletes exclusive work and leaves shared work for an active Objective", async (t) => {
   const exclusive = await createHarness(t);
   const only = await exclusive.main.startObjective({
     goal: "Only owner",
@@ -4062,7 +4063,7 @@ test("/stop obsoletes exclusive work and leaves shared work for an active Object
   assert.equal(shared.launches.length, 1);
 });
 
-test("/stop lets an active Task finish, then obsoletes its unowned ChangeSet", async (t) => {
+test("/merro stop lets an active Task finish, then obsoletes its unowned ChangeSet", async (t) => {
   let alive = true;
   const harness = await createHarness(t, {
     inspect: async () => ({ alive, identityMatches: true, reason: null }),
@@ -4846,13 +4847,13 @@ test("status distinguishes passed review and green local CI from blocked publica
   const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
   registerCommands({ registerCommand(name, command) { commands.set(name, command); } }, harness.workspacePath, harness.main);
   let text = "";
-  await commands.get("status")!.handler("", { ui: { notify(message) { text = message; } } });
+  await commands.get("merro")!.handler("status", { ui: { notify(message) { text = message; } } });
   assert.match(text, /Blocked/);
   assert.match(text, /Review complete, publication blocked/);
   assert.match(text, /Local checks passed · checked \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/);
   assert.doesNotMatch(text, /GitHub checks|worker|AwaitingMerge/);
   let details = "";
-  await commands.get("merro")!.handler("details issue-7-for-example", { ui: { notify(message) { details = message; } } });
+  await commands.get("merro")!.handler("issue-7-for-example", { ui: { notify(message) { details = message; } } });
   assert.match(details, /Review: passed/);
   assert.match(details, /Checks: Local checks passed/);
   assert.match(details, /No pull request yet/);
@@ -4874,12 +4875,12 @@ test("status uses GitHub checks as the single current CI source after PR creatio
   const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
   registerCommands({ registerCommand(name, command) { commands.set(name, command); } }, harness.workspacePath, harness.main);
   let status = "";
-  await commands.get("status")!.handler("", { ui: { notify(message) { status = message; } } });
+  await commands.get("merro")!.handler("status", { ui: { notify(message) { status = message; } } });
   assert.match(status, /GitHub checks failed .*checked \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/);
   assert.doesNotMatch(status, /Local checks|CI \\(local\\)/);
 
   let details = "";
-  await commands.get("merro")!.handler("details issue-7-for-example", { ui: { notify(message) { details = message; } } });
+  await commands.get("merro")!.handler("issue-7-for-example", { ui: { notify(message) { details = message; } } });
   assert.match(details, /Checks: GitHub checks failed .*checked \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/);
   assert.doesNotMatch(details, /Local checks/);
 });

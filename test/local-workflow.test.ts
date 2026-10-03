@@ -29,14 +29,14 @@ async function repository(root: string) {
   return { path, git };
 }
 
-test("first init creates minimal templates; repeated init never repairs or validates dependencies", async (t) => {
+test("first init creates complete config and short templates; repeated init never repairs or validates dependencies", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-minimal-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   // Use the real Git command only for optional local excludes.
   await initializeWorkspace(root, { async run(file, args, options) {
     return file === "git" ? systemCommandRunner.run(file, args, options) : initCommands.run(file, args);
   } });
-  assert.equal(await readFile(join(root, ".merro", "config.json"), "utf8"), "{}\n");
+  assert.equal(await readFile(join(root, ".merro", "config.json"), "utf8"), `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`);
   for (const file of ["WORKSPACE.md", "IMPLEMENTER.md", "REVIEWER.md"]) assert.ok((await readFile(join(root, ".merro", file), "utf8")).startsWith("# "));
   await rm(join(root, ".wt"), { recursive: true });
   await rm(join(root, ".merro", "IMPLEMENTER.md"));

@@ -66,7 +66,7 @@ export async function initializeWorkspace(cwd: string, commands: CommandRunner =
   const lock = new MainLock(join(cwd, ".merro", "main.lock.db"));
   await lock.acquire();
   try {
-    await writeFile(join(cwd, ".merro", "config.json"), "{}\n", { flag: "wx", mode: 0o600 });
+    await writeFile(join(cwd, ".merro", "config.json"), `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, { flag: "wx", mode: 0o600 });
     const templates = {
       "WORKSPACE.md": "# Workspace\n\nDescribe workspace-wide goals, constraints, conventions, and project relationships here.\n",
       "IMPLEMENTER.md": "# Implementer\n\nImplement the requested change.\nRun relevant verification.\nCommit the completed implementation.\nDo not publish unless requested.\n",

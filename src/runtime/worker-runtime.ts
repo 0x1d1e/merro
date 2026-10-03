@@ -259,9 +259,10 @@ export class WorkerRuntime {
       environment.GH_TOKEN = token;
     }
 
+    const settings = input.role === "implement" ? this.#config.worker : this.#config.reviewer;
     const roleArguments = [
-      ...(this.#config.worker_models[input.role] ? ["--model", this.#config.worker_models[input.role]!] : []),
-      ...(this.#config.worker_thinking[input.role] ? ["--thinking", this.#config.worker_thinking[input.role]!] : []),
+      ...(settings.model ? ["--model", settings.model] : []),
+      ...(settings.thinking ? ["--thinking", settings.thinking] : []),
     ];
     const commonPiArgs = ["--no-session", "--tui-mode", "regular", "--approve", ...roleArguments];
     const piArgs = [

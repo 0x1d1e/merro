@@ -5,7 +5,7 @@ Run `scripts/run-ci.sh`. Tests cross the interfaces used by Main, Pi commands/to
 ## Automated gates
 
 - Uninitialized cwd refuses with `/merro init` guidance. Startup creates nothing and ignores initialized parents.
-- `/merro init` validates Pi/tmux and creates minimal config/Markdown plus `.merro`, `projects`, and `.wt` in a writable directory without requiring Git, remotes or GitHub access. It registers no Projects and excludes local state when inside a Git working tree. Repeated init is a no-op, even for incomplete state; startup preserves custom config, registered Projects, and history.
+- `/merro init` validates Pi/tmux and creates complete editable config defaults and short Markdown templates plus `.merro`, `projects`, and `.wt` in a writable directory without requiring Git, remotes or GitHub access. It registers no Projects and excludes local state when inside a Git working tree. Repeated init is a no-op, even for incomplete state; startup preserves custom config, registered Projects, and history.
 - Init reports `register <repo-or-path> as <name>`. Remote registration uses workspace-owned canonical clones; local paths register directly. No GitHub calls or destination adoption during registration.
 - Real-Git tool walkthroughs approve issue-free goals, implement, review, and complete locally without any GitHub calls, including repositories with remotes. Dirty targets block without overwrites; local base divergence gets implementation and fresh review. Explicit PR plans retain publication and merge approval.
 - Optional Markdown reaches Main planning and fresh Task input without new config keys. Workspace/Project/role scoping, current-turn reads, future-Task snapshots, Pi/repository guidance preservation, and non-overridable safety are covered. Repeated init preserves Markdown; absent/blank files need no setup.
@@ -24,7 +24,7 @@ Primary coverage: `test/local-workflow.test.ts`, `test/workspace.test.ts`, `test
 
 With real Pi/provider, tmux, and Git, use a disposable repository/workspace. GitHub authentication is needed only for the optional PR path:
 
-1. Load Merro before initialization: `/status` refuses and no state appears.
+1. Load Merro before initialization: `/merro status` refuses and no state appears.
 2. Follow only the README quickstart: `/merro init`, register a remote or local Project, give local work, approve conversationally. Confirm the init next steps and first Worker. Optionally add workspace/role/Project Markdown and verify only applicable instructions appear in fresh Task input.
 3. Attach to `merro-<project> / impl-<change>`. Confirm the actual Pi TUI, repository/normal host instructions and expected config/extensions are present; no print/JSON reconstruction.
 4. Observe implementation, green local verification, fresh review, and local completion without a push or PR. A rejection must launch fresh Pi processes without changing branch.

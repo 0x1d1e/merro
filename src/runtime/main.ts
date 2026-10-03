@@ -558,8 +558,8 @@ export class MainOrchestrator {
       const prepared = await this.#prepareObjective(store, input);
       const id = randomUUID();
       const workerSettings: WorkerSettings = {
-        implement: { model: this.#config.worker_models.implement, thinking: this.#config.worker_thinking.implement },
-        review: { model: this.#config.worker_models.review, thinking: this.#config.worker_thinking.review },
+        implement: { ...this.#config.worker },
+        review: { ...this.#config.reviewer },
       };
       const proposal = { id, workerSettings, ...prepared.graph };
       this.#proposals.clear();

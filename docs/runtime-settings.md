@@ -1,11 +1,11 @@
 # Runtime settings
 
-`.merro/config.json` contains machine settings. Init writes `{}`; missing settings use defaults. Restart Main after editing it. Instructions, prompts, review policy, architecture guidance, and Project context belong in [Markdown](../README.md#markdown-customization).
+`.merro/config.json` contains machine settings. Init writes all editable defaults without replacing existing files. `/merro config` shows the file location and effective Merro settings, filling omitted fields with defaults without rewriting the file. `null` preserves Pi inheritance rather than copying Pi settings into Merro. Restart Main after editing the JSON; the config view reads the current file, not Main's startup snapshot. Instructions, prompts, review policy, architecture guidance, and Project context belong in [Markdown](../README.md#markdown-customization).
 
 Common overrides:
 
 - `projectsDir`, `worktreesDir`: workspace-relative directories, default `projects` and `.wt`. They cannot overlap, traverse outside the root, contain Git/Merro metadata, or use symlink directories. Existing recorded working-copy paths remain authoritative after changes.
-- `worker`, `reviewer`: optional `model` and `thinking`. Omitted or `null` inherits Pi's normal defaults. Model is a Pi model ID; thinking is a supported Pi level. Legacy `worker_models` and `worker_thinking` role maps remain accepted.
+- `worker`, `reviewer`: optional `model` and `thinking`. Omitted or `null` inherits Pi's normal defaults. Model is a Pi model ID; thinking is a supported Pi level. Legacy `worker_models` and `worker_thinking` role maps are migration-only inputs, normalized to `worker`/`reviewer` in the effective config. Mixing either legacy map with `worker` or `reviewer` is rejected; migrate both roles together.
 - `git.defaultDelivery`: `local` by default, or `pr`. Explicit plan delivery overrides it; a remote never selects publication implicitly. Existing approved changes retain their delivery mode and target branch.
 - `tmux.session`: session prefix, default `merro`; a Project uses `<prefix>-<project>`. Previously recorded sessions still receive worker safety checks.
 
