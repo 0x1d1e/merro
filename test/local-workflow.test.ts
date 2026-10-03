@@ -85,7 +85,7 @@ test("remote registration clones into configured workspace paths without GitHub 
   await assert.rejects(linked.addProject(remote, "escape"), /must not be a symlink/);
 });
 
-for (const scenario of ["remote-free", "with-remote", "base-moved", "approval-base-moved", "requirements-restart", "dirty-target", "merge-declined", "branch-switch-during-final-fetch", "branch-switch-during-ref-update", "head-lock-during-final-fetch", "tracked-edit-after-ref-update", "read-tree-fails"] as const) {
+for (const scenario of ["remote-free", "with-remote", "base-moved", "approval-base-moved", "approval-dirty-target", "requirements-restart", "dirty-target", "merge-declined", "branch-switch-during-final-fetch", "branch-switch-during-ref-update", "head-lock-during-final-fetch", "tracked-edit-after-ref-update", "staged-edit-before-sync", "read-tree-fails"] as const) {
 test(`tool flow approves, implements, reviews and delivers locally without gh: ${scenario}`, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-local-flow-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -103,9 +103,16 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   let switchRejectedDuringRefUpdate = false;
   let headLockCreated = false;
   let editedAfterRefUpdate = false;
+  let stagedEditBeforeSync = false;
   const deliveryGit = new GitClient({ async run(file, args, commandOptions) {
     if (scenario === "read-tree-fails" && file === "git" && commandOptions?.cwd === source.path && args[0] === "read-tree") {
       throw new Error("Injected checkout synchronization failure");
+    }
+    if (scenario === "staged-edit-before-sync" && !stagedEditBeforeSync
+      && file === "git" && commandOptions?.cwd === source.path && args[0] === "read-tree") {
+      await writeFile(join(source.path, "file.txt"), "concurrent staged edit\n");
+      await systemCommandRunner.run("git", ["add", "file.txt"], { cwd: source.path });
+      stagedEditBeforeSync = true;
     }
     if (scenario === "branch-switch-during-ref-update" && file === "git" && commandOptions?.cwd === source.path && args.includes("update-ref")) {
       try {
@@ -134,7 +141,7 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     return output;
   } });
   const options = {
-    ...(["branch-switch-during-final-fetch", "branch-switch-during-ref-update", "head-lock-during-final-fetch", "tracked-edit-after-ref-update", "read-tree-fails"].includes(scenario) ? { git: deliveryGit } : {}),
+    ...(["branch-switch-during-final-fetch", "branch-switch-during-ref-update", "head-lock-during-final-fetch", "tracked-edit-after-ref-update", "staged-edit-before-sync", "read-tree-fails"].includes(scenario) ? { git: deliveryGit } : {}),
     workspacePath: workspace, config: scenario === "with-remote" ? validateConfig({ worktreesDir: "scratch/changes", git: { defaultDelivery: "local" }, tmux: { session: "work" } }) : { ...DEFAULT_CONFIG },
     github: new Proxy({}, { get(_target, name) { return () => { throw new Error(`GitHub must not be called: ${String(name)}`); }; } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>,
     workers: {
@@ -243,7 +250,23 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     assert.equal(await readFile(join(source.path, "external.txt"), "utf8"), "external change\n");
     assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
   }
+  if (scenario === "approval-dirty-target") await writeFile(join(source.path, "unrelated.txt"), "preserve this edit\n");
   const approval = await call("merro_resolve_decision", { change: "requested-change", approved: true });
+  if (scenario === "approval-dirty-target") {
+    const message = approval.content[0]?.text ?? "";
+    assert.match(message, /Local merge failed: Local delivery needs clean working copies/);
+    assert.match(message, /Check the canonical checkout, then \/merro retry requested-change\./);
+    assert.doesNotMatch(message, /Local base changed/);
+    assert.equal(await source.git("rev-parse", "refs/heads/main"), initialBase);
+    assert.equal(await source.git("rev-parse", "HEAD"), initialBase);
+    assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
+    assert.equal(await readFile(join(source.path, "unrelated.txt"), "utf8"), "preserve this edit\n");
+    const blocked = await main.statusSnapshot();
+    assert.equal(blocked.changeSets[0]!.state, "Blocked");
+    assert.equal(blocked.objectives[0]!.state, "Active");
+    assert.equal(blocked.decisions.length, 0);
+    return;
+  }
   if (scenario === "branch-switch-during-final-fetch") {
     assert.equal(switchedDuringFinalFetch, true);
     assert.doesNotMatch(approval.content[0]?.text ?? "", /Applied locally/);
@@ -267,10 +290,14 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     assert.equal((await main.statusSnapshot()).decisions.length, 0);
     return;
   }
-  if (scenario === "tracked-edit-after-ref-update" || scenario === "read-tree-fails") {
+  if (scenario === "tracked-edit-after-ref-update" || scenario === "staged-edit-before-sync" || scenario === "read-tree-fails") {
     if (scenario === "tracked-edit-after-ref-update") {
       assert.equal(editedAfterRefUpdate, true);
       assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "concurrent edit\n");
+    } else if (scenario === "staged-edit-before-sync") {
+      assert.equal(stagedEditBeforeSync, true);
+      assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "concurrent staged edit\n");
+      assert.equal(await source.git("status", "--porcelain"), "M  file.txt");
     } else {
       assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
     }

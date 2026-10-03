@@ -228,7 +228,8 @@ export class GitClient {
     if (indexTree !== baseTree || worktreeChanged || untracked) {
       throw new Error("Canonical checkout changed during local delivery; refusing to overwrite edits");
     }
-    await this.#run("git", ["read-tree", "-m", "-u", reviewedCommit], { cwd: path });
+    // Merge from the reviewed base so concurrent index or worktree edits are preserved and rejected, not reset.
+    await this.#run("git", ["read-tree", "-m", "-u", baseCommit, reviewedCommit], { cwd: path });
   }
 
   async #verifySynchronizedLocalTarget(path: string, targetBranch: string, reviewedCommit: string): Promise<void> {

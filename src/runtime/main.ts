@@ -29,6 +29,7 @@ type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" |
   & Partial<Pick<GitHubClient, "findPullRequest" | "beginPass">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup" | "listOwnedWorkers">
   & Partial<Pick<WorkerRuntime, "plan" | "stop">>;
+type LocalMergeOutcome = "done" | "base_updated" | "blocked" | "declined";
 
 export interface MainOptions {
   workspacePath: string;
@@ -880,9 +881,10 @@ export class MainOrchestrator {
       throw error;
     }
     const kind = await this.#withStore((store) => store.getDecision(decisionId)?.kind);
+    let localMergeOutcome: LocalMergeOutcome | undefined;
     try {
       if (kind === "merge_conflict") await this.resolveMergeConflictDecision(decisionId, approved ? "resolved" : "abandon");
-      else if (kind === "local_merge") await this.resolveLocalMergeDecision(decisionId, approved);
+      else if (kind === "local_merge") localMergeOutcome = await this.resolveLocalMergeDecision(decisionId, approved);
       else await this.resolveMergeDecision(decisionId, approved);
     } catch (error) {
       if (approved) {
@@ -898,9 +900,18 @@ export class MainOrchestrator {
       return item && runtime ? { name: changeName(item), state: item.state, pr: runtime.pullRequestNumber, targetBranch: item.targetBranch } : null;
     });
     if (!resolved) return "Decision resolved.";
-    if (kind === "local_merge") return approved
-      ? resolved.state === "Done" ? `Applied locally: ${resolved.name} · ${resolved.targetBranch}.` : `Local base changed; fresh implementation, verification, review, and approval are required.`
-      : `Local merge declined for ${resolved.name}; no changes applied.`;
+    if (kind === "local_merge") {
+      if (!approved) return `Local merge declined for ${resolved.name}; no changes applied.`;
+      if (localMergeOutcome === "done") return `Applied locally: ${resolved.name} · ${resolved.targetBranch}.`;
+      if (localMergeOutcome === "base_updated") return "Local base changed; fresh implementation, verification, review, and approval are required.";
+      if (localMergeOutcome === "blocked") {
+        const change = (await this.publicSnapshot()).changes.find((candidate) => candidate.name === resolved.name);
+        return change?.blocked
+          ? `${change.blocked.message} ${change.blocked.next}`
+          : `Local merge failed. Check the canonical checkout, then /merro retry ${resolved.name}.`;
+      }
+      return `Local merge for ${resolved.name} could not be completed; check /merro ${resolved.name}.`;
+    }
     if (approved && resolved.state === "Done") return `Merged: ${resolved.name} · PR #${resolved.pr ?? "?"}.`;
     if (kind === "merge_conflict") return approved ? `Approved a fresh implementation for ${resolved.name}.` : `Left ${resolved.name} unchanged.`;
     return approved ? `Merge approved for ${resolved.name}.` : `Left PR #${resolved.pr ?? "?"} open.`;
@@ -1121,8 +1132,8 @@ export class MainOrchestrator {
     await this.runPass();
   }
 
-  async resolveLocalMergeDecision(decisionId: string, approved: boolean): Promise<void> {
-    await this.#withStore(async (store) => {
+  async resolveLocalMergeDecision(decisionId: string, approved: boolean): Promise<LocalMergeOutcome> {
+    const outcome = await this.#withStore(async (store): Promise<LocalMergeOutcome> => {
       const decision = store.getDecision(decisionId);
       if (!decision || decision.state !== "pending" || decision.kind !== "local_merge") {
         throw new Error(`pending local merge Decision not found: ${decisionId}`);
@@ -1137,7 +1148,7 @@ export class MainOrchestrator {
       if (!approved) {
         store.resolveDecision(decisionId, "rejected");
         this.#block(store, item, "merge_rejected", "Local merge declined; the canonical checkout remains unchanged");
-        return;
+        return "declined";
       }
       const { unsafeProjects } = await this.#workerSafetyPreflight(store);
       if (unsafeProjects.has(project.slug) || store.activeTask(item.id)) {
@@ -1155,14 +1166,14 @@ export class MainOrchestrator {
         store.resolveDecision(decisionId, "resolved");
         this.#resolveMergeDecisions(store, item.id);
         this.#block(store, item, "merge_failed", "Local merge approval no longer matches the passing review; inspect the checkout and retry for a fresh approval");
-        return;
+        return "blocked";
       }
       try {
         const inspection = await this.#git.inspectLocalDelivery(project, runtime.clonePath, item.targetBranch, reviewedCommit, baseCommit);
         if ("baseUpdate" in inspection) {
           store.resolveDecision(decisionId, "resolved");
           this.#queueLocalBaseUpdate(store, item, runtime, inspection.baseUpdate);
-          return;
+          return "base_updated";
         }
         if (inspection.diffHash !== diffHash || runtime.reviewedDiffHash !== diffHash) {
           throw new Error("The reviewed diff changed after approval was requested");
@@ -1171,12 +1182,13 @@ export class MainOrchestrator {
         if ("baseUpdate" in delivered) {
           store.resolveDecision(decisionId, "resolved");
           this.#queueLocalBaseUpdate(store, item, runtime, delivered.baseUpdate);
-          return;
+          return "base_updated";
         }
         store.resolveDecision(decisionId, "approved");
         store.completeLocalChangeSet(item.id, delivered.commit);
         this.#notify(`${changeName(item)} done · Applied locally to ${item.targetBranch}.`);
         await this.#finishObjectives(store, new Set(), unsafeProjects);
+        return "done";
       } catch (error) {
         if (store.getDecision(decisionId)?.state === "pending") store.resolveDecision(decisionId, "resolved");
         const current = store.getChangeSet(item.id);
@@ -1184,9 +1196,11 @@ export class MainOrchestrator {
           this.#resolveMergeDecisions(store, item.id);
           this.#block(store, current, "merge_failed", `Local merge failed: ${errorText(error)}`);
         }
+        return "blocked";
       }
     });
     await this.runPass();
+    return outcome;
   }
 
   async resolveMergeConflictDecision(decisionId: string, resolution: "resolved" | "abandon"): Promise<void> {
