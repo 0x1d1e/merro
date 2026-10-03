@@ -50,6 +50,7 @@ export interface ObjectiveRoadmapItem {
   order?: string;
   status?: RoadmapStatus;
   changeSet?: string;
+  sourceDependencies?: Array<{ workstream: string; projectSlug: string }>;
 }
 
 export interface ObjectivePlanningContext {
@@ -161,11 +162,31 @@ function normalizePlanningContext(
       mapped.add(planned.id);
       changeSet = changeName(planned);
     }
+    let sourceDependencies: ObjectiveRoadmapItem["sourceDependencies"];
+    if (item.sourceDependencies !== undefined) {
+      if (!Array.isArray(item.sourceDependencies)) throw new Error(`Source dependencies for '${workstream}' must be an array`);
+      sourceDependencies = item.sourceDependencies.map((dependency) => {
+        if (!dependency || typeof dependency !== "object" || typeof dependency.workstream !== "string" || !dependency.workstream.trim()
+          || typeof dependency.projectSlug !== "string" || !store.getProject(dependency.projectSlug)) {
+          throw new Error(`Invalid source dependency for '${workstream}'`);
+        }
+        return { workstream: dependency.workstream.trim(), projectSlug: dependency.projectSlug };
+      });
+      if (new Set(sourceDependencies.map((dependency) => `${dependency.projectSlug}\0${semanticSlug(dependency.workstream)}`)).size !== sourceDependencies.length) {
+        throw new Error(`Duplicate source dependency for '${workstream}'`);
+      }
+    }
     return { workstream, projectSlug: item.projectSlug, issues: [...item.issues],
       ...(item.order === undefined ? {} : { order: item.order.trim() }),
       ...(item.status === undefined ? {} : { status: item.status }),
-      ...(changeSet === undefined ? {} : { changeSet }) };
+      ...(changeSet === undefined ? {} : { changeSet }),
+      ...(sourceDependencies === undefined ? {} : { sourceDependencies }) };
   });
+  for (const item of items) for (const dependency of item.sourceDependencies ?? []) {
+    const target = items.find((candidate) => candidate.projectSlug === dependency.projectSlug
+      && semanticSlug(candidate.workstream) === semanticSlug(dependency.workstream));
+    if (!target || target === item) throw new Error(`Source dependency for '${item.workstream}' references an unknown or identical workstream`);
+  }
   if (mapped.size !== changeSets.length) throw new Error("Every selected ChangeSet must map to one planning workstream");
   const unresolved = input.unresolved.map((entry) => {
     if (!entry || typeof entry !== "object" || typeof entry.workstream !== "string" || !entry.workstream.trim()

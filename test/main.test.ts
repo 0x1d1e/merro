@@ -456,6 +456,169 @@ test("Markdown roadmap interpretation preserves grouping, order, statuses, depen
   assert.ok(harness.launches.every((launch) => !launch.taskFile.includes("after interfaces stabilize") && !launch.taskFile.includes("#999")));
 });
 
+test("pasted Markdown tables work without a Project heading or Status column", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [159, 160, 105, 101, 103] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  const proposed = await tools.get("merro_propose_objective")!.execute("pasted-table", {
+    goal: "Implement the Kinetix roadmap",
+    markdown: [
+      "| Order | Workstream | Issues | Parallel? |",
+      "|---|---|---|---|",
+      "| 1A | Provider primitives | #159 + #160 | yes |",
+      "| 1B | Admin API | #105 | yes |",
+      "| 2A | CLI contract | #101 + #103 | after 1A |",
+    ].join("\n"),
+    project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
+  });
+  const details = proposed.details as {
+    plans: Array<{ change: string; issues: number[]; order?: string }>;
+    relations: Array<{ kind: string; from: string; to: string }>;
+    planning: { items: Array<{ status?: string }> };
+  };
+  assert.deepEqual(details.plans.map(({ change, issues, order }) => [change, issues, order]), [
+    ["provider-primitives", [159, 160], "1A"],
+    ["admin-api", [105], "1B"],
+    ["cli-contract", [101, 103], "2A"],
+  ]);
+  assert.deepEqual(details.relations.map(({ kind, from, to }) => [kind, from, to]), [
+    ["Requires", "cli-contract", "provider-primitives"],
+  ]);
+  assert.ok(details.planning.items.every((item) => item.status === undefined));
+
+  const statusProposal = await tools.get("merro_propose_objective")!.execute("status-table", {
+    goal: "Preserve in-progress roadmap status",
+    markdown: [
+      "| Status | Order | Workstream | Issues | Parallel? |",
+      "|---|---|---|---|---|",
+      "| 🟡 | 1B | Admin API | #105 | yes |",
+    ].join("\n"),
+    project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
+  });
+  const statusDetails = statusProposal.details as { planning: { items: Array<{ status?: string }> } };
+  assert.equal(statusDetails.planning.items[0]?.status, "In Progress");
+});
+
+test("full Kinetix roadmaps enter through Markdown, retain typed structure, and never reach Workers", async (t) => {
+  const fixture = await readFile(join(process.cwd(), "test", "fixtures", "kinetix-roadmap.md"), "utf8");
+  const harness = await createHarness(t, {
+    projects: [
+      { slug: "kinetix", issueNumbers: [170, 159, 160, 105, 96, 97, 100, 189, 101, 103, 106, 98, 99, 107, 112, 116, 109, 111, 110, 114, 113, 171, 115, 117] },
+      { slug: "kinetix-plugins", issueNumbers: [65, 68, 66, 69, 70, 71, 73, 74, 72, 54, 59, 55, 56, 57, 58, 61, 60] },
+    ],
+    maxConcurrentTasks: 20,
+    result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+  });
+  const roadmapPath = join(harness.workspacePath, "ROADMAP.md");
+  await writeFile(roadmapPath, fixture);
+  const markdown = await readFile(roadmapPath, "utf8");
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+
+  const proposed = await tools.get("merro_propose_objective")!.execute("full-roadmap", {
+    goal: "Kinetix + Kinetix Plugins roadmap",
+    markdown,
+    project_map: [
+      { heading: "Kinetix", project_slug: "kinetix" },
+      { heading: "Kinetix Plugins", project_slug: "kinetix-plugins" },
+    ],
+    delivery_mode: "pr",
+  });
+  const text = proposed.content[0]?.text ?? "";
+  const details = proposed.details as {
+    plans: Array<{ change: string; project: string; issues: number[]; order?: string; status?: string; delivery: string }>;
+    relations: Array<{ kind: string; from: string; to: string }>;
+    planning: {
+      items: Array<{ workstream: string; projectSlug: string; issues: number[]; order?: string; status?: string; changeSet?: string; sourceDependencies?: Array<{ workstream: string; projectSlug: string }> }>;
+      unresolved: Array<{ workstream: string; projectSlug: string; statement: string }>;
+    };
+    runnableImmediately: number;
+  };
+  assert.deepEqual(details.plans.map(({ change, project, issues, order, status, delivery }) => [change, project, issues, order, status, delivery]), [
+    ["plugin-lifecycle-safety", "kinetix", [96, 97, 100], "1C", "Not Started", "pr"],
+    ["core-architecture-consolidation", "kinetix", [189], "1D", "Not Started", "pr"],
+    ["cli-doctor-automation-contract", "kinetix", [101, 103], "2A", "Not Started", "pr"],
+    ["control-plane-audit-coverage", "kinetix", [106], "2B", "Not Started", "pr"],
+    ["official-plugin-conformance", "kinetix", [98], "2C", "Not Started", "pr"],
+    ["deployment-oauth-topology-suite", "kinetix", [99, 107], "3A", "Not Started", "pr"],
+    ["upgrade-artifact-acceptance", "kinetix", [112, 116], "3B", "Not Started", "pr"],
+    ["resilience-suite", "kinetix", [111], "3D", "Not Started", "pr"],
+    ["performance-baselines", "kinetix", [110], "3E", "Not Started", "pr"],
+    ["authoring-dev-loop", "kinetix-plugins", [70], "3A", "Not Started", "pr"],
+    ["out-of-tree-compatibility", "kinetix-plugins", [71], "3B", "Not Started", "pr"],
+    ["marketplace-trust-metadata", "kinetix-plugins", [73], "3C", "Not Started", "pr"],
+    ["four-reference-quality-plugins-reasoning", "kinetix-plugins", [72, 74], "3D", "Not Started", "pr"],
+    ["kilo-free", "kinetix-plugins", [54], "4A", "Not Started", "pr"],
+    ["cloudflare-workers-ai", "kinetix-plugins", [59], "4B", "Not Started", "pr"],
+    ["cerebras", "kinetix-plugins", [55], "4C", "Not Started", "pr"],
+    ["groq", "kinetix-plugins", [56], "4D", "Not Started", "pr"],
+    ["ollama-cloud", "kinetix-plugins", [57], "4E", "Not Started", "pr"],
+    ["nvidia-nim", "kinetix-plugins", [58], "4F", "Not Started", "pr"],
+    ["openrouter-free", "kinetix-plugins", [61], "4G", "Not Started", "pr"],
+  ]);
+  assert.equal(details.planning.items.length, 33);
+  assert.equal(details.runnableImmediately, 15);
+  assert.deepEqual(details.relations.map(({ kind, from, to }) => [kind, from, to]), [
+    ["Requires", "cli-doctor-automation-contract", "core-architecture-consolidation"],
+    ["Requires", "control-plane-audit-coverage", "core-architecture-consolidation"],
+    ["Requires", "control-plane-audit-coverage", "plugin-lifecycle-safety"],
+    ["Requires", "official-plugin-conformance", "out-of-tree-compatibility"],
+    ["Requires", "official-plugin-conformance", "four-reference-quality-plugins-reasoning"],
+    ["Requires", "kilo-free", "four-reference-quality-plugins-reasoning"],
+    ["Requires", "cloudflare-workers-ai", "four-reference-quality-plugins-reasoning"],
+  ]);
+  const item = (workstream: string) => details.planning.items.find((candidate) => candidate.workstream === workstream);
+  assert.deepEqual([item("Finish credential interchange")?.status, item("Finish credential interchange")?.changeSet], ["Done", undefined]);
+  assert.deepEqual([item("Provider connection primitives")?.issues, item("Provider connection primitives")?.status, item("Provider connection primitives")?.changeSet], [[159, 160], "Done", undefined]);
+  assert.deepEqual([item("Cline Free research")?.status, item("Cline Free research")?.changeSet], ["Parked", undefined]);
+  assert.deepEqual([item("JS/TS -\\> WASM")?.status, item("JS/TS -\\> WASM")?.issues, item("JS/TS -\\> WASM")?.changeSet], ["Future", [], undefined]);
+  assert.deepEqual(item("Plugin lifecycle safety")?.sourceDependencies, [
+    { workstream: "Plugin/package architecture", projectSlug: "kinetix-plugins" },
+    { workstream: "WASM capability sandbox", projectSlug: "kinetix-plugins" },
+  ]);
+  assert.deepEqual(item("Kilo Free")?.sourceDependencies, [
+    { workstream: "Four reference-quality plugins + reasoning", projectSlug: "kinetix-plugins" },
+    { workstream: "Provider connection primitives", projectSlug: "kinetix" },
+  ]);
+  const barrier = item("Complete v1 acceptance matrix");
+  assert.equal(barrier?.sourceDependencies?.length, 18);
+  assert.ok(barrier?.sourceDependencies?.some((dependency) => dependency.workstream === "Security adversarial suite"));
+  assert.ok(barrier?.sourceDependencies?.some((dependency) => dependency.workstream === "Freeze 1.x/API compatibility policy"));
+  assert.ok(details.planning.unresolved.some((entry) => entry.workstream === "Security adversarial suite" && entry.statement === "after plugin security contract"));
+  assert.ok(details.planning.unresolved.some((entry) => entry.workstream === "Freeze 1.x/API compatibility policy" && entry.statement === "after interfaces stabilize"));
+  for (const workstream of ["Docs/product audit", "Complete v1 acceptance matrix", "Final changelog/release docs"]) {
+    assert.equal(item(workstream)?.changeSet, undefined, `${workstream} remains outside executable scope`);
+    assert.ok(details.planning.unresolved.some((entry) => entry.workstream === workstream));
+  }
+  assert.match(text, /kinetix \/ Provider connection primitives/);
+  assert.match(text, /Unresolved \/ blocked workstreams/);
+  assert.match(text, /15 runnable immediately/);
+  assert.doesNotMatch(text, /\{:\s|Finish credential interchange.*ChangeSet/);
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
+
+  await tools.get("merro_start_objective")!.execute("approve", {});
+  assert.equal(harness.launches.length, 15);
+  assert.ok(harness.launches.every((launch) => !launch.taskFile.includes("Finish credential interchange")
+    && !launch.taskFile.includes("Cline Free research") && !launch.taskFile.includes("after interfaces stabilize")
+    && !launch.taskFile.includes("{: style=") && !launch.taskFile.includes("#999")));
+
+  await writeFile(roadmapPath, "# Updated roadmap now mentions #999.");
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches.length, 15);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    const changes = store.listChangeSets();
+    assert.equal(changes.length, 20);
+    assert.equal(store.listRelations().length, 7);
+    assert.ok(changes.every((change) => change.delivery === "pr"));
+    assert.ok(!changes.some((change) => change.issues.some((issue) => [170, 159, 160, 105, 65, 68, 66, 69, 60, 109, 114, 113, 171, 115, 117].includes(issue.number))));
+    const durable = JSON.stringify({ objectives: store.listObjectives(), changes, relations: store.listRelations() });
+    assert.ok(!durable.includes(markdown));
+    assert.ok(!durable.includes("#999"));
+  } finally { store.close(); }
+});
+
 test("approved branch stays frozen when issue labels change before the first launch", async (t) => {
   const harness = await createHarness(t);
   const input: NamedObjectiveStartInput = {
