@@ -65,6 +65,24 @@ function parseStatus(value: string, order: string): MarkdownRoadmapStatus | unde
   throw new Error(`Unsupported roadmap status '${value}'`);
 }
 
+function parseIssues(value: string, status?: MarkdownRoadmapStatus): { issues: number[]; unresolved?: string } {
+  const text = value.trim();
+  if (!text || /^(?:none|n\/a|no issues|[-\u2013\u2014])$/i.test(text) || (status === "Future" && /^future$/i.test(text))) {
+    return { issues: [] };
+  }
+
+  const matches = [...text.matchAll(/(?<![a-z0-9])#?(\d+)(?![a-z0-9])/gi)];
+  const issues = matches.map((match) => Number(match[1]));
+  const remainder = text.replace(/(?<![a-z0-9])#?\d+(?![a-z0-9])/gi, " ")
+    .replace(/\b(?:and|folded|issue|issues)\b/gi, " ")
+    .replace(/[#+,\s/&;]+/g, "");
+  if (!matches.length || remainder || issues.some((number) => !Number.isSafeInteger(number) || number < 1)
+    || new Set(issues).size !== issues.length) {
+    return { issues: [], unresolved: `Unrecognized Issues cell: ${text}` };
+  }
+  return { issues };
+}
+
 function projectMappings(input: readonly MarkdownProjectMapping[]) {
   if (!input.length) throw new Error("Map each roadmap heading to a registered Project slug");
   const mappings = input.map((entry) => {
@@ -125,14 +143,13 @@ function parseTables(markdown: string, mappings: readonly MarkdownProjectMapping
     const workstream = row[workstreamAt!]!;
     const issueText = row[issuesAt!]!;
     if (!workstream) throw new Error(`Roadmap row in '${projectHeading}' has no workstream name`);
-    const issueMatches = [...issueText.matchAll(/#(\d+)/g)].map((match) => Number(match[1]));
-    if (issueMatches.some((number) => !Number.isSafeInteger(number) || number < 1)
-      || new Set(issueMatches).size !== issueMatches.length) throw new Error(`Roadmap issues for '${workstream}' must be unique positive numbers`);
     const status = parseStatus(statusCell, order);
+    const parsedIssues = parseIssues(issueText, status);
     rows.push({
       workstream,
       projectSlug: projectSlug!,
-      issues: issueMatches,
+      issues: parsedIssues.issues,
+      ...(parsedIssues.unresolved ? { unresolvedStatement: parsedIssues.unresolved } : {}),
       ...(order ? { order } : {}),
       ...(status ? { status } : {}),
       parallel: row[parallelAt!]!,
@@ -187,6 +204,8 @@ interface RelationClause {
 function relationClause(value: string): RelationClause | undefined {
   const source = value.trim().split(/;\s*parallel\b/i)[0]!.trim().replace(/[.;,]+$/, "").trim();
   const targetText = source.replace(/^(?:yes[,;:]?\s+|parallel[,;:]?\s+)/i, "");
+  if (!targetText || /^(?:yes|true|parallel|foundation|none|n\/a)$/i.test(targetText)
+    || /^with\s+\d+[a-z](?:\s*(?:\/|-|\+|,|&|\band\b)\s*\d+[a-z])*$/i.test(targetText)) return undefined;
   if (/^(?:(?:finish|run|do|ship)\s+)?last$/i.test(targetText)) {
     return { target: "last", statement: targetText, last: true };
   }
@@ -202,10 +221,7 @@ function relationClause(value: string): RelationClause | undefined {
     const match = targetText.match(pattern);
     if (match) return { target: match[1]!.replace(/[.;,]+$/, "").trim(), statement: targetText };
   }
-  if (/\b(?:after|depend(?:s|ing)?|requires?|blocked|wait(?:s|ing)?|following|last)\b/i.test(source)) {
-    return { target: source, statement: source, unsupported: true };
-  }
-  return undefined;
+  return { target: source, statement: source, unsupported: true };
 }
 
 function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappings: readonly MarkdownProjectMapping[]): string | undefined {
@@ -290,7 +306,7 @@ export function interpretMarkdownRoadmap(markdown: string, projectMapInput: read
   const rows = parseTables(markdown, mappings);
   for (const row of rows) {
     const unresolved = resolveDependencies(row, rows, mappings);
-    if (unresolved) row.unresolvedStatement = unresolved;
+    if (unresolved) row.unresolvedStatement = [row.unresolvedStatement, unresolved].filter(Boolean).join("; ");
   }
 
   const selected = new Map<string, RoadmapRow>();

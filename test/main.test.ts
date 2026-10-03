@@ -499,6 +499,67 @@ test("pasted Markdown tables work without a Project heading or Status column", a
   assert.equal(statusDetails.planning.items[0]?.status, "In Progress");
 });
 
+test("Markdown sequencing and issue cells fail closed when their meaning is unknown", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2, 159, 160] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  const proposeMarkdown = tools.get("merro_propose_objective")!;
+  const projectMap = [{ heading: "Kinetix", project_slug: "kinetix" }];
+
+  const unknown = await proposeMarkdown.execute("unknown-sequencing", {
+    goal: "Plan work after interfaces stabilize",
+    markdown: [
+      "| Order | Workstream | Issues | Parallel? |",
+      "|---|---|---|---|",
+      "| 1 | Interfaces | #1 | yes |",
+      "| 2 | Consumer | #2 | once interfaces stabilize |",
+    ].join("\n"),
+    project_map: projectMap,
+  });
+  const unknownDetails = unknown.details as {
+    plans: Array<{ change: string }>;
+    planning: { items: Array<{ workstream: string; changeSet?: string }>; unresolved: Array<{ workstream: string; statement: string }> };
+  };
+  assert.deepEqual(unknownDetails.plans.map(({ change }) => change), ["interfaces"]);
+  assert.equal(unknownDetails.planning.items.find(({ workstream }) => workstream === "Consumer")?.changeSet, undefined);
+  assert.deepEqual(unknownDetails.planning.unresolved, [{
+    workstream: "Consumer", projectSlug: "kinetix", statement: "once interfaces stabilize",
+  }]);
+
+  const unhashed = await proposeMarkdown.execute("unhashed-issues", {
+    goal: "Group provider issues",
+    markdown: [
+      "| Order | Workstream | Issues | Parallel? |",
+      "|---|---|---|---|",
+      "| 1 | Provider primitives | 159 + 160 | yes |",
+    ].join("\n"),
+    project_map: projectMap,
+  });
+  const unhashedDetails = unhashed.details as { plans: Array<{ change: string; issues: number[] }> };
+  assert.deepEqual(unhashedDetails.plans.map(({ change, issues }) => [change, issues]), [["provider-primitives", [159, 160]]]);
+
+  const unknownIssues = await proposeMarkdown.execute("invalid-issue-cell", {
+    goal: "Plan provider work",
+    markdown: [
+      "| Order | Workstream | Issues | Parallel? |",
+      "|---|---|---|---|",
+      "| 1 | Provider primitives | issue TBD | yes |",
+      "| 2 | Independent work | #1 | yes |",
+    ].join("\n"),
+    project_map: projectMap,
+  });
+  const unknownIssueDetails = unknownIssues.details as {
+    plans: Array<{ change: string }>;
+    planning: { items: Array<{ workstream: string; changeSet?: string }>; unresolved: Array<{ workstream: string; statement: string }> };
+  };
+  assert.deepEqual(unknownIssueDetails.plans.map(({ change }) => change), ["independent-work"]);
+  assert.equal(unknownIssueDetails.planning.items[0]?.changeSet, undefined);
+  assert.deepEqual(unknownIssueDetails.planning.unresolved, [{
+    workstream: "Provider primitives", projectSlug: "kinetix", statement: "Unrecognized Issues cell: issue TBD",
+  }]);
+  assert.match(unknownIssues.content[0]?.text ?? "", /Unrecognized Issues cell: issue TBD/);
+});
+
 test("Markdown dependency wording fails closed and 'last' waits for all earlier workstreams", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2, 3] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
