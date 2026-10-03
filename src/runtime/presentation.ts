@@ -73,7 +73,9 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
           : "GitHub is temporarily unavailable.";
     return { summary, next: "Merro will retry automatically when it is available." };
   }
-  if (reason === "merge_rejected") return { summary: "The pull request was left open.", next: `Approve it later with /merro approve ${name}.` };
+  if (reason === "merge_rejected") return localDelivery
+    ? { summary: "Local merge was declined; no changes were applied.", next: `Request approval again with /merro retry ${name}.` }
+    : { summary: "The pull request was left open.", next: `Approve it later with /merro approve ${name}.` };
   if (reason === "pr_closed") return { summary: "The pull request was closed without merging.", next: "Reopen it on GitHub; Merro will check again automatically." };
   if (reason === "review_cap") return { summary: "Review still found blocking issues after the allowed rounds.", next: `See /merro ${name} for findings; then /merro retry ${name} after fixing them.` };
   if (reason === "cycle") return { summary: "The approved changes depend on each other in a cycle.", next: "Update the Objective's dependencies before retrying." };
@@ -99,7 +101,7 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
 function userState(item: ChangeSet, reviewDecision: string | null, decisionAction: string | undefined): UserChangeState {
   if (item.state === "Done") return "Done";
   if (item.state === "Blocked" || item.state === "PublishBlocked") return "Blocked";
-  if (decisionAction === "approve_merge") return "Ready to merge";
+  if (decisionAction === "approve_merge" || decisionAction === "approve_local_merge") return "Ready to merge";
   if (decisionAction === "approve_fresh_attempt" || reviewDecision?.toUpperCase() === "REVIEW_REQUIRED") return "Needs you";
   return "Working";
 }
@@ -121,10 +123,10 @@ export function presentWorkspace(store: MerroStore) {
     const item = store.getChangeSet(decision.subjectId);
     const runtime = item && store.getChangeSetRuntime(item.id);
     const pr = typeof payload.pullRequest === "number" ? payload.pullRequest : runtime?.pullRequestNumber ?? null;
-    const action = decision.kind === "merge_conflict" ? "approve_fresh_attempt" : "approve_merge";
-    const summary = action === "approve_fresh_attempt"
-      ? "Approve a fresh attempt to resolve merge conflicts?"
-      : "Approve merge?";
+    const action = decision.kind === "merge_conflict" ? "approve_fresh_attempt"
+      : decision.kind === "local_merge" ? "approve_local_merge" : "approve_merge";
+    const summary = action === "approve_fresh_attempt" ? "Approve a fresh attempt to resolve merge conflicts?"
+      : action === "approve_local_merge" ? "Approve local merge?" : "Approve merge?";
     return { change: item ? changeName(item) : "change", action, pr, summary };
   });
   const decisionByChange = new Map(decisionRows.map((decision) => [decision.change, decision]));
@@ -152,13 +154,13 @@ export function presentWorkspace(store: MerroStore) {
       let summary: string;
       if (state === "Done") summary = item.delivery === "local" ? `Completed locally on ${item.targetBranch}` : runtime?.pullRequestNumber ? `PR #${runtime.pullRequestNumber} merged` : "Completed";
       else if (runtime?.pullRequestState?.toUpperCase() === "MERGED" && !runtime.mergedCommitSha) summary = `GitHub marked PR #${runtime.pullRequestNumber} merged; Merro is verifying completion`;
-      else if (state === "Ready to merge") summary = "Ready for merge approval";
+      else if (state === "Ready to merge") summary = decision?.action === "approve_local_merge" ? `Ready to apply locally to ${item.targetBranch}` : "Ready for merge approval";
       else if (state === "Needs you") summary = runtime?.pullRequestNumber
         ? `PR #${runtime.pullRequestNumber} · ${decision?.action === "approve_fresh_attempt" ? "Merge conflicts need a resolution" : "GitHub requires reviewer approval"}`
         : "A decision is needed";
       else if (state === "Blocked") summary = blocked?.summary ?? "This change is blocked.";
       else if (active?.role === "implement" && latestReview?.outcome === "reject") summary = `Fixing review findings · attempt ${Math.max(2, (runtime?.reviewRound ?? 1) + 1)}`;
-      else if (item.state === "Reviewed" && item.delivery === "local") summary = "Review passed; completing locally";
+      else if (item.state === "Reviewed" && item.delivery === "local") summary = "Review passed; preparing local merge approval";
       else if (item.state === "Publishing") summary = "Opening PR...";
       else if (active?.role === "review") summary = "Checking the latest changes";
       else if (active) summary = "Working on the change";
@@ -239,7 +241,10 @@ export function formatStatus(snapshot: ReturnType<typeof presentWorkspace>): str
       const row = `  ${change.name}   ${change.status}${pr}`;
       if (change.status === "Done") return row;
       if (change.status === "Ready to merge") {
-        return `${row}\n    ${formatChecks(change.checks, true)} · Merro review ${change.review}\n    Approve merge? /merro approve ${change.name} · Leave open: /merro leave ${change.name}`;
+        const action = change.decision?.action === "approve_local_merge"
+          ? `Approve local merge? /merro approve ${change.name} · Leave unchanged: /merro leave ${change.name}`
+          : `Approve merge? /merro approve ${change.name} · Leave open: /merro leave ${change.name}`;
+        return `${row}\n    ${formatChecks(change.checks, true)} · Merro review ${change.review}\n    ${action}`;
       }
       if (change.status === "Needs you" && change.decision?.action === "approve_fresh_attempt") {
         return `${row}\n    ${change.summary}\n    Approve a fresh attempt? /merro approve ${change.name} · Leave unchanged: /merro leave ${change.name}`;

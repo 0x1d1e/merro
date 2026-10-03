@@ -6,7 +6,7 @@ Common overrides:
 
 - `projectsDir`, `worktreesDir`: workspace-relative directories, default `projects` and `.wt`. They cannot overlap, traverse outside the root, contain Git/Merro metadata, or use symlink directories. Existing recorded working-copy paths remain authoritative after changes.
 - `worker`, `reviewer`: optional `model` and `thinking`. Omitted or `null` inherits Pi's normal defaults. Model is a Pi model ID; thinking is a supported Pi level. Legacy `worker_models` and `worker_thinking` role maps are migration-only inputs, normalized to `worker`/`reviewer` in the effective config. Mixing either legacy map with `worker` or `reviewer` is rejected; migrate both roles together.
-- `git.defaultDelivery`: `local` by default, or `pr`. Explicit plan delivery overrides it; a remote never selects publication implicitly. Existing approved changes retain their delivery mode and target branch.
+- `git.defaultDelivery`: `auto` by default, `local`, or `pr`. Auto selects PR delivery when the Project has supported remotes and local delivery otherwise. Explicit plan delivery overrides it. Existing approved changes retain their delivery mode and target branch.
 - `tmux.session`: session prefix, default `merro`; a Project uses `<prefix>-<project>`. Previously recorded sessions still receive worker safety checks.
 
 Advanced settings:

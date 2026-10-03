@@ -9,7 +9,7 @@ test("config applies documented defaults", () => {
     worktreesDir: ".wt",
     worker: { model: null, thinking: null },
     reviewer: { model: null, thinking: null },
-    git: { defaultDelivery: "local" },
+    git: { defaultDelivery: "auto" },
     tmux: { session: "merro" },
     max_concurrent_tasks: 3,
     max_review_rounds: 3,
@@ -22,6 +22,7 @@ test("config applies documented defaults", () => {
 });
 
 test("minimal runtime settings accept paths and per-role overrides without prompt policy", () => {
+  assert.deepEqual(validateConfig({ git: { defaultDelivery: "auto" } }).git, { defaultDelivery: "auto" });
   const config = validateConfig({ projectsDir: "repos", worktreesDir: "scratch/changes", worker: { model: "openai/model", thinking: "max" }, reviewer: { thinking: "high" }, git: { defaultDelivery: "pr" }, tmux: { session: "lead" } });
   assert.equal(config.projectsDir, "repos");
   assert.equal(config.worktreesDir, "scratch/changes");

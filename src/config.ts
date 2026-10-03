@@ -12,7 +12,7 @@ export interface MerroConfig {
   worktreesDir: string;
   worker: WorkerRoleSettings;
   reviewer: WorkerRoleSettings;
-  git: { defaultDelivery: "local" | "pr" };
+  git: { defaultDelivery: "auto" | "local" | "pr" };
   tmux: { session: string };
   max_concurrent_tasks: number | "unlimited";
   max_review_rounds: number | "unlimited";
@@ -28,7 +28,7 @@ export const DEFAULT_CONFIG: Readonly<MerroConfig> = {
   worktreesDir: ".wt",
   worker: { model: null, thinking: null },
   reviewer: { model: null, thinking: null },
-  git: { defaultDelivery: "local" },
+  git: { defaultDelivery: "auto" },
   tmux: { session: "merro" },
   max_concurrent_tasks: 3,
   max_review_rounds: 3,
@@ -60,8 +60,8 @@ export function validateConfig(value: unknown): MerroConfig {
     throw new Error("projectsDir and worktreesDir must not overlap");
   }
   const git = settingsObject(merged.git, "git", ["defaultDelivery"]);
-  const defaultDelivery = git.defaultDelivery ?? "local";
-  if (defaultDelivery !== "local" && defaultDelivery !== "pr") throw new Error("git.defaultDelivery must be local or pr");
+  const defaultDelivery = git.defaultDelivery ?? "auto";
+  if (defaultDelivery !== "auto" && defaultDelivery !== "local" && defaultDelivery !== "pr") throw new Error("git.defaultDelivery must be auto, local or pr");
   const tmux = settingsObject(merged.tmux, "tmux", ["session"]);
   const session = tmux.session ?? "merro";
   if (typeof session !== "string" || !/^[a-zA-Z0-9_-]+$/.test(session)) throw new Error("tmux.session must be a safe session prefix");

@@ -8,7 +8,7 @@ Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly in an
 
 Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; replacement or restart expires it. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch, delivery mode, target branch, or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
 
-Default grouping combines the selected issues within each Project into one ChangeSet. Issue-free Objectives select named changes with no GitHub scope. Delivery mode defaults to local, with PR opt-in; remote presence never implies publication. Cross-Project Objectives have separate changes. An issue already owned by another active selection cannot be silently regrouped. Separate delivery is explicit, not a second execution model: each delivery unit is still a ChangeSet.
+Default grouping combines the selected issues within each Project into one ChangeSet. Issue-free Objectives select named changes with no GitHub scope. Delivery follows each Project checkout by default: supported remotes select PR delivery; without them, delivery is local. Explicit local or PR settings may override the default. Cross-Project Objectives have separate changes. An issue already owned by another active selection cannot be silently regrouped. Separate delivery is explicit, not a second execution model: each delivery unit is still a ChangeSet.
 
 Combined query results become fixed selections on approval so future matches cannot silently enlarge a running change. Separate delivery may retain a live query of labels and optional milestone. Newly matching issues enter approved query scope; scope expansion or new Projects require user direction. Query removal detaches ownership, obsoletes exclusive unfinished work once idle, and preserves shared work. Failed scope refresh gates scheduling and completion, never falls back to cached membership.
 
@@ -21,7 +21,7 @@ Planned -> Ready -> Implementing -> Reviewing -> Reviewed -> Publishing -> Await
                          ^             | reject                  | failure
                          +-------------+                         v
                                                         PublishBlocked -> Publishing
-Reviewed -> Done (local delivery)
+Reviewed -> AwaitingLocalMerge -> Done (local delivery approval)
 any non-terminal state -> Blocked -> prior flow after resolution
 idle unfinished work -> Obsolete | Cancelled
 ```
@@ -60,7 +60,7 @@ Each change uses `.wt/<project>/<slug>` and an intent-prefixed branch (`feat/`, 
 
 Local changes start from the approved target branch in the canonical checkout; their clone remotes point there. PR changes start from the canonical base remote's current default branch. Base movement schedules an implementer to merge the exact fetched commit, verify and commit, followed by fresh review. No rebase, force-push or Main-authored merge commit. Merge conflicts require a Decision authorizing implementation, not direct merge by Main.
 
-Passing review persists Reviewed and reports completion before delivery, including completion hooks. Local delivery requires verified worker exit, the exact reviewed HEAD, clean working copies, and the approved branch checked out in the canonical Project. Main fast-forwards without authoring a commit or pushing. Diverged local base schedules implementation and fresh review; dirty/mismatched targets block with retry guidance. Completion is persisted only after verifying the canonical HEAD.
+Passing review persists Reviewed and reports completion before delivery, including completion hooks. Local delivery then enters AwaitingLocalMerge and requires explicit approval for the displayed branch and exact reviewed diff. Before fast-forward, Merro rechecks verified Worker exit, clean working copies, the target branch, base commit, and review freshness. Main does not author a commit or push. If the base moved, Merro schedules implementation against that base, verifies and reviews again, then requests fresh approval. Merge conflicts require a fresh implementer, verification, and reviewer; Main never resolves them. Completion is persisted only after verifying the canonical HEAD.
 
 For PR delivery, Publishing fetches the push remote branch first and publishes the exact reviewed commit with an ordinary push. Absent/equal/remote-behind branches are safe; remote-ahead/diverged branches block with reconciliation and fresh-review guidance. A concurrent remote update cannot be overwritten. PublishBlocked retains review and any PR identity; restart/continuation reuses the single PR. AwaitingMerge begins only after publication and metadata synchronization succeed.
 
