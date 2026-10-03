@@ -104,6 +104,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
     config: {
       ...DEFAULT_CONFIG,
       sandbox: "none",
+      worker_github: "on",
       worker_models: { implement: null, review: "openai/gpt-4o" },
       worker_thinking: { implement: null, review: "high" },
     },
@@ -182,7 +183,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   const movedPath = join(root, "moved-project");
   await rename(projectPath, movedPath);
   containerId = "b".repeat(64);
-  const restarted = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "docker" }, commands, piConfigPath });
+  const restarted = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "docker", worker_github: "on" }, commands, piConfigPath });
   const legacyClonePath = join(root, "merro-acceptance:issue-1:g1");
   await mkdir(legacyClonePath);
   const successor = await restarted.launch({ taskId: "task-2", changeSetId: "merro-acceptance:issue-1:g1", changeSlug: "safety", taskName: "implement-safety", role: "implement",

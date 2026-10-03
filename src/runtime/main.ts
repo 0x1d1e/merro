@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, mkdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { MerroConfig, WorkerSettings } from "../config.js";
-import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type ChangeSet } from "../domain/model.js";
+import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../domain/relations.js";
@@ -23,7 +24,7 @@ import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-run
 import { GitClient } from "../vcs/git.js";
 
 type GitAdapter = Pick<GitClient, "discoverProject" | "createChangeSetClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint" | "fullDiff">
-  & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone">>;
+  & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone" | "cloneProject" | "deliverLocal">>;
 type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "issues" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest" | "beginPass">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup" | "listOwnedWorkers">
@@ -68,6 +69,7 @@ interface ObjectiveInputOptions {
   goal: string;
   priority?: Priority;
   maxReviewRounds?: number | "unlimited";
+  deliveryMode?: DeliveryMode;
 }
 
 export interface ObjectiveStartInput extends ObjectiveInputOptions {
@@ -102,7 +104,7 @@ function proposalFingerprint(graph: ObjectiveGraph, projects: readonly Project[]
   return JSON.stringify({
     projects: projects.map(({ slug, path, baseRemote, pushRemote, defaultBranch }) => ({ slug, path, baseRemote, pushRemote, defaultBranch })),
     changeSets: graph.changeSets.map((item) => ({ id: item.id, name: changeName(item), projectSlug: item.projectSlug,
-      issues: item.issues, generation: item.generation })),
+      issues: item.issues, generation: item.generation, delivery: item.delivery, targetBranch: item.targetBranch })),
     branches: graph.branches, relations: graph.relations, relationNames: graph.relationNames,
     unresolved: graph.unresolved, cycle: graph.cycle, runnableImmediately: graph.runnableImmediately,
   });
@@ -320,7 +322,7 @@ function isCommitSha(value: string | null): value is string {
 export class MainOrchestrator {
   readonly #workspacePath: string;
   readonly #stateDirectory: string;
-  readonly #workRoot: string;
+  get #workRoot(): string { return join(this.#workspacePath, this.#config.worktreesDir); }
   readonly #config: MerroConfig;
   readonly #notify: (message: string, level?: "info" | "warning" | "error") => void;
   readonly #progress: (message: string) => void;
@@ -337,7 +339,6 @@ export class MainOrchestrator {
   constructor(options: MainOptions) {
     this.#workspacePath = resolve(options.workspacePath);
     this.#stateDirectory = join(this.#workspacePath, ".merro");
-    this.#workRoot = join(this.#workspacePath, ".wt");
     this.#config = options.config;
     const notify = options.notify ?? ((message: string) => console.log(message));
     this.#notify = (message, level) => notify(publicText(message, this.#names), level);
@@ -402,10 +403,24 @@ export class MainOrchestrator {
   async addProject(path: string, slug: string): Promise<Project> {
     await requireWorkspace(this.#workspacePath);
     assertProjectSlug(slug);
-    const projectPath = resolve(path);
-    const gitProject = await this.#git.discoverProject(projectPath, slug);
-    const repository = await this.#github.repositoryInDirectory(projectPath);
-    const project: Project = { ...gitProject, defaultBranch: repository.defaultBranch };
+    const remote = /^(?:https?|ssh|git|file):\/\//.test(path) || /^[^/\s]+@[^:\s]+:.+/.test(path);
+    let projectPath: string;
+    if (remote) {
+      projectPath = join(this.#workspacePath, this.#config.projectsDir, slug);
+      const existing = await this.#withStore((store) => store.getProject(slug));
+      if (existing) {
+        if (existing.path !== projectPath || !sameRemoteRepository(existing.baseRemote, path)) throw new Error(`Project '${slug}' is already registered with different repository identity`);
+      } else {
+        if (!this.#git.cloneProject) throw new Error("Git adapter cannot clone a remote Project");
+        await this.#ensureWorkspaceDirectory(this.#config.projectsDir);
+        this.#notify(`Cloning -> ./${this.#config.projectsDir}/${slug}`);
+        await this.#git.cloneProject(path, projectPath);
+      }
+    } else {
+      const supplied = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+      projectPath = resolve(this.#workspacePath, supplied);
+    }
+    const project = await this.#git.discoverProject(projectPath, slug);
     return this.#withStore((store) => {
       const existing = store.getProject(slug);
       if (existing) {
@@ -440,6 +455,8 @@ export class MainOrchestrator {
   }
 
   async #prepareObjective(store: MerroStore, input: ObjectiveRequest) {
+    const delivery = input.deliveryMode ?? this.#config.git.defaultDelivery;
+    if (delivery !== "local" && delivery !== "pr") throw new Error("Delivery mode must be local or pr");
     const explicit = "changeSets" in input;
     let projects: Project[];
     let issueScopes: ObjectiveIssueScope[];
@@ -459,7 +476,7 @@ export class MainOrchestrator {
       });
       selections = input.changeSets.map((item, index) => ({
         name: names[index]!, projectSlug: item.projectSlug,
-        scope: parseObjectiveIssueScopes([{ projectSlug: item.projectSlug, numbers: item.issues }], [item.projectSlug])[0]!,
+        scope: parseObjectiveIssueScopes([{ projectSlug: item.projectSlug, numbers: item.issues }], [item.projectSlug], { allowEmptyFixedSelections: true })[0]!,
       }));
       issueScopes = [];
     } else {
@@ -475,6 +492,13 @@ export class MainOrchestrator {
       selections = issueScopes.map((scope) => ({ name: null, projectSlug: scope.projectSlug, scope }));
     }
 
+    if (delivery === "pr") {
+      for (const project of projects) {
+        if (!project.baseRemote || !project.pushRemote) throw new Error(`Project '${project.slug}' has no remote; use local delivery`);
+        const repository = await this.#github.repository(project.baseRemote);
+        project.defaultBranch = repository.defaultBranch;
+      }
+    }
     const projectBySlug = new Map(projects.map((project) => [project.slug, project]));
     const issueRows = new Map<string, GitHubIssue>();
     const selectedGroups: GitHubIssue[][] = [];
@@ -482,7 +506,8 @@ export class MainOrchestrator {
     for (const selection of selections) {
       const project = projectBySlug.get(selection.projectSlug);
       if (!project) throw new Error(`unknown Project: ${selection.projectSlug}`);
-      const open = await this.#github.listOpenIssues(project, "query" in selection.scope ? selection.scope.query : undefined);
+      const issueFree = "numbers" in selection.scope && selection.scope.numbers.length === 0;
+      const open = issueFree ? [] : await this.#github.listOpenIssues(project, "query" in selection.scope ? selection.scope.query : undefined);
       const selected = open.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(selection.scope, issue))
         .sort((a, b) => a.number - b.number);
       if ("numbers" in selection.scope) {
@@ -490,7 +515,6 @@ export class MainOrchestrator {
           if (!selected.some((issue) => issue.number === number)) throw new Error(`issue #${number} is not open in Project '${project.slug}'`);
         }
       }
-      if (explicit && selected.length === 0) throw new Error(`ChangeSet '${selection.name}' must select at least one open issue`);
       for (const issue of selected) {
         const key = `${project.slug}\0${issue.number}`;
         const previousOwner = issueOwners.get(key);
@@ -510,7 +534,7 @@ export class MainOrchestrator {
       for (const project of projects) {
         const issues = [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue);
         if (input.delivery === "separate") groups.push(...issues.map((issue) => ({ name: null, projectSlug: project.slug, issues: [issue] })));
-        else if (issues.length) groups.push({ name: null, projectSlug: project.slug, issues });
+        else if (issues.length || input.issues.length === 0) groups.push({ name: null, projectSlug: project.slug, issues });
       }
     }
     const plannedNames = new Set<string>();
@@ -519,9 +543,11 @@ export class MainOrchestrator {
     const requestedRelations = "relations" in input ? input.relations ?? [] : [];
     const changeSets = groups.map(({ name, projectSlug, issues }): ChangeSet => {
       const numbers = issues.map((issue) => issue.number);
-      const existing = store.findNonTerminalChangeSet(projectSlug, numbers);
+      const existing = numbers.length ? store.findNonTerminalChangeSet(projectSlug, numbers)
+        : name ? store.listChangeSets().find((item) => item.projectSlug === projectSlug && item.slug === name && !terminal(item)) ?? null : null;
       if (existing) {
         if (name && existing.slug !== name) throw new Error(`These issues already belong to ChangeSet '${existing.slug}', not '${name}'`);
+        if ((existing.delivery ?? "pr") !== delivery) throw new Error(`ChangeSet '${existing.slug}' already has ${existing.delivery ?? "pr"} delivery; obtain a new plan instead`);
         plannedNames.add(existing.slug);
         if (name) namesToIds.set(name, existing.id);
         return existing;
@@ -536,7 +562,7 @@ export class MainOrchestrator {
       const id = issues.length === 1 ? sourceId(projectSlug, issues[0]!.number, generation) : `${projectSlug}:change:${slug}:g${generation}`;
       this.#names.set(id, slug);
       if (name) namesToIds.set(name, id);
-      return { id, slug, projectSlug, issues: numbers.map((number) => ({ projectSlug, number })), generation,
+      return { id, slug, projectSlug, delivery, targetBranch: projectBySlug.get(projectSlug)!.defaultBranch, issues: numbers.map((number) => ({ projectSlug, number })), generation,
         state: "Planned", priority: input.priority ?? "normal", readySince: null, blockedReason: null, blockedResumeState: null };
     });
 
@@ -597,7 +623,7 @@ export class MainOrchestrator {
       .filter((item) => ids.has(item.id) && !unresolvedIds.has(item.id)).length;
     return { projects, issueScopes, approvedIssueScopes, issueRows, automaticRelations, explicitRelations,
       graph: { changeSets, branches: Object.fromEntries(changeSets.map((item) => [item.id,
-        store.getChangeSetRuntime(item.id)?.branchName ?? branchName(issueRows.get(`${item.projectSlug}\0${issueNumbers(item)[0]}`)!, item.slug)])),
+        store.getChangeSetRuntime(item.id)?.branchName ?? (item.issues.length ? branchName(issueRows.get(`${item.projectSlug}\0${issueNumbers(item)[0]}`)!, item.slug) : `chore/${item.slug}`)])),
         relations: effective, relationNames, unresolved, cycle: findRequiresCycle(effective), runnableImmediately } };
   }
 
@@ -705,7 +731,8 @@ export class MainOrchestrator {
       if (matches.length !== 1) return null;
       const item = matches[0]!;
       const runtime = store.getChangeSetRuntime(item.id)!;
-      return `Already merged: ${changeName(item)} · PR #${runtime.pullRequestNumber ?? "?"} merged.`;
+      return item.delivery === "local" ? `Already completed: ${changeName(item)} · Local delivery to ${item.targetBranch}.`
+        : `Already merged: ${changeName(item)} · PR #${runtime.pullRequestNumber ?? "?"} merged.`;
     });
     let decisionId: string;
     try {
@@ -1012,7 +1039,7 @@ export class MainOrchestrator {
       const finalizedTaskCount = () => store.listTasks().filter((task) => task.status === "finalized").length;
       let inventoriedFinalizedTaskCount = -1;
       try {
-        this.#github.beginPass?.();
+        if (store.listChangeSets().some((item) => !terminal(item) && (item.issues.length || item.delivery === "pr"))) this.#github.beginPass?.();
         const issueCache = new Map<string, Map<number, GitHubIssue>>();
         const unavailableProjects = await this.#reconcileProjects(store);
         let orphans = await this.#workerSafetyPreflight(store, unsafeProjects);
@@ -1034,7 +1061,8 @@ export class MainOrchestrator {
         for (const item of store.listChangeSets()) {
           if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
         }
-        publicationDeferred = await this.#reconcilePublication(store, unavailableProjects, unsafeProjects);
+        publicationDeferred = await this.#reconcileLocalDelivery(store, unavailableProjects, unsafeProjects);
+        publicationDeferred = await this.#reconcilePublication(store, unavailableProjects, unsafeProjects) || publicationDeferred;
         await this.#reconcilePullRequests(store, unavailableProjects, unsafeProjects);
         const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds, issueCache);
         for (const id of scopeGates) relationGates.add(id);
@@ -1146,8 +1174,9 @@ export class MainOrchestrator {
       const taskName = `${role === "implement" ? "implement" : "review"}-${slug}-${attempt}`;
       if (!runtime.clonePath || !runtime.branchName) {
         const branch = runtime.branchName ?? (issue ? branchName(issue, slug) : `chore/${slug}`);
-        const clonePath = join(this.#workRoot, slug);
-        const clone = await this.#git.createChangeSetClone(project, clonePath, branch);
+        await this.#ensureWorkspaceDirectory(join(this.#config.worktreesDir, project.slug));
+        const clonePath = join(this.#workRoot, project.slug, slug);
+        const clone = await this.#git.createChangeSetClone({ ...project, defaultBranch: item.targetBranch ?? project.defaultBranch }, clonePath, branch, item.delivery ?? "pr");
         runtime = { ...runtime, branchName: clone.branchName, clonePath: clone.path, baseCommit: clone.baseCommit };
         store.saveChangeSetRuntime(runtime);
         await this.#workers.prepareClone(project, clone.path, store.getProjectSettings(project.slug));
@@ -1167,11 +1196,12 @@ export class MainOrchestrator {
           const dependency = store.getChangeSet(relation.to);
           if (!dependency || dependency.state !== "Done") return [];
           const depRuntime = store.getChangeSetRuntime(dependency.id);
+          const sourceProject = store.getProject(dependency.projectSlug);
           const summary = store.listTasks(dependency.id).reverse().find((task) => task.role === "review" && task.summary)?.summary ?? null;
           return [{
             changeSetId: dependency.id,
             projectSlug: dependency.projectSlug,
-            project: store.getProject(dependency.projectSlug),
+            project: sourceProject && dependency.delivery === "local" ? { ...sourceProject, baseRemote: "", pushRemote: "" } : sourceProject,
             pullRequestUrl: depRuntime?.pullRequestUrl ?? null,
             commit: depRuntime?.mergedCommitSha ?? null,
             summary,
@@ -1225,7 +1255,7 @@ export class MainOrchestrator {
       runtimeIntent = this.#workers.plan?.(launchInput) ?? {
         taskId,
         runtimeKind: null,
-        tmuxSession: `merro-${project.slug}`,
+        tmuxSession: `${this.#config.tmux.session}-${project.slug}`,
         tmuxWindow: taskWindowName(role, slug),
         paneId: null,
         containerId: null,
@@ -1280,8 +1310,9 @@ export class MainOrchestrator {
           || !sameRemoteRepository(current.pushRemote, discovered.pushRemote)) {
           throw new Error("Git remotes now identify a different repository; explicit confirmation is required");
         }
-        const repository = await this.#github.repository(discovered.baseRemote);
-        const reconciled = { ...discovered, defaultBranch: repository.defaultBranch };
+        const needsGitHub = store.listChangeSets().some((item) => item.projectSlug === current.slug && !terminal(item) && (item.issues.length || item.delivery === "pr"));
+        const repository = needsGitHub ? await this.#github.repository(discovered.baseRemote) : null;
+        const reconciled = { ...discovered, defaultBranch: repository?.defaultBranch ?? discovered.defaultBranch };
         store.updateProject(reconciled);
         let resumed = false;
         for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === current.slug)) {
@@ -1290,7 +1321,7 @@ export class MainOrchestrator {
             resumed = true;
           }
         }
-        if (resumed) this.#progress(`${current.slug} · GitHub is available again.`);
+        if (resumed) this.#progress(`${current.slug} · Project is available again.`);
       } catch (error) {
         unavailable.add(current.slug);
         const cause = isTransientGitHubFailure(error)
@@ -1301,7 +1332,7 @@ export class MainOrchestrator {
             this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${cause}`);
           }
         }
-        this.#notify(`${current.slug} · GitHub is unavailable. Merro will retry automatically.`, "warning");
+        this.#notify(`${current.slug} · Project is unavailable. Merro will retry automatically.`, "warning");
       }
     }
     return unavailable;
@@ -1729,16 +1760,54 @@ export class MainOrchestrator {
 
   #notifyReviewComplete(store: MerroStore, item: ChangeSet, task: Task): void {
     if (store.hasEvent("Task", task.id, "review_complete_notified")) return;
-    const message = `${changeName(item)} · Review passed; opening PR.`;
+    const message = `${changeName(item)} · Review passed; ${item.delivery === "local" ? "completing locally" : "opening PR"}.`;
     this.#progress(message);
     this.#queueNotification("review_complete", item.id, message);
     store.appendEvent("Task", task.id, "review_complete_notified", {});
+  }
+
+  async #ensureWorkspaceDirectory(directory: string): Promise<void> {
+    let path = this.#workspacePath;
+    for (const part of directory.split(/[\\/]/).filter(Boolean)) {
+      if (part === "." || part === "..") throw new Error("Invalid workspace directory");
+      path = join(path, part);
+      try { await mkdir(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const details = await lstat(path);
+      if (!details.isDirectory() || details.isSymbolicLink()) throw new Error(`Workspace directory must not be a symlink: ${path}`);
+    }
+  }
+
+  async #reconcileLocalDelivery(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<boolean> {
+    let deferred = false;
+    for (const item of store.listChangeSets()) {
+      if (item.delivery !== "local" || item.state !== "Reviewed" || unavailableProjects.has(item.projectSlug)
+        || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
+      if (this.#reviewNotificationsInFlight.has(item.id)) { deferred = true; continue; }
+      try {
+        const runtime = store.getChangeSetRuntime(item.id);
+        const project = store.getProject(item.projectSlug);
+        const review = store.listTasks(item.id).at(-1);
+        if (!project || !runtime?.clonePath || !item.targetBranch || review?.outcome !== "pass" || !review.reviewedCommit || !this.#git.deliverLocal) throw new Error("Local delivery requires a reviewed working copy and target branch");
+        const delivered = await this.#git.deliverLocal(project, runtime.clonePath, item.targetBranch, review.reviewedCommit);
+        if ("baseUpdate" in delivered) {
+          store.saveChangeSetRuntime({ ...runtime, baseUpdate: delivered.baseUpdate });
+          store.transitionChangeSet(item.id, "Implementing");
+          this.#progress(`${item.slug} · Local base moved; updating and reviewing again.`);
+        } else {
+          store.completeLocalChangeSet(item.id, delivered.commit);
+          this.#notify(`${item.slug} done · Completed locally on ${item.targetBranch}.`);
+          // Keep the clone until finalized Task scratch has been cleaned safely.
+        }
+      } catch (error) { this.#block(store, item, "merge_failed", `Local delivery failed: ${errorText(error)}`); }
+    }
+    return deferred;
   }
 
   async #reconcilePublication(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<boolean> {
     let deferred = false;
     for (let item of store.listChangeSets()) {
       if (unavailableProjects.has(item.projectSlug) || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
+      if (item.delivery === "local") continue;
       const retrying = item.state === "PublishBlocked" && item.blockedReason === "github_unavailable";
       if (item.state !== "Reviewed" && item.state !== "Publishing" && !retrying) continue;
       const workRuntime = store.getChangeSetRuntime(item.id);
@@ -1823,7 +1892,7 @@ export class MainOrchestrator {
 
   async #reconcilePullRequests(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<void> {
     for (let item of store.listChangeSets()) {
-      if (unavailableProjects.has(item.projectSlug)) continue;
+      if (unavailableProjects.has(item.projectSlug) || item.delivery === "local") continue;
       const recovering = item.state === "Blocked"
         && item.blockedResumeState === "AwaitingMerge"
         && (item.blockedReason === "github_unavailable" || item.blockedReason === "policy_unknown");
@@ -2339,7 +2408,7 @@ export class MainOrchestrator {
           if (!project || unavailableProjects.has(project.slug)) throw new Error(`Project '${scope.projectSlug}' is unavailable`);
           const issues = "query" in scope
             ? await this.#github.listOpenIssues(project, scope.query)
-            : await this.#github.issues(project, scope.numbers);
+            : scope.numbers.length ? await this.#github.issues(project, scope.numbers) : [];
           const cached = issueCache.get(project.slug) ?? new Map<number, GitHubIssue>();
           for (const issue of issues) cached.set(issue.number, issue);
           issueCache.set(project.slug, cached);

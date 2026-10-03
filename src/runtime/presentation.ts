@@ -54,7 +54,7 @@ function reviewResult(tasks: Task[]): "passed" | "changes requested" | "not revi
       : latest?.outcome === "failed" ? "review failed" : "not reviewed";
 }
 
-function blockMessage(reason: BlockReason, detail: string, retryable: boolean | null, name: string, reviewPassed = false): { summary: string; next: string | null } {
+function blockMessage(reason: BlockReason, detail: string, retryable: boolean | null, name: string, reviewPassed = false, localDelivery = false): { summary: string; next: string | null } {
   if (reason === "policy_unknown") {
     const rule = detail.match(/unsupported (?:merge requirement|branch rule) '([^']+)'/i)?.[1];
     if (retryable === false) return {
@@ -64,6 +64,7 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
     return { summary: "Merro cannot verify GitHub's branch rules right now.", next: "Merro will check again automatically." };
   }
   if (reason === "github_unavailable" || reason === "project_unavailable") {
+    if (localDelivery && reason === "project_unavailable") return { summary: "The canonical Project checkout is unavailable.", next: "Restore the checkout; Merro will retry automatically." };
     const summary = reviewPassed
       ? reason === "project_unavailable" ? "Review complete, publication blocked while this GitHub Project is unavailable."
         : "Review complete, publication blocked while GitHub is unavailable."
@@ -84,7 +85,9 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
   }
   if (reason === "clone_lost") return { summary: "Merro could not find the working copy for this change.", next: `Restore the working copy, then /merro retry ${name}.` };
   if (reason === "remote_branch_deleted") return { summary: "The pull request branch was deleted.", next: "Restore the branch on GitHub; Merro will check again automatically." };
-  if (reason === "merge_failed") return { summary: `GitHub could not merge this pull request: ${oneLine(detail)}`, next: `Check the pull request, then /merro retry ${name} if needed.` };
+  if (reason === "merge_failed") return localDelivery
+    ? { summary: oneLine(detail) || "Local delivery is blocked.", next: `Check the canonical checkout, then /merro retry ${name}.` }
+    : { summary: `GitHub could not merge this pull request: ${oneLine(detail)}`, next: `Check the pull request, then /merro retry ${name} if needed.` };
   if (reason === "publication_failed") return {
     summary: reviewPassed ? "Review complete, publication blocked: Merro could not open or update the pull request." : "Merro could not open or update the pull request.",
     next: `See /merro ${name} for details; then /merro retry ${name} after fixing the cause.`,
@@ -144,10 +147,10 @@ export function presentWorkspace(store: MerroStore) {
       const latestReview = tasks.filter((task) => task.role === "review").at(-1);
       const latestBlock = store.latestBlock(item.id);
       const blocked = item.blockedReason
-        ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, changeName(item), review === "passed")
+        ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, changeName(item), review === "passed", item.delivery === "local")
         : null;
       let summary: string;
-      if (state === "Done") summary = runtime?.pullRequestNumber ? `PR #${runtime.pullRequestNumber} merged` : "Completed";
+      if (state === "Done") summary = item.delivery === "local" ? `Completed locally on ${item.targetBranch}` : runtime?.pullRequestNumber ? `PR #${runtime.pullRequestNumber} merged` : "Completed";
       else if (runtime?.pullRequestState?.toUpperCase() === "MERGED" && !runtime.mergedCommitSha) summary = `GitHub marked PR #${runtime.pullRequestNumber} merged; Merro is verifying completion`;
       else if (state === "Ready to merge") summary = "Ready for merge approval";
       else if (state === "Needs you") summary = runtime?.pullRequestNumber
@@ -155,6 +158,7 @@ export function presentWorkspace(store: MerroStore) {
         : "A decision is needed";
       else if (state === "Blocked") summary = blocked?.summary ?? "This change is blocked.";
       else if (active?.role === "implement" && latestReview?.outcome === "reject") summary = `Fixing review findings · attempt ${Math.max(2, (runtime?.reviewRound ?? 1) + 1)}`;
+      else if (item.state === "Reviewed" && item.delivery === "local") summary = "Review passed; completing locally";
       else if (item.state === "Publishing") summary = "Opening PR...";
       else if (active?.role === "review") summary = "Checking the latest changes";
       else if (active) summary = "Working on the change";
@@ -165,7 +169,7 @@ export function presentWorkspace(store: MerroStore) {
       return {
         name: changeName(item), project: item.projectSlug, issues: issueNumbers(item), status: state, summary,
         pr: runtime?.pullRequestNumber ?? null,
-        prState: runtime?.mergedCommitSha ? "MERGED" : runtime?.pullRequestState?.toUpperCase() === "MERGED" ? "verifying merge" : runtime?.pullRequestState?.toUpperCase() ?? "not opened",
+        prState: item.delivery === "local" ? "not requested" : runtime?.mergedCommitSha ? "MERGED" : runtime?.pullRequestState?.toUpperCase() === "MERGED" ? "verifying merge" : runtime?.pullRequestState?.toUpperCase() ?? "not opened",
         checks, review, decision: decision ?? null,
         blocked: blocked ? { message: blocked.summary, next: blocked.next } : null,
       };
@@ -182,7 +186,7 @@ export function presentChangeDetails(store: MerroStore, name: string) {
   const current = presentWorkspace(store).changes.find((change) => change.name === name)!;
   const latestBlock = store.latestBlock(item.id);
   const block = item.blockedReason
-    ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, name, current.review === "passed")
+    ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, name, current.review === "passed", item.delivery === "local")
     : null;
   const blocked = block ? {
     ...block,

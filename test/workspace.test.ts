@@ -57,11 +57,13 @@ for (const gitRepository of [false, true]) {
         await commands.get('merro-export').handler('',{});
       } finally { await events.get('session_shutdown')(); }`;
     const result = await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, MERRO_RUNTIME: "" } });
-    assert.match(result.stdout, /Merro initialized\.\n\nNext: ask Main to register a Project and propose an Objective\./);
-    assert.match(result.stdout, /Merro is already initialized\./);
-    for (const file of ["WORKSPACE.md", "IMPLEMENTER.md", "REVIEWER.md", "projects/my-app.md"]) {
-      await assert.rejects(readFile(join(cwd, ".merro", file)), { code: "ENOENT" });
+    assert.match(result.stdout, /Merro initialized in /);
+    assert.match(result.stdout, /register <repo-or-path> as <name>/);
+    assert.match(result.stdout, /Merro already initialized\./);
+    for (const file of ["WORKSPACE.md", "IMPLEMENTER.md", "REVIEWER.md"]) {
+      assert.ok((await readFile(join(cwd, ".merro", file), "utf8")).trim());
     }
+    await assert.rejects(readFile(join(cwd, ".merro", "projects/my-app.md")), { code: "ENOENT" });
     await requireWorkspace(cwd);
     assert.deepEqual(JSON.parse(await readFile(join(cwd, ".merro", "export.json"), "utf8")).projects, []);
     await assert.rejects(readFile(join(root, "gh-called")), { code: "ENOENT" });
@@ -107,7 +109,7 @@ test("/merro init excludes local state and preserves explicitly registered Proje
   const customConfig = '{"max_concurrent_tasks":2,"max_review_rounds":3}\n';
   await writeFile(config, customConfig);
   await writeFile(join(cwd, ".merro", "runtime", "sentinel"), "preserved");
-  await mkdir(join(cwd, ".merro", "projects"));
+  await mkdir(join(cwd, ".merro", "projects"), { recursive: true });
   const markdown = ["WORKSPACE.md", "IMPLEMENTER.md", "REVIEWER.md", "projects/kinetix.md"];
   for (const file of markdown) await writeFile(join(cwd, ".merro", file), `Preserved ${file}`);
   const state = join(cwd, ".merro", "state.db");

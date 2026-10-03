@@ -22,7 +22,7 @@ import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
 
@@ -55,6 +55,8 @@ function changeSetFromRow(row: Record<string, unknown>): ChangeSet {
     // Old source columns remain a persisted-state detail, not a domain identity.
     slug: row.slug ? String(row.slug) : row.source_type === "issue" ? `issues-${String(row.source_ref).replace(/,/g, "-")}` : semanticSlug(String(row.source_ref)),
     issues: row.source_type === "issue" ? String(row.source_ref).split(",").map((number) => ({ projectSlug: String(row.project_slug), number: Number(number) })) : [],
+    delivery: row.delivery === "local" ? "local" : "pr",
+    ...(typeof row.target_branch === "string" ? { targetBranch: row.target_branch } : {}),
     generation: Number(row.generation),
     state: row.state as ChangeSetState,
     priority: row.priority as ChangeSet["priority"],
@@ -350,6 +352,15 @@ export class MerroStore {
         version = 16;
       } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
     }
+    if (version < 17) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_17);
+        this.#db.prepare("UPDATE schema_meta SET version = 17").run();
+        this.#db.exec("COMMIT");
+        version = 17;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -430,7 +441,7 @@ export class MerroStore {
         INSERT INTO objectives(id, goal, priority, state, created_at, updated_at, issue_scopes_json)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(objective.id, objective.goal, objective.priority, objective.state, timestamp, timestamp,
-        objective.issueScopes === undefined ? null : JSON.stringify(parseObjectiveIssueScopes(objective.issueScopes, objective.projectSlugs)));
+        objective.issueScopes === undefined ? null : JSON.stringify(parseObjectiveIssueScopes(objective.issueScopes, objective.projectSlugs, { allowEmptyFixedSelections: true })));
       const attach = this.#db.prepare("INSERT INTO objective_projects(objective_id, project_slug) VALUES (?, ?)");
       for (const slug of [...new Set(objective.projectSlugs)]) attach.run(objective.id, slug);
       if (objective.maxReviewRounds !== undefined && objective.maxReviewRounds !== null) {
@@ -779,12 +790,12 @@ export class MerroStore {
       this.#db.prepare(`
         INSERT INTO work_items(
           id, project_slug, source_type, source_ref, generation, state, priority,
-          ready_since, blocked_reason, blocked_resume_state, created_at, updated_at, slug
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ready_since, blocked_reason, blocked_resume_state, created_at, updated_at, slug, delivery, target_branch
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         item.id, item.projectSlug, item.issues.length ? "issue" : "local", item.issues.length ? issueNumbers(item).sort((a, b) => a - b).join(",") : item.slug, item.generation, item.state,
         item.priority, item.readySince, item.blockedReason, item.blockedResumeState, timestamp, timestamp,
-        this.availableChangeName(changeName(item)),
+        this.availableChangeName(changeName(item)), item.delivery ?? "pr", item.targetBranch ?? null,
       );
       this.#db.prepare("INSERT INTO work_item_settings(work_item_id, guidance) VALUES (?, ?)")
         .run(item.id, item.guidance ?? "");
@@ -929,6 +940,27 @@ export class MerroStore {
       });
   }
 
+  completeLocalChangeSet(id: string, commit: string): void {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const item = this.getChangeSet(id);
+      const review = this.listTasks(id).at(-1);
+      if (item?.delivery !== "local" || item.state !== "Reviewed" || this.activeTask(id)
+        || review?.role !== "review" || review.outcome !== "pass" || review.reviewedCommit !== commit) {
+        throw new Error("Local completion requires the latest passing review and no active Task");
+      }
+      const runtime = this.getChangeSetRuntime(id);
+      if (!runtime) throw new Error("Local completion requires working-copy metadata");
+      this.saveChangeSetRuntime({ ...runtime, mergedCommitSha: commit });
+      this.transitionChangeSet(id, "Done");
+      this.#db.prepare("INSERT INTO final_summaries(work_item_id, payload_json, created_at) VALUES (?, ?, ?)")
+        .run(id, JSON.stringify({ change: item.slug, delivery: "local", branch: item.targetBranch, commit }), now());
+      this.appendEvent("ChangeSet", id, "final_summary_written", { createdAt: now() });
+      this.appendEvent("ChangeSet", id, "completed", { reason: "local_delivery", commit });
+      this.#db.exec("COMMIT");
+    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+  }
+
   completeChangeSetAfterMerge(id: string, payload: unknown): boolean {
     const serialized = JSON.stringify(payload);
     if (serialized === undefined) throw new Error("final summary must be JSON serializable");
@@ -1025,7 +1057,7 @@ export class MerroStore {
       throw new Error("BlockReason is only valid when entering or updating Blocked");
     }
 
-    assertChangeSetTransition(item.state, to, item.blockedResumeState);
+    assertChangeSetTransition(item.state, to, item.blockedResumeState, item.delivery ?? "pr");
     if (to === "Obsolete" && this.activeTask(id)) {
       throw new Error(`cannot obsolete ChangeSet with an active Task: ${id}`);
     }

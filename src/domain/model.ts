@@ -1,3 +1,4 @@
+export type DeliveryMode = "local" | "pr";
 export type Priority = "high" | "normal" | "low";
 export type ObjectiveState = "Active" | "Done" | "Stopped";
 export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "Reviewed" | "Publishing" | "AwaitingMerge";
@@ -70,6 +71,8 @@ export interface ChangeSet {
   id: string;
   slug: string;
   projectSlug: string;
+  delivery?: DeliveryMode;
+  targetBranch?: string;
   issues: SourceRef[];
   generation: number;
   state: ChangeSetState;

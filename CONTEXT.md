@@ -3,7 +3,7 @@
 ## Terms
 
 ### Main
-The Pi session the user talks to. Plans, schedules, reconciles, opens PRs and asks permission to merge.
+The Pi session the user talks to. Plans, schedules, reconciles, delivers reviewed changes locally, and opens requested PRs with separate merge approval.
 - **Invariant:** one writer per workspace. Only Main writes orchestration state and talks to the user.
 - **Avoid:** supervisor, generic harness
 
@@ -13,14 +13,14 @@ Disposable Pi process executing one Task. Runs visibly in tmux, on the host by d
 - **Avoid:** subagent
 
 ### Project
-Registered GitHub repository, identified publicly by its immutable slug. Has a canonical base remote and a push remote, which may be a fork.
+Registered Git repository, identified publicly by its immutable slug. Has a canonical checkout. Optional base and push remotes may differ, for example with a fork.
 
 ### Objective
-User goal with an approved Project set, issue scope and priority. States: Active, Done, Stopped.
+User goal with an approved Project set, optional issue scope and priority. States: Active, Done, Stopped.
 - **Invariant:** multiple Objectives may share the same ChangeSet. Effective priority is the highest active owner's priority.
 
 ### ChangeSet
-Delivery unit in exactly one Project. Owns `issues[]`, one working copy, one branch, implementation/review flow and one PR. May be local, with no issues.
+Delivery unit in exactly one Project. Owns optional issue SourceRefs, one working copy, one branch, and implementation/review flow. Local delivery completes in the canonical checkout; requested PR delivery owns one PR. Delivery mode and local target branch are fixed at approval.
 - **Identity:** immutable semantic slug, such as `plugin-lifecycle-safety`. Issue numbers, branch and PR number provide external references; database keys are private.
 - **Invariant:** an issue belongs to at most one non-terminal ChangeSet in its Project. At most one active Task per ChangeSet. Terminal records never reactivate.
 - **Avoid:** WorkItem, ticket, job, issue-owned execution, task for the delivery unit
@@ -54,7 +54,7 @@ Private counter preserving history when a terminal source needs new work. Never 
 1. Workspace authority is exactly `cwd/.merro`. Initialization is explicit; no parent search or startup creation.
 2. Public identity is semantic. Internal IDs never appear in status, plans, errors, Task text, worker/path/branch names, PRs, comments, notifications or normal exports.
 3. Review follows green reported command verification and uses a fresh Worker. Rejection leads to a fresh implementer and fresh reviewer on the same change/branch.
-4. Merge needs explicit per-PR approval unless the user merged externally. Main never force-pushes or rewrites finalized Task commits.
+4. Local plan approval authorizes delivery of the exact reviewed commit to its named target branch. PR merge needs separate per-PR approval unless the user merged externally. Main never force-pushes, authors merge commits, or rewrites finalized Task commits.
 5. GitHub owns issue/PR/policy/merge truth; Git owns commits and working copies; tmux/process identity owns worker liveness. Merro owns orchestration metadata.
 6. Requires unblocks only on actual completion, normally merge. Merro never auto-splits or auto-creates issues.
 7. Guidance precedence: current user instruction, approved ChangeSet guidance, Project guidance (including Markdown), workspace Markdown, Merro defaults. Built-in safety invariants cannot be overridden. Repository AGENTS.md remains normal Pi/repository guidance.

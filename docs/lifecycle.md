@@ -4,15 +4,15 @@ Read before changing ChangeSet states, relations, scheduling, PR/merge flow or r
 
 ## Workspace and approval
 
-Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly in any writable directory, without requiring a Git repository, remote or GitHub access. Projects are registered separately by path/name. Startup opens and reconciles state without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
+Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly in any writable directory, without requiring a Git repository, remote or GitHub access. First init writes `{}` config, short workspace/role Markdown templates, the Project-guidance directory, and default checkout directories. Existing `.merro` makes init a no-op, not a repair. Projects register separately: remote URLs clone into `<root>/projects/<project>`; supplied local paths register directly. No home scanning or destination adoption. Startup opens and reconciles state without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
 
-Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; replacement or restart expires it. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
+Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; replacement or restart expires it. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch, delivery mode, target branch, or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
 
-Default delivery combines the selected issues within each Project into one ChangeSet. Cross-Project Objectives have separate changes. An issue already owned by another active selection cannot be silently regrouped. Separate delivery is explicit, not a second execution model: each delivery unit is still a ChangeSet.
+Default grouping combines the selected issues within each Project into one ChangeSet. Issue-free Objectives select named changes with no GitHub scope. Delivery mode defaults to local, with PR opt-in; remote presence never implies publication. Cross-Project Objectives have separate changes. An issue already owned by another active selection cannot be silently regrouped. Separate delivery is explicit, not a second execution model: each delivery unit is still a ChangeSet.
 
 Combined query results become fixed selections on approval so future matches cannot silently enlarge a running change. Separate delivery may retain a live query of labels and optional milestone. Newly matching issues enter approved query scope; scope expansion or new Projects require user direction. Query removal detaches ownership, obsoletes exclusive unfinished work once idle, and preserves shared work. Failed scope refresh gates scheduling and completion, never falls back to cached membership.
 
-An Objective completes only after fresh scope verification and terminal attached work. Externally closed issues may satisfy work. A terminal source reopened under an active Objective creates new history rather than mutating the old generation. Stopping is soft: current Tasks finish; exclusive unowned work becomes Obsolete; other owners continue.
+An Objective completes only after fresh scope verification and terminal attached work. Issue-free scopes require no GitHub calls. Externally closed issues may satisfy work. A terminal source reopened under an active Objective creates new history rather than mutating the old generation. Stopping is soft: current Tasks finish; exclusive unowned work becomes Obsolete; other owners continue.
 
 ## ChangeSet flow
 
@@ -21,6 +21,7 @@ Planned -> Ready -> Implementing -> Reviewing -> Reviewed -> Publishing -> Await
                          ^             | reject                  | failure
                          +-------------+                         v
                                                         PublishBlocked -> Publishing
+Reviewed -> Done (local delivery)
 any non-terminal state -> Blocked -> prior flow after resolution
 idle unfinished work -> Obsolete | Cancelled
 ```
@@ -55,11 +56,13 @@ Valid result after exit is consumed. Result submission alone does not prove exit
 
 ## Git and PRs
 
-Each change uses `.wt/<slug>` and an intent-prefixed branch (`feat/`, `fix/`, `chore/`). Names are immutable; collisions use numeric semantic suffixes. Existing persisted paths remain authoritative during migration, particularly while workers live. Never adopt an unrelated branch or expose private keys in public names/text.
+Each change uses `.wt/<project>/<slug>` and an intent-prefixed branch (`feat/`, `fix/`, `chore/`). Names are immutable; collisions use numeric semantic suffixes. Existing persisted paths remain authoritative during migration, particularly while workers live. Never adopt an unrelated branch or expose private keys in public names/text.
 
-Create from the canonical base remote's current default branch. Base movement schedules an implementer to merge the exact fetched commit, verify and commit, followed by fresh review. No rebase, force-push or Main-authored merge commit. Merge conflicts require a Decision authorizing implementation, not direct merge by Main.
+Local changes start from the approved target branch in the canonical checkout; their clone remotes point there. PR changes start from the canonical base remote's current default branch. Base movement schedules an implementer to merge the exact fetched commit, verify and commit, followed by fresh review. No rebase, force-push or Main-authored merge commit. Merge conflicts require a Decision authorizing implementation, not direct merge by Main.
 
-Passing review persists Reviewed and reports completion before publication, including completion hooks. Publishing fetches the push remote branch first and publishes the exact reviewed commit with an ordinary push. Absent/equal/remote-behind branches are safe; remote-ahead/diverged branches block with reconciliation and fresh-review guidance. A concurrent remote update cannot be overwritten. PublishBlocked retains review and any PR identity; restart/continuation reuses the single PR. AwaitingMerge begins only after publication and metadata synchronization succeed.
+Passing review persists Reviewed and reports completion before delivery, including completion hooks. Local delivery requires verified worker exit, the exact reviewed HEAD, clean working copies, and the approved branch checked out in the canonical Project. Main fast-forwards without authoring a commit or pushing. Diverged local base schedules implementation and fresh review; dirty/mismatched targets block with retry guidance. Completion is persisted only after verifying the canonical HEAD.
+
+For PR delivery, Publishing fetches the push remote branch first and publishes the exact reviewed commit with an ordinary push. Absent/equal/remote-behind branches are safe; remote-ahead/diverged branches block with reconciliation and fresh-review guidance. A concurrent remote update cannot be overwritten. PublishBlocked retains review and any PR identity; restart/continuation reuses the single PR. AwaitingMerge begins only after publication and metadata synchronization succeed.
 
 Main generates a concise conventional title from task intent and branch kind. Summary uses reviewed product-facing changes, Verification uses deduplicated passing commands, and Issues includes every `Closes #n`. Activity summaries and legacy worker PR suggestions remain history, never PR content. Generated title/body omit internal ancestry, working paths and lifecycle commentary. User edits stop wholesale body regeneration; required verification/closures are repaired. One canonical `<!-- merro:review-notes -->` comment holds passing review, verification and non-blocking findings. Private IDs are removed from titles, bodies, comments, notifications and merge prompts.
 
@@ -71,4 +74,4 @@ Main asks per PR only when review covers the latest diff, the PR is open/mergeab
 
 Completion writes immutable final history and unblocks dependents. Cleanup is best-effort afterward. PR closed unmerged or branch deleted before merge blocks; a lost clone may be restored from the authoritative reviewed remote head. Unsafe live-worker occupancy prohibits restoration/deletion.
 
-Project repository identity changes require confirmation. Transport-equivalent URLs, remote renames and validated checkout moves may be adopted. New default branches apply to future changes; existing PR bases remain intact. Project removal is outside v0.1.
+Project repository identity changes require confirmation. Transport-equivalent URLs, remote renames and validated checkout moves may be adopted. New default branches apply to future changes; existing local target branches and PR bases remain intact. Project removal is outside v0.1.

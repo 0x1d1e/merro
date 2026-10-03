@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, normalize, sep } from "node:path";
 
 export type WorkerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type WorkerSettings = Record<"implement" | "review", { model: string | null; thinking: WorkerThinkingLevel | null }>;
 
 export interface MerroConfig {
   version: 1;
+  projectsDir: string;
+  worktreesDir: string;
+  git: { defaultDelivery: "local" | "pr" };
+  tmux: { session: string };
   max_concurrent_tasks: number | "unlimited";
   max_review_rounds: number | "unlimited";
   sandbox: "docker" | "none";
@@ -19,11 +23,15 @@ export interface MerroConfig {
 
 export const DEFAULT_CONFIG: Readonly<MerroConfig> = {
   version: 1,
+  projectsDir: "projects",
+  worktreesDir: ".wt",
+  git: { defaultDelivery: "local" },
+  tmux: { session: "merro" },
   max_concurrent_tasks: 3,
   max_review_rounds: 3,
   sandbox: "none",
   network: "on",
-  worker_github: "on",
+  worker_github: "off",
   worker_models: { implement: null, review: null },
   worker_thinking: { implement: null, review: null },
   notify_command: null,
@@ -36,7 +44,21 @@ export function validateConfig(value: unknown): MerroConfig {
   const input = value as Record<string, unknown>;
   // Deprecated clone-root settings are read only for persisted-config migration.
   const { work_root: _oldRoot, pi_config: _oldPiConfig, ...current } = input;
+  const allowed = new Set([...Object.keys(DEFAULT_CONFIG), "worker", "reviewer"]);
+  const unsupported = Object.keys(current).find((key) => !allowed.has(key));
+  if (unsupported) throw new Error(`Unsupported Merro setting '${unsupported}'; put instructions in Markdown.`);
   const merged = { ...DEFAULT_CONFIG, ...current } as Record<string, unknown>;
+  const projectsDir = validateDirectory(merged.projectsDir, "projectsDir");
+  const worktreesDir = validateDirectory(merged.worktreesDir, "worktreesDir");
+  if (projectsDir === worktreesDir || projectsDir.startsWith(`${worktreesDir}${sep}`) || worktreesDir.startsWith(`${projectsDir}${sep}`)) {
+    throw new Error("projectsDir and worktreesDir must not overlap");
+  }
+  const git = settingsObject(merged.git, "git", ["defaultDelivery"]);
+  const defaultDelivery = git.defaultDelivery ?? "local";
+  if (defaultDelivery !== "local" && defaultDelivery !== "pr") throw new Error("git.defaultDelivery must be local or pr");
+  const tmux = settingsObject(merged.tmux, "tmux", ["session"]);
+  const session = tmux.session ?? "merro";
+  if (typeof session !== "string" || !/^[a-zA-Z0-9_-]+$/.test(session)) throw new Error("tmux.session must be a safe session prefix");
 
   if (merged.version !== 1) throw new Error(`unsupported Merro config version: ${String(merged.version)}`);
   const concurrency = merged.max_concurrent_tasks;
@@ -64,7 +86,41 @@ export function validateConfig(value: unknown): MerroConfig {
     return value as WorkerThinkingLevel;
   });
 
-  return { ...merged, worker_models: workerModels, worker_thinking: workerThinking } as unknown as MerroConfig;
+  for (const [key, role] of [["worker", "implement"], ["reviewer", "review"]] as const) {
+    if (current[key] === undefined) continue;
+    const settings = settingsObject(current[key], key, ["model", "thinking"]);
+    const parsedModels = validateRoleSettings({ [role]: settings.model }, workerModels, "worker_models", (value) => {
+      if (value === null) return null;
+      if (typeof value !== "string" || !value.trim() || /[\r\n]/.test(value)) throw new Error(`${key}.model must be a non-empty string or null`);
+      return value.trim();
+    });
+    const parsedThinking = validateRoleSettings({ [role]: settings.thinking }, workerThinking, "worker_thinking", (value) => {
+      if (value === null) return null;
+      if (typeof value !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) throw new Error(`${key}.thinking must be a Pi thinking level or null`);
+      return value as WorkerThinkingLevel;
+    });
+    workerModels[role] = parsedModels[role];
+    workerThinking[role] = parsedThinking[role];
+  }
+  delete merged.worker;
+  delete merged.reviewer;
+  return { ...merged, projectsDir, worktreesDir, git: { defaultDelivery }, tmux: { session }, worker_models: workerModels, worker_thinking: workerThinking } as unknown as MerroConfig;
+}
+
+function settingsObject(value: unknown, name: string, keys: string[]): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
+  const input = value as Record<string, unknown>;
+  if (Object.keys(input).some((key) => !keys.includes(key))) throw new Error(`Unsupported ${name} setting`);
+  return input;
+}
+
+function validateDirectory(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value.trim() || isAbsolute(value) || /[\r\n\0]/.test(value) || value.split(/[\\/]/).includes("..")) {
+    throw new Error(`${name} must be a workspace-relative directory without traversal`);
+  }
+  const path = normalize(value.replace(/[\\/]/g, sep));
+  if (path === "." || path.split(sep).some((part) => part === ".merro" || part === ".git")) throw new Error(`${name} must not contain workspace state or Git metadata`);
+  return path.split(sep).filter(Boolean).join(sep);
 }
 
 function validateRoleSettings<T>(
@@ -99,7 +155,7 @@ export async function saveConfig(path: string, value: unknown): Promise<MerroCon
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
-    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
     await rename(temporary, path);
   } finally {
     await rm(temporary, { force: true });

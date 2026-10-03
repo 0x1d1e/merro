@@ -1,4 +1,4 @@
-import type { FlowChangeSetState, ChangeSetState } from "./model.js";
+import type { FlowChangeSetState, ChangeSetState, DeliveryMode } from "./model.js";
 import { FLOW_CHANGE_SET_STATES, TERMINAL_CHANGE_SET_STATES } from "./model.js";
 
 const allowedTransitions: Readonly<Record<FlowChangeSetState, ReadonlySet<ChangeSetState>>> = {
@@ -6,7 +6,7 @@ const allowedTransitions: Readonly<Record<FlowChangeSetState, ReadonlySet<Change
   Ready: new Set(["Planned", "Implementing", "Blocked", "Obsolete", "Cancelled"]),
   Implementing: new Set(["Reviewing", "Blocked", "Obsolete"]),
   Reviewing: new Set(["Implementing", "Reviewed", "Blocked", "Obsolete"]),
-  Reviewed: new Set(["Publishing", "Implementing", "Reviewing", "Blocked", "Obsolete"]),
+  Reviewed: new Set(["Publishing", "Done", "Implementing", "Reviewing", "Blocked", "Obsolete"]),
   Publishing: new Set(["AwaitingMerge", "Implementing", "Reviewing", "PublishBlocked", "Blocked", "Obsolete"]),
   AwaitingMerge: new Set(["Implementing", "Reviewing", "Done", "Blocked", "Obsolete"]),
 };
@@ -26,8 +26,13 @@ export function assertChangeSetTransition(
   from: ChangeSetState,
   to: ChangeSetState,
   blockedResumeState: FlowChangeSetState | null = null,
+  delivery: DeliveryMode = "pr",
 ): void {
   if (from === to) return;
+  if ((from === "Reviewed" && to === "Done" && delivery !== "local")
+    || (delivery === "local" && ["Publishing", "PublishBlocked", "AwaitingMerge"].includes(to))) {
+    throw new InvalidChangeSetTransitionError(from, to);
+  }
   if (TERMINAL_CHANGE_SET_STATES.has(from)) {
     throw new InvalidChangeSetTransitionError(from, to);
   }

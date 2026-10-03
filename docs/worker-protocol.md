@@ -8,13 +8,13 @@ One Task is one fresh native Pi process in one tmux pane. Launch uses `pi --no-s
 
 Host mode inherits the user's normal HOME, Pi config, models, auth, packages and unrelated extensions. Merro does not copy or replace host configuration. Worker-specific environment sets `MERRO_RUNTIME=worker`; the installed Main extension is inert under this marker, preventing nested orchestration. Host mode is not an OS security boundary. Worker restrictions, including reviewer non-editing, are contractual.
 
-Docker is optional. It stages normal Pi configuration into scratch, mounts only the change clone and Task/dependency scratch, and mounts the review clone read-only. It uses an interactive tty, version-matched Pi image, read-only container root and optional network isolation. Workers never receive Main's database mount. GitHub tokens are passed only when `worker_github` is enabled. Tokens and staged config are secrets removed by safe finalized cleanup.
+Docker is optional. It stages normal Pi configuration into scratch, mounts only the change clone and Task/dependency scratch, and mounts the review clone read-only. It uses an interactive tty, version-matched Pi image, read-only container root and optional network isolation. Workers never receive Main's database mount. GitHub tokens are passed only when `worker_github` is enabled (default off). Tokens and staged config are secrets removed by safe finalized cleanup.
 
 ## Paths and input
 
-One full local clone per ChangeSet: `cwd/.wt/<semantic-slug>`. The same clone/branch serves implementation, review, rework and merge preparation. Cloning preserves the configured Git identity and repoints remotes to canonical base/push repositories; the registered source checkout is not the worker working directory.
+One full local clone per ChangeSet: `<root>/.wt/<project>/<semantic-slug>`, or configured worktrees directory. The same clone/branch serves implementation, review, rework and merge preparation. Cloning preserves the configured Git identity. Local delivery points clone remotes at the canonical checkout; PR delivery points them at base/push repositories. The registered source checkout is not the worker working directory. Persisted legacy clone paths remain authoritative.
 
-Task scratch is `.merro/runtime/tasks/<implement-or-review>-<change>-<attempt>/`. Names and collision suffixes are semantic, never UUIDs. Exact merged dependency checkouts live under Task scratch, read-only, without a shared cache.
+Task scratch is `.merro/runtime/tasks/<implement-or-review>-<change>-<attempt>/`. Names and collision suffixes are semantic, never UUIDs. Exact completed dependency checkouts live under Task scratch, read-only, without a shared cache.
 
 Main writes fresh `.merro-task.md` in the clone, excluded through Git's local exclude file. It contains change name, all issue contents/acceptance criteria, relevant Objective, guidance, repository instructions, dependencies, expected commit and role instructions. Review additionally receives full `base...HEAD` diff, implementation summary and verification, and prior findings. Task text contains no private Task/Objective/Decision/ChangeSet keys. Task history retains the input; safe finalization removes the shared file only when no successor owns it.
 
@@ -35,7 +35,7 @@ Pi labels the initial CLI task input interactive. Accept that first input, then 
 
 ## tmux and identity
 
-Sessions are `merro-<project>`, windows `impl-<change>` or `rev-<change>`. One pane per window. Disable automatic rename and allow-rename; persist stable window ID and exact pane ID. Sessions are detached, never auto-attached. Host workers enable `remain-on-exit`: an unexpected Pi exit leaves the exact dead pane, tmux exit status/signal and scrollback available to reconciliation. Main writes a bounded plain-text pane capture to `.merro/runtime/diagnostics/<task-attempt>.log` before finalizing the infrastructure failure; the log survives Task scratch cleanup. A missing pane remains distinct evidence of external tmux/session removal.
+Sessions are `<tmux.session>-<project>` (default `merro-<project>`), windows `impl-<change>` or `rev-<change>`. One pane per window. Disable automatic rename and allow-rename; persist stable window ID and exact pane ID. Sessions are detached, never auto-attached. Host workers enable `remain-on-exit`: an unexpected Pi exit leaves the exact dead pane, tmux exit status/signal and scrollback available to reconciliation. Main writes a bounded plain-text pane capture to `.merro/runtime/diagnostics/<task-attempt>.log` before finalizing the infrastructure failure; the log survives Task scratch cleanup. A missing pane remains distinct evidence of external tmux/session removal.
 
 Ownership is private metadata: workspace owner marker, Project, Task and ChangeSet keys, runtime kind and clone path. Keep the workspace owner marker across restarts/moves. Tmux options and Docker labels are machine metadata, not public names. Persisted legacy ownership may migrate only after exact recorded runtime/process proof; never rediscover/adopt by window name alone.
 

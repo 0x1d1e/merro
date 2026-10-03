@@ -1,4 +1,12 @@
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
+
+export const MIGRATION_17 = `
+ALTER TABLE work_items ADD COLUMN delivery TEXT NOT NULL DEFAULT 'pr' CHECK (delivery IN ('local','pr'));
+ALTER TABLE work_items ADD COLUMN target_branch TEXT CHECK (delivery = 'pr' OR (target_branch IS NOT NULL AND length(trim(target_branch)) > 0));
+CREATE TRIGGER change_set_delivery_immutable BEFORE UPDATE OF delivery, target_branch ON work_items
+WHEN NEW.delivery IS NOT OLD.delivery OR NEW.target_branch IS NOT OLD.target_branch
+BEGIN SELECT RAISE(ABORT, 'ChangeSet delivery is immutable'); END;
+`;
 
 export const MIGRATION_1 = `
 PRAGMA foreign_keys = ON;

@@ -85,8 +85,8 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-function projectSession(project: Project): string {
-  return `merro-${safeName(project.slug)}`;
+function projectSession(project: Project, prefix = "merro"): string {
+  return `${prefix}-${safeName(project.slug)}`;
 }
 
 export function taskWindowName(role: TaskRole, slug: string): string {
@@ -200,7 +200,7 @@ export class WorkerRuntime {
     return {
       taskId: input.taskId,
       runtimeKind: sandbox === "docker" ? "docker" : "host",
-      tmuxSession: projectSession(input.project),
+      tmuxSession: projectSession(input.project, this.#config.tmux.session),
       tmuxWindow: taskWindowName(input.role, input.changeSlug),
       paneId: null,
       containerId: null,
@@ -450,11 +450,12 @@ export class WorkerRuntime {
 
   async listOwnedWorkers(project: Project, settings: ProjectSettingsRecord | null = null,
     recordedRuntimes: readonly TaskRuntimeRecord[] = []): Promise<OwnedWorker[]> {
-    const session = projectSession(project);
+    const sessions = new Set([projectSession(project, this.#config.tmux.session), ...recordedRuntimes.map((record) => record.tmuxSession)]);
     const owner = await this.#workspaceOwner();
     const workers: OwnedWorker[] = [];
     let dockerPane = false;
-    if (await this.#sessionExists(session, project, recordedRuntimes)) {
+    for (const session of sessions) {
+      if (!await this.#sessionExists(session, project, recordedRuntimes)) continue;
       const panes = (await this.#commands.run("tmux", ["list-panes", "-s", "-t", session, "-F", "#{pane_id} #{pane_dead}"])).stdout.trim();
       for (const row of panes ? panes.split("\n") : []) {
         const [paneId, dead] = row.split(" ");

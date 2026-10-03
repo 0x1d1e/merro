@@ -44,8 +44,9 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
       if (!verb) { await showStatus(ctx); return; }
       if (verb === "init") {
         const alreadyInitialized = await isWorkspace(cwd);
+        if (alreadyInitialized) { report(ctx, "Merro already initialized."); return; }
         await initializeWorkspace(cwd);
-        report(ctx, alreadyInitialized ? "Merro is already initialized." : "Merro initialized.\n\nNext: ask Main to register a Project and propose an Objective.");
+        report(ctx, `Merro initialized in ${cwd}.\n\nCreated:\n  .merro/\n  .merro/config.json\n  .merro/WORKSPACE.md\n  .merro/IMPLEMENTER.md\n  .merro/REVIEWER.md\n  .merro/projects/\n  projects/\n  .wt/\n\nNext:\n  register <repo-or-path> as <name>`);
         await onInitialized?.();
         return;
       }

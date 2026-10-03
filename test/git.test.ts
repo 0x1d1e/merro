@@ -342,3 +342,40 @@ test("discarding a stopped attempt restores its base and removes unfinished file
   assert.equal(await git(project.path, "status", "--porcelain"), "?? .pi/");
   await assert.rejects(client.discardAttempt(project.path, "--hard"), /invalid/);
 });
+
+test("local delivery refuses stale review and wrong target, then fast-forwards without changing remote refs", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = await createProject(root);
+  const client = new GitClient();
+  const project = await client.discoverProject(source.path, "app");
+  const path = join(root, "changes/app/requested-change");
+  const clone = await client.createChangeSetClone(project, path, "chore/requested-change", "local");
+  assert.equal(await git(path, "remote", "get-url", "origin"), source.path);
+  await writeFile(join(path, "implementation.txt"), "reviewed change\n");
+  await git(path, "add", ".");
+  await git(path, "commit", "-m", "fix: reviewed implementation");
+  const reviewed = await client.currentCommit(path);
+  await assert.rejects(client.deliverLocal(project, path, "main", clone.baseCommit), /no longer matches the reviewed commit/);
+  assert.equal(await client.currentCommit(source.path), clone.baseCommit);
+  await git(source.path, "switch", "-c", "other");
+  await assert.rejects(client.deliverLocal(project, path, "main", reviewed), /needs main checked out/);
+  assert.equal(await client.currentCommit(source.path), clone.baseCommit);
+  await git(source.path, "switch", "main");
+  assert.deepEqual(await client.deliverLocal(project, path, "main", reviewed), { commit: reviewed });
+  assert.equal(await client.currentCommit(source.path), reviewed);
+  assert.equal(await git(source.bare, "rev-parse", "main"), clone.baseCommit);
+});
+
+test("Project and ChangeSet cloning refuse even empty existing destinations", async (t) => {
+  const root = await tempDirectory();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = await createProject(root);
+  const client = new GitClient();
+  const path = join(root, "occupied");
+  await mkdir(path);
+  const project = await client.discoverProject(source.path, "app");
+  await assert.rejects(client.cloneProject(source.bare, path), /destination already exists/);
+  await assert.rejects(client.createChangeSetClone(project, path, "chore/requested-change", "local"), /destination already exists/);
+  await assert.rejects(systemCommandRunner.run("git", ["-C", path, "rev-parse", "--show-toplevel"]));
+});

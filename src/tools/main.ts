@@ -5,6 +5,7 @@ import { formatStatus, publicText } from "../runtime/presentation.js";
 import type { MainOrchestrator, NamedObjectiveStartInput, ObjectiveStartInput } from "../runtime/main.js";
 
 const empty = Type.Object({}, { additionalProperties: false });
+const deliveryMode = Type.Optional(Type.Union([Type.Literal("local"), Type.Literal("pr")], { description: "Default local: reviewed fast-forward into the Project's canonical branch, no push. PR only when requested." }));
 const priority = Type.Optional(Type.Union([Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")]));
 const issueNumbersSchema = Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 });
 const legacyObjectiveParameters = Type.Object({
@@ -17,13 +18,14 @@ const legacyObjectiveParameters = Type.Object({
   ]), { minItems: 1 }),
   delivery: Type.Optional(Type.Union([Type.Literal("together"), Type.Literal("separate")])),
   priority,
+  delivery_mode: deliveryMode,
 }, { additionalProperties: false });
 const namedObjectiveParameters = Type.Object({
   goal: Type.String(),
   change_sets: Type.Array(Type.Object({
     name: Type.String({ description: "Unique semantic ChangeSet name." }),
     project_slug: Type.String(),
-    issues: issueNumbersSchema,
+    issues: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), { description: "GitHub issue numbers, or omit for an issue-free Objective." })),
   }, { additionalProperties: false }), { minItems: 1 }),
   relations: Type.Optional(Type.Array(Type.Object({
     kind: Type.Union([Type.Literal("Requires"), Type.Literal("Conflicts")]),
@@ -31,6 +33,7 @@ const namedObjectiveParameters = Type.Object({
     to: Type.String({ description: "Prerequisite name for Requires; other name for Conflicts." }),
   }, { additionalProperties: false }))),
   priority,
+  delivery_mode: deliveryMode,
 }, { additionalProperties: false });
 const objectiveParameters = Type.Union([legacyObjectiveParameters, namedObjectiveParameters]);
 
@@ -58,15 +61,17 @@ function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | Na
     const changeSets = args.change_sets.map((value) => {
       if (!value || typeof value !== "object") throw new Error("ChangeSet selection must be an object");
       const row = value as Record<string, unknown>;
-      if (!Array.isArray(row.issues) || (row.issues as unknown[]).some((number: unknown) => !Number.isSafeInteger(number) || Number(number) < 1)) {
+      const issues = row.issues ?? [];
+      if (!Array.isArray(issues) || (issues as unknown[]).some((number: unknown) => !Number.isSafeInteger(number) || Number(number) < 1)) {
         throw new Error("ChangeSet issues must be positive issue numbers");
       }
-      return { name: text(row, "name"), projectSlug: text(row, "project_slug"), issues: row.issues as number[] };
+      return { name: text(row, "name"), projectSlug: text(row, "project_slug"), issues: issues as number[] };
     });
     if (args.relations !== undefined && !Array.isArray(args.relations)) throw new Error("relations must be an array");
     const relations = (args.relations ?? []) as unknown[];
     return {
       goal: text(args, "goal"), changeSets,
+      ...(args.delivery_mode ? { deliveryMode: args.delivery_mode as "local" | "pr" } : {}),
       relations: relations.map((value) => {
         if (!value || typeof value !== "object") throw new Error("Relation must be an object");
         const row = value as Record<string, unknown>;
@@ -81,6 +86,7 @@ function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | Na
   if (!Array.isArray(args.issues)) throw new Error("issues must be an array");
   return {
     goal: text(args, "goal"), projectSlugs,
+    ...(args.delivery_mode ? { deliveryMode: args.delivery_mode as "local" | "pr" } : {}),
     changeSlug: text(args, "change"), delivery: args.delivery === "separate" ? "separate" : "together",
     issues: parseObjectiveIssueScopes(args.issues.map((scope) => {
       if (!scope || typeof scope !== "object") throw new Error("Issue selection must be an object");
@@ -92,8 +98,8 @@ function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | Na
 }
 
 export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void {
-  pi.registerTool({ name: "merro_add_project", label: "Register Project", description: "Register a GitHub Project after the user confirms its path and semantic name.",
-    parameters: Type.Object({ path: Type.String(), slug: Type.String() }, { additionalProperties: false }),
+  pi.registerTool({ name: "merro_add_project", label: "Register Project", description: "Register a Git Project from the user's remote URL or supplied local path and semantic name. Remote URLs clone into this workspace's projects directory. Never scan home directories or require GitHub for registration.",
+    parameters: Type.Object({ path: Type.String({ description: "Remote URL or supplied local checkout path." }), slug: Type.String() }, { additionalProperties: false }),
     async execute(_id, args) {
       const project = await main.addProject(text(args, "path"), text(args, "slug"));
       return result(`Registered ${project.slug}.`, project);
@@ -103,13 +109,13 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
   pi.registerTool({ name: "merro_discover_issues", label: "Discover issues", description: "Read open GitHub issues in a registered Project.",
     parameters: Type.Object({ project_slug: Type.String() }, { additionalProperties: false }),
     async execute(_id, args) { const issues = await main.discoverIssues(text(args, "project_slug")); return result(JSON.stringify(issues), issues); } });
-  pi.registerTool({ name: "merro_propose_objective", label: "Propose plan", description: "Propose an Objective as named ChangeSets with per-Project issue selections and optional Requires or Conflicts relations. The legacy selection form remains supported. Only one plan is pending. Show the normalized plan, ask Approve? and wait. Never start without approval.", parameters: objectiveParameters,
+  pi.registerTool({ name: "merro_propose_objective", label: "Propose plan", description: "Propose an Objective as named ChangeSets, optionally with GitHub issue selections and Requires or Conflicts relations. Omit issues for local goals. Delivery defaults to local; only choose pr when requested. Local delivery fast-forwards the reviewed commit into the Project's canonical branch, without publication. The legacy selection form remains supported. Only one plan is pending. Show the normalized plan, ask Approve? and wait. Never start without approval.", parameters: objectiveParameters,
     async execute(_id, args) {
       const input = objectiveInput(args);
       const proposal = await main.proposeObjective(input);
       const names = new Map(proposal.changeSets.map((item) => [item.id, changeName(item)]));
       for (const [id, name] of Object.entries(proposal.relationNames)) names.set(id, name);
-      const plans = proposal.changeSets.map((item) => ({ change: changeName(item), project: item.projectSlug, issues: issueNumbers(item), branch: proposal.branches[item.id] }));
+      const plans = proposal.changeSets.map((item) => ({ change: changeName(item), project: item.projectSlug, issues: issueNumbers(item), branch: proposal.branches[item.id], delivery: item.delivery ?? "pr", targetBranch: item.targetBranch }));
       const plannedIds = new Set(proposal.changeSets.map((item) => item.id));
       const relationLines = new Map<string, string[]>();
       for (const edge of proposal.relations) {
@@ -131,7 +137,9 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
           ? `${plan.change}\n  ${plan.project} ${plan.issues.map((number) => `#${number}`).join(" ")}${relations}`
           : `${plan.project}: ${plan.issues.map((number) => `#${number}`).join(" ")}\nChange: ${plan.change}${relations}`;
       }).join("\n\n");
-      const totals = `${plans.length} change${plans.length === 1 ? "" : "s"} · ${plans.length} pull request${plans.length === 1 ? "" : "s"}`;
+      const prCount = plans.filter((plan) => plan.delivery === "pr").length;
+      const local = plans.filter((plan) => plan.delivery === "local").map((plan) => `${plan.project}: local delivery to ${plan.targetBranch} after review (no push)`).join("\n");
+      const totals = `${plans.length} change${plans.length === 1 ? "" : "s"} · ${prCount} pull request${prCount === 1 ? "" : "s"}${local ? `\n${local}` : ""}`;
       const message = publicText(`Plan\n\n${planText}\n\n${totals}${warning}\n\nApprove?`, names);
       const details = { plans, relations, runnableImmediately: proposal.runnableImmediately };
       pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details });

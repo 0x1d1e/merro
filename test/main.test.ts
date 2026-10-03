@@ -128,7 +128,7 @@ test("combined plan delivers three issues as one change, branch, worker flow and
   visible.push(JSON.stringify(await tools.get("merro_start_objective")!.execute("approve", {})));
   assert.equal(harness.launches.length, 1);
   assert.deepEqual(harness.issueBatches, [{ projectSlug: "kinetix", numbers: [96, 97, 100] }]);
-  assert.equal(harness.launches[0]!.clonePath, join(harness.workspacePath, ".wt", "plugin-lifecycle-safety"));
+  assert.equal(harness.launches[0]!.clonePath, join(harness.workspacePath, ".wt", "kinetix", "plugin-lifecycle-safety"));
   const restarted = harness.restartMain();
   for (let pass = 0; pass < 5; pass++) await restarted.runPass();
   assert.deepEqual(harness.launches.map((input) => input.role), ["implement", "review", "implement", "review"]);
@@ -953,6 +953,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     workspacePath,
     config: {
       ...DEFAULT_CONFIG,
+      git: { defaultDelivery: "pr" }, // This harness tests explicitly requested PR delivery.
       sandbox: options.realWorkerPlan ? "docker" : "none",
       max_concurrent_tasks: options.maxConcurrentTasks ?? 3,
       notify_command: options.notifyCommand ?? null,
@@ -1041,7 +1042,7 @@ test("Main derives a safe clone path without rewriting the acceptance ChangeSet 
   assert.ok(input);
   assert.equal(input.changeSetId, id);
   const component = relative(join(harness.workspacePath, ".wt"), input.clonePath);
-  assert.equal(component, "issue-1-for-merro-acceptance");
+  assert.equal(component, join("merro-acceptance", "issue-1-for-merro-acceptance"));
   assert.match(input.taskFile, /Change: issue-1-for-merro-acceptance/);
   assert.ok(!input.taskFile.includes(id));
   const snapshot = await harness.main.statusSnapshot();
@@ -1289,7 +1290,7 @@ test("incomplete v11 Objective scopes remain readable and reconcile after upgrad
   try {
     database.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?")
       .run(JSON.stringify([{ projectSlug: "api", query: { labels: ["feature"] } }]), objective.id);
-    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
+    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
   } finally { database.close(); }
   const restarted = harness.restartMain();
   assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, [
@@ -2334,9 +2335,9 @@ test("GitHub connection outage explains automatic recovery without replacing the
   assert.equal(harness.launches.length, 1);
   assert.equal(stops, 0);
   assert.equal(harness.cleanupCalls.length, 0);
-  assert.equal(harness.progressMessages.filter((message) => /example · GitHub is available again/.test(message)).length, 1);
+  assert.equal(harness.progressMessages.filter((message) => /example · Project is available again/.test(message)).length, 1);
   await harness.main.runPass();
-  assert.equal(harness.progressMessages.filter((message) => /example · GitHub is available again/.test(message)).length, 1);
+  assert.equal(harness.progressMessages.filter((message) => /example · Project is available again/.test(message)).length, 1);
 });
 
 test("adopt a moved Project path only for the same repository identity", async (t) => {

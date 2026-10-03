@@ -15,6 +15,34 @@ function makeStore(): MerroStore {
   return store;
 }
 
+test("v16 changes retain PR delivery and recorded clone paths; new local targets are required and immutable", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-local-migration-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.db");
+  const original = new MerroStore(path);
+  original.createProject({ slug: "p", path: "/tmp/p", baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" });
+  original.createChangeSet({ id: "legacy", projectSlug: "p", slug: "legacy", issues: [{ projectSlug: "p", number: 1 }], generation: 1, state: "Reviewed", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
+  original.close();
+  const legacy = new DatabaseSync(path);
+  legacy.exec("UPDATE work_item_runtime SET clone_path = '/tmp/old:clone', branch_name = 'fix/legacy' WHERE work_item_id = 'legacy'; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; UPDATE schema_meta SET version = 16;");
+  legacy.close();
+  const migrated = new MerroStore(path);
+  try {
+    assert.equal(migrated.getChangeSet("legacy")?.delivery, "pr");
+    assert.equal(migrated.getChangeSet("legacy")?.targetBranch, undefined);
+    assert.equal(migrated.getChangeSetRuntime("legacy")?.clonePath, "/tmp/old:clone");
+    assert.throws(() => migrated.transitionChangeSet("legacy", "Done"), /invalid/);
+    const local = { id: "local", projectSlug: "p", slug: "local", issues: [], delivery: "local" as const, generation: 1, state: "Planned" as const, priority: "normal" as const, readySince: null, blockedReason: null, blockedResumeState: null };
+    assert.throws(() => migrated.createChangeSet(local), /CHECK constraint/);
+    migrated.createChangeSet({ ...local, targetBranch: "main" });
+    const database = new DatabaseSync(path);
+    try {
+      assert.throws(() => database.exec("UPDATE work_items SET delivery = 'pr' WHERE id = 'local'"), /immutable/);
+      assert.throws(() => database.exec("UPDATE work_items SET target_branch = 'other' WHERE id = 'local'"), /immutable/);
+    } finally { database.close(); }
+  } finally { migrated.close(); }
+});
+
 test("store enforces one non-terminal generation per source", () => {
   const store = makeStore();
   try {

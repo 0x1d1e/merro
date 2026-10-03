@@ -22,7 +22,12 @@ export class GitClient {
     assertProjectSlug(slug);
     const root = (await this.#run("git", ["rev-parse", "--show-toplevel"], { cwd: path })).stdout.trim();
     const remotes = (await this.#run("git", ["remote"], { cwd: root })).stdout.trim().split(/\r?\n/).filter(Boolean);
-    if (remotes.length === 0) throw new Error(`Project ${path} has no Git remotes`);
+    if (remotes.length === 0) {
+      const defaultBranch = (await this.#run("git", ["branch", "--show-current"], { cwd: root })).stdout.trim();
+      if (!defaultBranch) throw new Error(`Project ${slug} needs a checked-out branch`);
+      await this.currentCommit(root); // An initial commit is required for isolated work.
+      return { slug, path: root, baseRemote: "", pushRemote: "", defaultBranch };
+    }
     const baseName = remotes.includes("upstream") ? "upstream" : remotes.includes("origin") ? "origin" : remotes[0];
     const pushName = remotes.includes("origin") ? "origin" : baseName;
     if (!baseName || !pushName) throw new Error(`Project ${path} has no usable Git remote`);
@@ -47,8 +52,25 @@ export class GitClient {
     };
   }
 
-  async createChangeSetClone(project: Project, path: string, branchName: string): Promise<ChangeSetClone> {
-    const resolvedProject = await this.resolveProjectRemotes(project);
+  async cloneProject(remote: string, path: string): Promise<void> {
+    try { await lstat(path); throw new Error(`Project destination already exists: ${path}`); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    await mkdir(dirname(path), { recursive: true });
+    // Clone privately first. Failed registration never removes or adopts a pre-existing destination.
+    const temporary = `${path}.clone-${randomUUID()}`;
+    try {
+      await this.#run("git", ["clone", "--", remote, temporary]);
+      await mkdir(path); // Exclusive reservation; never overwrite an existing checkout.
+      await rename(temporary, path);
+    } finally { await rm(temporary, { recursive: true, force: true }); }
+  }
+
+  async createChangeSetClone(project: Project, path: string, branchName: string, delivery: "local" | "pr" = "pr"): Promise<ChangeSetClone> {
+    try { await lstat(path); throw new Error(`ChangeSet destination already exists: ${path}`); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    const resolvedProject = delivery === "local" ? { ...project, baseRemote: project.path, pushRemote: project.path }
+      : await this.resolveProjectRemotes(project);
+    if (!resolvedProject.baseRemote) throw new Error("PR delivery requires a remote; use local delivery for this Project");
     await this.#run("git", ["check-ref-format", "--branch", branchName]);
     const userName = await this.#gitConfig(project.path, "user.name");
     const userEmail = await this.#gitConfig(project.path, "user.email");
@@ -68,6 +90,30 @@ export class GitClient {
     await this.#run("git", ["switch", "--create", branchName, `origin/${project.defaultBranch}`], { cwd: path });
     const baseCommit = (await this.#run("git", ["rev-parse", "HEAD"], { cwd: path })).stdout.trim();
     return { path, branchName, baseCommit };
+  }
+
+  async deliverLocal(project: Project, path: string, targetBranch: string, reviewedCommit: string): Promise<{ commit: string } | { baseUpdate: BaseUpdate }> {
+    if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(reviewedCommit)) throw new Error("Invalid reviewed commit");
+    if (await this.currentCommit(path) !== reviewedCommit) throw new Error("Working copy no longer matches the reviewed commit");
+    for (const checkout of [path, project.path]) {
+      if ((await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: checkout })).stdout) {
+        throw new Error("Local delivery needs clean working copies; commit or stash unrelated changes first");
+      }
+    }
+    const branch = (await this.#run("git", ["branch", "--show-current"], { cwd: project.path })).stdout.trim();
+    if (branch !== targetBranch) throw new Error(`Local delivery needs ${targetBranch} checked out in Project ${project.slug}`);
+    const target = await this.currentCommit(project.path);
+    await this.#run("git", ["fetch", "--no-tags", "--", project.path, `refs/heads/${targetBranch}`], { cwd: path });
+    try { await this.#run("git", ["merge-base", "--is-ancestor", target, reviewedCommit], { cwd: path }); }
+    catch (error) {
+      if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
+      return { baseUpdate: { baseRefName: targetBranch, baseCommit: target } };
+    }
+    await this.#run("git", ["fetch", "--no-tags", "--", path, reviewedCommit], { cwd: project.path });
+    // Never author a merge commit, force an update, or touch a remote.
+    await this.#run("git", ["-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--no-edit", reviewedCommit], { cwd: project.path });
+    if (await this.currentCommit(project.path) !== reviewedCommit) throw new Error("Local target changed during delivery; reconcile before retrying");
+    return { commit: reviewedCommit };
   }
 
   async discardAttempt(path: string, expectedCommit: string): Promise<void> {
@@ -95,7 +141,7 @@ export class GitClient {
       if (typeof error !== "object" || error === null || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
 
-    const remote = await this.#resolveRemote(project.path, project.baseRemote);
+    const remote = project.baseRemote ? await this.#resolveRemote(project.path, project.baseRemote) : project.path;
     await mkdir(dirname(path), { recursive: true });
     try {
       await this.#run("git", ["clone", "--no-checkout", "--no-hardlinks", "--", remote, path]);
