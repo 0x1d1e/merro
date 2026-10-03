@@ -9,7 +9,7 @@ import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
 import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
-import { GitHubClient, GitHubMergeError, isTransientGitHubFailure, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
+import { GitHubClient, GitHubMergeError, isTransientGitHubFailure, supportsPullRequestRemote, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
 import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
@@ -608,10 +608,14 @@ export class MainOrchestrator {
     }
 
     const deliveryByProject = new Map(projects.map((project) => [project.slug,
-      requestedDelivery === "auto" ? project.baseRemote && project.pushRemote ? "pr" as const : "local" as const : requestedDelivery]));
+      requestedDelivery === "auto"
+        ? supportsPullRequestRemote(project.baseRemote) && supportsPullRequestRemote(project.pushRemote) ? "pr" as const : "local" as const
+        : requestedDelivery]));
     for (const project of projects) {
       if (deliveryByProject.get(project.slug) !== "pr") continue;
-      if (!project.baseRemote || !project.pushRemote) throw new Error(`Project '${project.slug}' has no supported remote; use local delivery`);
+      if (!supportsPullRequestRemote(project.baseRemote) || !supportsPullRequestRemote(project.pushRemote)) {
+        throw new Error(`Project '${project.slug}' has no supported remote; use local delivery`);
+      }
       const repository = await this.#github.repository(project.baseRemote);
       project.defaultBranch = repository.defaultBranch;
     }

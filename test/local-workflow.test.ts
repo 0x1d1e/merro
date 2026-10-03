@@ -7,6 +7,7 @@ import { DEFAULT_CONFIG, validateConfig } from "../src/config.js";
 import { initializeWorkspace } from "../src/runtime/workspace.js";
 import { systemCommandRunner } from "../src/runtime/commands.js";
 import { MainOrchestrator } from "../src/runtime/main.js";
+import { GitClient } from "../src/vcs/git.js";
 import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import type { WorkerLaunchInput } from "../src/runtime/worker-runtime.js";
 
@@ -84,7 +85,7 @@ test("remote registration clones into configured workspace paths without GitHub 
   await assert.rejects(linked.addProject(remote, "escape"), /must not be a symlink/);
 });
 
-for (const scenario of ["remote-free", "with-remote", "base-moved", "approval-base-moved", "requirements-restart", "dirty-target", "merge-declined"] as const) {
+for (const scenario of ["remote-free", "with-remote", "base-moved", "approval-base-moved", "requirements-restart", "dirty-target", "merge-declined", "branch-switch-during-final-fetch"] as const) {
 test(`tool flow approves, implements, reviews and delivers locally without gh: ${scenario}`, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-local-flow-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -97,7 +98,19 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   } });
   const launches: WorkerLaunchInput[] = [];
   let implementationAttempts = 0;
+  let switchedDuringFinalFetch = false;
+  const deliveryGit = new GitClient({ async run(file, args, commandOptions) {
+    const output = await systemCommandRunner.run(file, args, commandOptions);
+    if (scenario === "branch-switch-during-final-fetch" && !switchedDuringFinalFetch
+      && file === "git" && commandOptions?.cwd === source.path && args[0] === "fetch"
+      && args[args.indexOf("--") + 1] === launches[0]?.clonePath) {
+      await systemCommandRunner.run("git", ["switch", "-c", "other"], { cwd: source.path });
+      switchedDuringFinalFetch = true;
+    }
+    return output;
+  } });
   const options = {
+    ...(scenario === "branch-switch-during-final-fetch" ? { git: deliveryGit } : {}),
     workspacePath: workspace, config: scenario === "with-remote" ? validateConfig({ worktreesDir: "scratch/changes", git: { defaultDelivery: "local" }, tmux: { session: "work" } }) : { ...DEFAULT_CONFIG },
     github: new Proxy({}, { get(_target, name) { return () => { throw new Error(`GitHub must not be called: ${String(name)}`); }; } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>,
     workers: {
@@ -207,6 +220,16 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
   }
   const approval = await call("merro_resolve_decision", { change: "requested-change", approved: true });
+  if (scenario === "branch-switch-during-final-fetch") {
+    assert.equal(switchedDuringFinalFetch, true);
+    assert.doesNotMatch(approval.content[0]?.text ?? "", /Applied locally/);
+    assert.equal(await source.git("branch", "--show-current"), "other");
+    assert.equal(await source.git("rev-parse", "refs/heads/main"), await source.git("rev-parse", "refs/heads/other"));
+    assert.equal(await source.git("rev-parse", "refs/heads/main"), await source.git("rev-parse", "HEAD"));
+    assert.equal((await main.statusSnapshot()).changeSets[0]!.state, "Blocked");
+    assert.equal((await main.statusSnapshot()).decisions.length, 0);
+    return;
+  }
   assert.match(approval.content[0]?.text ?? "", /Applied locally: requested-change · main/);
   assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), scenario === "requirements-restart" ? "updated\n" : "implemented\n");
   assert.equal(await source.git("branch", "--show-current"), "main");
@@ -218,11 +241,45 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
 });
 }
 
-test("checkout-detected delivery selects PRs for Projects with remotes", async (t) => {
+for (const [kind, remote] of [
+  ["local path", (path: string) => path],
+  ["file URL", (path: string) => `file://${path}`],
+  ["unsupported host", () => "https://gitlab.com/example/app.git"],
+] as const) {
+test(`checkout-detected delivery uses local mode for ${kind} remotes`, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-local-remote-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = await repository(root);
+  await source.git("remote", "add", "origin", remote(source.path));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  await initializeWorkspace(workspace, { async run(file, args, options) {
+    return file === "git" ? systemCommandRunner.run(file, args, options) : initCommands.run(file, args);
+  } });
+  const githubCalls: string[] = [];
+  const github = new Proxy({}, { get(_target, name) {
+    return async () => {
+      githubCalls.push(String(name));
+      throw new Error(`GitHub must not be called for ${kind}: ${String(name)}`);
+    };
+  } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>;
+  const main = new MainOrchestrator({ workspacePath: workspace, config: { ...DEFAULT_CONFIG }, github });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  await tools.get("merro_add_project")!.execute("register", { path: "../repo", slug: "app" });
+  const proposal = await tools.get("merro_propose_objective")!.execute("plan", {
+    goal: "Update the local project", change_sets: [{ name: "local-change", project_slug: "app" }],
+  });
+  assert.equal((proposal.details as { plans: Array<{ delivery: string }> }).plans[0]!.delivery, "local");
+  assert.deepEqual(githubCalls, []);
+});
+}
+
+test("checkout-detected delivery selects PRs for Projects with supported GitHub remotes", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-auto-delivery-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = await repository(root);
-  await source.git("remote", "add", "origin", "https://github.invalid/example/app.git");
+  await source.git("remote", "add", "origin", "git@github.com:example/app.git");
   const workspace = join(root, "workspace");
   await mkdir(workspace);
   await initializeWorkspace(workspace, { async run(file, args, options) {
@@ -244,5 +301,32 @@ test("checkout-detected delivery selects PRs for Projects with remotes", async (
     goal: "Update the remote-backed project", change_sets: [{ name: "remote-change", project_slug: "app" }],
   });
   assert.equal((proposal.details as { plans: Array<{ delivery: string }> }).plans[0]!.delivery, "pr");
-  assert.deepEqual(repositoryLookups, ["https://github.invalid/example/app.git"]);
+  assert.deepEqual(repositoryLookups, ["git@github.com:example/app.git"]);
+});
+
+test("supported GitHub remote failures do not fall back to local delivery", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-github-outage-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = await repository(root);
+  await source.git("remote", "add", "origin", "https://github.com/example/app.git");
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  await initializeWorkspace(workspace, { async run(file, args, options) {
+    return file === "git" ? systemCommandRunner.run(file, args, options) : initCommands.run(file, args);
+  } });
+  let lookups = 0;
+  const github = new Proxy({}, { get() {
+    return async () => {
+      lookups++;
+      throw new Error("error connecting to api.github.com");
+    };
+  } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>;
+  const main = new MainOrchestrator({ workspacePath: workspace, config: { ...DEFAULT_CONFIG }, github });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  await tools.get("merro_add_project")!.execute("register", { path: "../repo", slug: "app" });
+  await assert.rejects(tools.get("merro_propose_objective")!.execute("plan", {
+    goal: "Update the remote project", change_sets: [{ name: "remote-change", project_slug: "app" }],
+  }), /error connecting to api\.github\.com/);
+  assert.equal(lookups, 1);
 });

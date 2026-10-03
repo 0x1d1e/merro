@@ -9,6 +9,24 @@ export interface GitHubRepository {
   defaultBranch: string;
 }
 
+export function supportsPullRequestRemote(reference: string): boolean {
+  const validPath = (owner: string | undefined, repository: string | undefined): boolean => {
+    const name = repository?.replace(/\.git$/i, "");
+    return Boolean(owner && name && /^[a-z0-9_.-]+$/i.test(owner) && /^[a-z0-9_.-]+$/i.test(name));
+  };
+  const scp = /^git@github\.com:([^/]+)\/([^/]+)$/i.exec(reference);
+  if (scp) return validPath(scp[1], scp[2]);
+  try {
+    const url = new URL(reference);
+    if (!new Set(["http:", "https:", "ssh:", "git:"]).has(url.protocol)
+      || url.hostname.toLowerCase() !== "github.com" || url.search || url.hash) return false;
+    const parts = url.pathname.split("/").filter(Boolean);
+    return parts.length === 2 && validPath(parts[0], parts[1]);
+  } catch {
+    return false;
+  }
+}
+
 export interface GitHubIssue {
   number: number;
   title: string;

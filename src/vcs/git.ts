@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, rename, rm, type FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { BaseUpdate, Project } from "../domain/model.js";
@@ -138,10 +138,68 @@ export class GitClient {
       return { baseUpdate: { baseRefName: targetBranch, baseCommit: await this.currentCommit(project.path) } };
     }
     await this.#run("git", ["fetch", "--no-tags", "--", path, reviewedCommit], { cwd: project.path });
-    // Never author a merge commit, force an update, or touch a remote.
-    await this.#run("git", ["-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--no-edit", reviewedCommit], { cwd: project.path });
-    if (await this.currentCommit(project.path) !== reviewedCommit) throw new Error("Local target changed during delivery; reconcile before retrying");
+
+    const targetRef = `refs/heads/${targetBranch}`;
+    const checkedOutBranch = (await this.#run("git", ["branch", "--show-current"], { cwd: project.path })).stdout.trim();
+    if (checkedOutBranch !== targetBranch) throw new Error(`Local delivery needs ${targetBranch} checked out in Project ${project.slug}`);
+    const targetBase = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
+    if (targetBase !== expectedBase) return { baseUpdate: { baseRefName: targetBranch, baseCommit: targetBase } };
+    if (await this.currentCommit(project.path) !== expectedBase) throw new Error("Local target changed during delivery; reconcile before retrying");
+    if ((await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: project.path })).stdout) {
+      throw new Error("Local delivery needs clean working copies; commit or stash unrelated changes first");
+    }
+
+    // Compare-and-swap the approved ref, never whichever branch happens to be checked out.
+    try {
+      await this.#run("git", ["update-ref", "--no-deref", targetRef, reviewedCommit, expectedBase], { cwd: project.path });
+    } catch (error) {
+      const currentBase = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
+      if (currentBase !== expectedBase) return { baseUpdate: { baseRefName: targetBranch, baseCommit: currentBase } };
+      throw error;
+    }
+    await this.#syncCheckedOutLocalTarget(project.path, targetBranch, expectedBase, reviewedCommit);
+    const deliveredRef = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
+    if (deliveredRef !== reviewedCommit) throw new Error("Approved local target ref changed during delivery; reconcile before retrying");
     return { commit: reviewedCommit };
+  }
+
+  async #syncCheckedOutLocalTarget(path: string, targetBranch: string, baseCommit: string, reviewedCommit: string): Promise<void> {
+    const headPath = (await this.#run("git", ["rev-parse", "--path-format=absolute", "--git-path", "HEAD"], { cwd: path })).stdout.trim();
+    const lockPath = `${headPath}.lock`;
+    let lock: FileHandle;
+    try {
+      lock = await open(lockPath, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+      throw error;
+    }
+    try {
+      const branch = (await this.#run("git", ["branch", "--show-current"], { cwd: path })).stdout.trim();
+      if (branch !== targetBranch || await this.currentCommit(path) !== reviewedCommit) return;
+      const baseTree = (await this.#run("git", ["rev-parse", "--verify", `${baseCommit}^{tree}`], { cwd: path })).stdout.trim();
+      const indexTree = (await this.#run("git", ["write-tree"], { cwd: path })).stdout.trim();
+      const untracked = (await this.#run("git", ["ls-files", "--others", "--exclude-standard"], { cwd: path })).stdout;
+      let worktreeChanged = false;
+      try {
+        await this.#run("git", ["diff", "--quiet", "--"], { cwd: path });
+      } catch (error) {
+        if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
+        worktreeChanged = true;
+      }
+      if (indexTree !== baseTree || worktreeChanged || untracked) return;
+      try {
+        await this.#run("git", ["read-tree", "-m", "-u", reviewedCommit], { cwd: path });
+      } catch (error) {
+        // The approved branch ref is authoritative; don't overwrite concurrent checkout edits.
+        if (!(error instanceof CommandError) || error.exitCode !== 128) throw error;
+      }
+    } finally {
+      try {
+        await lock.close();
+      } finally {
+        await rm(lockPath, { force: true });
+      }
+    }
   }
 
   async discardAttempt(path: string, expectedCommit: string): Promise<void> {
