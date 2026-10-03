@@ -536,7 +536,12 @@ export class MerroStore {
     return this.#relationRebuild(analyzedIds, relations, []).relations;
   }
 
-  rebuildAutomaticRelations(analyzedIds: readonly string[], relations: readonly Relation[], occupiedChangeSetIds: readonly string[] = []): void {
+  rebuildAutomaticRelations(
+    analyzedIds: readonly string[],
+    relations: readonly Relation[],
+    occupiedChangeSetIds: readonly string[] = [],
+    explicitRelations: readonly Relation[] = [],
+  ): void {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const rebuild = this.#relationRebuild(analyzedIds, relations, occupiedChangeSetIds);
@@ -551,6 +556,15 @@ export class MerroStore {
       `);
       for (const relation of relations.map(normalizeRelation)) {
         upsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence, now());
+      }
+      const explicitUpsert = this.#db.prepare(`
+        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, active, automatic, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)
+        ON CONFLICT(kind, from_work_item_id, to_work_item_id) DO UPDATE SET
+          confidence = excluded.confidence, rationale = excluded.rationale, evidence = excluded.evidence, active = 1, automatic = 0
+      `);
+      for (const relation of explicitRelations.map(normalizeRelation)) {
+        explicitUpsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence, now());
       }
       const rebuilt = this.listRelations();
       const previous = this.#db.prepare("SELECT payload_json FROM event_log WHERE entity_type = 'Relations' AND event_type = 'rebuilt' ORDER BY id DESC LIMIT 1").get();

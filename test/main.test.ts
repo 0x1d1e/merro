@@ -9,13 +9,17 @@ import { DEFAULT_CONFIG, type MerroConfig } from "../src/config.js";
 import { MerroStore } from "../src/store/store.js";
 import type { Project, Relation } from "../src/domain/model.js";
 import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../src/github/client.js";
-import { MainOrchestrator, type ObjectiveStartInput } from "../src/runtime/main.js";
+import { MainOrchestrator, type NamedObjectiveStartInput, type ObjectiveProposal, type ObjectiveStartInput } from "../src/runtime/main.js";
 import { initializedState } from "./fixtures.js";
 
 // These reconciliation scenarios intentionally deliver each issue as a separate change.
 class SeparateChangesMain extends MainOrchestrator {
-  override proposeObjective(input: ObjectiveStartInput) { return super.proposeObjective({ delivery: "separate", ...input }); }
-  override startObjective(input: ObjectiveStartInput, proposal?: string) { return super.startObjective({ delivery: "separate", ...input }, proposal); }
+  override proposeObjective(input: NamedObjectiveStartInput | ObjectiveStartInput): Promise<ObjectiveProposal> {
+    return "changeSets" in input ? super.proposeObjective(input) : super.proposeObjective({ delivery: "separate", ...input });
+  }
+  override startObjective(input: NamedObjectiveStartInput | ObjectiveStartInput, proposal?: string): ReturnType<MainOrchestrator["startObjective"]> {
+    return "changeSets" in input ? super.startObjective(input, proposal) : super.startObjective({ delivery: "separate", ...input }, proposal);
+  }
 }
 import { registerCommands, type PiExtensionLike } from "../src/tools/commands.js";
 import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
@@ -304,6 +308,82 @@ test("authoritative proposal and approval persist exactly the acceptance graph",
   assert.deepEqual(harness.launches.map((input) => input.changeSetId).sort(), ["example:issue-1:g1", "example:issue-3:g1"]);
 });
 
+test("named Objective displays and approves a cross-Project dependency graph", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "runtime", issueNumbers: [159] }, { slug: "reference", issueNumbers: [74, 98] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  const result = await tools.get("merro_propose_objective")!.execute("proposal", {
+    goal: "Coordinate plugin work",
+    change_sets: [
+      { name: "plugin-runtime", project_slug: "runtime", issues: [159] },
+      { name: "plugin-reference", project_slug: "reference", issues: [74] },
+      { name: "plugin-conformance", project_slug: "reference", issues: [98] },
+    ],
+    relations: [{ kind: "Requires", from: "plugin-conformance", to: "plugin-reference" }],
+  });
+  const displayed = result.content[0]?.text ?? "";
+  assert.match(displayed, /plugin-runtime\n  runtime #159/);
+  assert.match(displayed, /plugin-reference\n  reference #74/);
+  assert.match(displayed, /plugin-conformance\n  reference #98\n  Branch: .*\n  after plugin-reference/);
+  assert.match(displayed, /3 changes\n3 PRs\n2 runnable immediately/);
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
+
+  const started = await harness.main.approveObjective();
+  assert.equal(started.changeSets.length, 3);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    const relation = store.listRelations()[0];
+    assert.deepEqual([relation?.kind, relation?.from, relation?.to, relation?.confidence], ["Requires", "reference:issue-98:g1", "reference:issue-74:g1", "explicit"]);
+  } finally { store.close(); }
+  await harness.main.runPass();
+  assert.deepEqual(harness.launches.map((input) => input.changeSetId).sort(), ["reference:issue-74:g1", "runtime:issue-159:g1"]);
+});
+
+test("named proposal displays preserved external relations with semantic names", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }] });
+  harness.issues.get("example:2")!.body = "Conflicts with #1.";
+  await harness.main.startObjective({ goal: "Existing relation", projectSlugs: ["example"],
+    issues: [{ projectSlug: "example", numbers: [1, 2] }], delivery: "separate" });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+
+  const result = await tools.get("merro_propose_objective")!.execute("proposal", {
+    goal: "Share existing work",
+    change_sets: [{ name: "issue-2-for-example", project_slug: "example", issues: [2] }],
+  });
+  assert.match(result.content[0]?.text ?? "", /conflicts with issue-1-for-example/);
+  assert.deepEqual((result.details as { relations: Array<{ kind: string; from: string; to: string }> }).relations,
+    [{ kind: "Conflicts", from: "issue-1-for-example", to: "issue-2-for-example" }]);
+});
+
+test("named Conflicts relations are symmetric and keep conflicting work from running together", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }] });
+  const proposal = await harness.main.proposeObjective({
+    goal: "Conflict test",
+    changeSets: [
+      { name: "first", projectSlug: "example", issues: [1] },
+      { name: "second", projectSlug: "example", issues: [2] },
+    ],
+    relations: [{ kind: "Conflicts", from: "first", to: "second" }],
+  });
+  assert.equal(proposal.runnableImmediately, 1);
+  await harness.main.startObjective({
+    goal: "Conflict test",
+    changeSets: [
+      { name: "first", projectSlug: "example", issues: [1] },
+      { name: "second", projectSlug: "example", issues: [2] },
+    ],
+    relations: [{ kind: "Conflicts", from: "first", to: "second" }],
+  }, proposal.id);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    const relation = store.listRelations()[0];
+    assert.deepEqual([relation?.kind, relation?.from, relation?.to, relation?.confidence], ["Conflicts", "example:issue-1:g1", "example:issue-2:g1", "explicit"]);
+  } finally { store.close(); }
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 1);
+});
+
 test("changed relation graphs require fresh proposal approval and unresolved references stay gated", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }], result: () => null });
   const input = { goal: "test", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [1, 2] }] };
@@ -317,6 +397,21 @@ test("changed relation graphs require fresh proposal approval and unresolved ref
   await harness.main.runPass();
   assert.equal(harness.launches.length, 1);
   assert.equal(harness.launches[0]?.changeSetId, "example:issue-1:g1");
+});
+
+test("changing a registered Project after named-plan proposal requires fresh approval", async (t) => {
+  const harness = await createHarness(t);
+  const input: NamedObjectiveStartInput = {
+    goal: "Freeze Project identity",
+    changeSets: [{ name: "frozen-change", projectSlug: "example", issues: [7] }],
+  };
+  const proposal = await harness.main.proposeObjective(input);
+  const project = harness.projects.get("example");
+  assert.ok(project);
+  harness.setProjectState("example", { defaultBranch: "develop" });
+  await harness.main.addProject(project.path, project.slug);
+  await assert.rejects(harness.main.startObjective(input, proposal.id), /proposal changed/);
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
 });
 
 test("proposal includes preserved incoming relations on shared active ChangeSets", async (t) => {
@@ -1957,7 +2052,7 @@ test("ambiguous and unsupported approved scopes fail before creating an Objectiv
     [{ projectSlug: "other", query: {} }],
   ]) {
     await assert.rejects(harness.main.startObjective({
-      goal: "Ship", projectSlugs: ["example"], issues: issues as unknown as Parameters<MainOrchestrator["startObjective"]>[0]["issues"],
+      goal: "Ship", projectSlugs: ["example"], issues: issues as unknown as ObjectiveStartInput["issues"],
     }));
   }
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);

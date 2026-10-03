@@ -2,20 +2,37 @@ import { Type } from "typebox";
 import { parseObjectiveIssueScopes } from "../domain/objective.js";
 import { changeName, issueNumbers } from "../domain/names.js";
 import { formatStatus, publicText } from "../runtime/presentation.js";
-import type { MainOrchestrator, ObjectiveStartInput } from "../runtime/main.js";
+import type { MainOrchestrator, NamedObjectiveStartInput, ObjectiveStartInput } from "../runtime/main.js";
 
 const empty = Type.Object({}, { additionalProperties: false });
-const objectiveParameters = Type.Object({
+const priority = Type.Optional(Type.Union([Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")]));
+const issueNumbersSchema = Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 });
+const legacyObjectiveParameters = Type.Object({
   goal: Type.String(),
   project_slugs: Type.Array(Type.String(), { minItems: 1 }),
   change: Type.String({ description: "Semantic change name, such as plugin-lifecycle-safety. Never a database identifier." }),
   issues: Type.Array(Type.Union([
-    Type.Object({ project_slug: Type.String(), numbers: Type.Array(Type.Integer({ minimum: 1 }), { minItems: 1 }) }, { additionalProperties: false }),
+    Type.Object({ project_slug: Type.String(), numbers: issueNumbersSchema }, { additionalProperties: false }),
     Type.Object({ project_slug: Type.String(), query: Type.Object({ labels: Type.Optional(Type.Array(Type.String())), milestone: Type.Optional(Type.String()) }, { additionalProperties: false }) }, { additionalProperties: false }),
   ]), { minItems: 1 }),
   delivery: Type.Optional(Type.Union([Type.Literal("together"), Type.Literal("separate")])),
-  priority: Type.Optional(Type.Union([Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")])),
+  priority,
 }, { additionalProperties: false });
+const namedObjectiveParameters = Type.Object({
+  goal: Type.String(),
+  change_sets: Type.Array(Type.Object({
+    name: Type.String({ description: "Unique semantic ChangeSet name." }),
+    project_slug: Type.String(),
+    issues: issueNumbersSchema,
+  }, { additionalProperties: false }), { minItems: 1 }),
+  relations: Type.Optional(Type.Array(Type.Object({
+    kind: Type.Union([Type.Literal("Requires"), Type.Literal("Conflicts")]),
+    from: Type.String({ description: "Dependent name for Requires; either name for Conflicts." }),
+    to: Type.String({ description: "Prerequisite name for Requires; other name for Conflicts." }),
+  }, { additionalProperties: false }))),
+  priority,
+}, { additionalProperties: false });
+const objectiveParameters = Type.Union([legacyObjectiveParameters, namedObjectiveParameters]);
 
 interface MainTool {
   name: string;
@@ -35,7 +52,30 @@ function text(args: Record<string, unknown>, key: string): string {
   if (typeof args[key] !== "string" || !args[key].trim()) throw new Error(`${key} must be a non-empty string`);
   return args[key];
 }
-function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput {
+function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | NamedObjectiveStartInput {
+  if ("change_sets" in args) {
+    if (!Array.isArray(args.change_sets)) throw new Error("change_sets must be an array");
+    const changeSets = args.change_sets.map((value) => {
+      if (!value || typeof value !== "object") throw new Error("ChangeSet selection must be an object");
+      const row = value as Record<string, unknown>;
+      if (!Array.isArray(row.issues) || (row.issues as unknown[]).some((number: unknown) => !Number.isSafeInteger(number) || Number(number) < 1)) {
+        throw new Error("ChangeSet issues must be positive issue numbers");
+      }
+      return { name: text(row, "name"), projectSlug: text(row, "project_slug"), issues: row.issues as number[] };
+    });
+    if (args.relations !== undefined && !Array.isArray(args.relations)) throw new Error("relations must be an array");
+    const relations = (args.relations ?? []) as unknown[];
+    return {
+      goal: text(args, "goal"), changeSets,
+      relations: relations.map((value) => {
+        if (!value || typeof value !== "object") throw new Error("Relation must be an object");
+        const row = value as Record<string, unknown>;
+        if (row.kind !== "Requires" && row.kind !== "Conflicts") throw new Error("Relation kind must be Requires or Conflicts");
+        return { kind: row.kind, from: text(row, "from"), to: text(row, "to") };
+      }),
+      ...(args.priority ? { priority: args.priority as NonNullable<ObjectiveStartInput["priority"]> } : {}),
+    };
+  }
   if (!Array.isArray(args.project_slugs) || args.project_slugs.some((slug) => typeof slug !== "string")) throw new Error("project_slugs must contain Project names");
   const projectSlugs = args.project_slugs as string[];
   if (!Array.isArray(args.issues)) throw new Error("issues must be an array");
@@ -63,21 +103,46 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
   pi.registerTool({ name: "merro_discover_issues", label: "Discover issues", description: "Read open GitHub issues in a registered Project.",
     parameters: Type.Object({ project_slug: Type.String() }, { additionalProperties: false }),
     async execute(_id, args) { const issues = await main.discoverIssues(text(args, "project_slug")); return result(JSON.stringify(issues), issues); } });
-  pi.registerTool({ name: "merro_propose_objective", label: "Propose plan", description: "Propose the user's Objective. All selected issues in each Project form one ChangeSet, branch, implementation, fresh review, and PR. Only one plan is pending. Ask Approve? and wait. Never start without approval.", parameters: objectiveParameters,
+  pi.registerTool({ name: "merro_propose_objective", label: "Propose plan", description: "Propose an Objective as named ChangeSets with per-Project issue selections and optional Requires or Conflicts relations. The legacy selection form remains supported. Only one plan is pending. Show the normalized plan, ask Approve? and wait. Never start without approval.", parameters: objectiveParameters,
     async execute(_id, args) {
       const input = objectiveInput(args);
       const proposal = await main.proposeObjective(input);
       const names = new Map(proposal.changeSets.map((item) => [item.id, changeName(item)]));
+      for (const [id, name] of Object.entries(proposal.relationNames)) names.set(id, name);
       const plans = proposal.changeSets.map((item) => ({ change: changeName(item), project: item.projectSlug, issues: issueNumbers(item), branch: proposal.branches[item.id] }));
+      const plannedIds = new Set(proposal.changeSets.map((item) => item.id));
+      const relationLines = new Map<string, string[]>();
+      for (const edge of proposal.relations) {
+        const from = names.get(edge.from) ?? "dependency";
+        const to = names.get(edge.to) ?? "dependency";
+        const externalDependent = !plannedIds.has(edge.from) && plannedIds.has(edge.to);
+        const owner = externalDependent ? to : from;
+        const line = edge.kind === "Requires"
+          ? `${externalDependent ? "required by" : "after"} ${externalDependent ? from : to}`
+          : `conflicts with ${externalDependent ? from : to}`;
+        relationLines.set(owner, [...(relationLines.get(owner) ?? []), line]);
+      }
       const settings = (role: "implement" | "review") => {
         const choice = proposal.workerSettings[role];
         return `model: ${choice.model ?? "Pi default"}, thinking: ${choice.thinking ?? "Pi default"}`;
       };
       const workerSettings = { implement: proposal.workerSettings.implement, review: proposal.workerSettings.review };
+      const relations = proposal.relations.map((edge) => ({ kind: edge.kind, from: names.get(edge.from) ?? "dependency", to: names.get(edge.to) ?? "dependency" }));
       const warning = proposal.cycle ? "\nBlocked: dependency cycle." : proposal.unresolved.length ? "\nBlocked: unresolved issue dependencies." : "";
-      const message = publicText(`Plan\n\n${plans.map((plan) => `${plan.project}: ${plan.issues.map((number) => `#${number}`).join(" ")}\nChange: ${plan.change}\nBranch: ${plan.branch}`).join("\n\n")}\nDelivery: ${input.delivery === "separate" ? "separate changes" : "one change per Project"}\nPRs: ${plans.length}\nImplementation: one worker per change (${settings("implement")})\nReview: one fresh worker per change (${settings("review")})${warning}\n\nApprove?`, names);
-      pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details: { plans, workerSettings } });
-      return result(message, { plans, workerSettings, relations: proposal.relations.map((edge) => ({ kind: edge.kind, from: names.get(edge.from) ?? "dependency", to: names.get(edge.to) ?? "dependency" })) });
+      const named = "changeSets" in input;
+      const planText = plans.map((plan) => {
+        const relations = (relationLines.get(plan.change) ?? []).map((line) => `\n  ${line}`).join("");
+        return named
+          ? `${plan.change}\n  ${plan.project} ${plan.issues.map((number) => `#${number}`).join(" ")}\n  Branch: ${plan.branch}${relations}`
+          : `${plan.project}: ${plan.issues.map((number) => `#${number}`).join(" ")}\nChange: ${plan.change}\nBranch: ${plan.branch}${relations}`;
+      }).join("\n\n");
+      const totals = named
+        ? `${plans.length} changes\n${plans.length} PRs\n${proposal.runnableImmediately} runnable immediately`
+        : `Delivery: ${"delivery" in input && input.delivery === "separate" ? "separate changes" : "one change per Project"}\nChanges: ${plans.length}\nPRs: ${plans.length}\nRunnable immediately: ${proposal.runnableImmediately}`;
+      const message = publicText(`Plan\n\n${planText}\n\n${totals}\nImplementation: one worker per change (${settings("implement")})\nReview: one fresh worker per change (${settings("review")})${warning}\n\nApprove?`, names);
+      const details = { plans, relations, runnableImmediately: proposal.runnableImmediately, workerSettings };
+      pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details });
+      return result(message, details);
     } });
   pi.registerTool({ name: "merro_start_objective", label: "Approve plan", description: "Approve the single pending plan only after explicit user approval such as 'approve'. Optionally select by semantic change name; never ask for an identifier or repeat the plan parameters.", parameters: Type.Object({ change: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, args) {
