@@ -23,7 +23,7 @@ import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
 
-type GitAdapter = Pick<GitClient, "discoverProject" | "createChangeSetClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint" | "fullDiff">
+type GitAdapter = Pick<GitClient, "discoverProject" | "createChangeSetClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint">
   & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone" | "cloneProject" | "deliverLocal">>;
 type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "issues" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest" | "beginPass">>;
@@ -117,6 +117,11 @@ type ObjectiveGraph = Omit<ObjectiveProposal, "id" | "workerSettings">;
 
 function relationKey(relation: Relation): string {
   return `${relation.kind}\0${relation.from}\0${relation.to}`;
+}
+
+function compactReviewText(text: string, length: number): string {
+  const value = text.replace(/\s+/g, " ").trim();
+  return value.length > length ? `${value.slice(0, length - 3).trimEnd()}...` : value;
 }
 
 function normalizePlanningContext(
@@ -1304,7 +1309,14 @@ export class MainOrchestrator {
       if (!objective) throw new Error(`ChangeSet ${item.id} is not attached to an Objective`);
       const previousReview = store.listTasks(item.id).reverse().find((task) => task.role === "review" && task.resultJson);
       const latestReview = previousReview?.resultJson ? this.#reviewContext(previousReview.resultJson) : null;
-      const instructions = await this.#repositoryInstructions(clonePath);
+      const actionablePriorFindings = previousReview?.resultJson ? this.#actionableReviewFindings(previousReview.resultJson) : null;
+      const implementationTask = role === "review"
+        ? store.listTasks(item.id).reverse().find((task) => task.role === "implement" && task.outcome === "success" && task.resultJson)
+        : undefined;
+      const implementationResult = implementationTask?.resultJson
+        ? parseImplementResult(JSON.parse(implementationTask.resultJson))
+        : null;
+      const instructions = role === "implement" ? await this.#repositoryInstructions(clonePath) : [];
       const directDependencies = store.listRelations().filter((relation) => relation.kind === "Requires" && relation.from === item.id)
         .flatMap((relation) => {
           const dependency = store.getChangeSet(relation.to);
@@ -1353,14 +1365,14 @@ export class MainOrchestrator {
         role, change: slug, projectSlug: item.projectSlug,
         issues: issueNumbers(item),
         title: slug, scope: issues.length ? issues.map((issue) => `### #${issue.number}: ${issue.title}\n\n${issue.body}`).join("\n\n") : item.guidance ?? objective.goal,
-        implementation: role === "review" ? store.listTasks(item.id).reverse().find((task) => task.role === "implement" && task.outcome === "success")?.resultJson ?? null : null,
-        diff: role === "review" ? await this.#git.fullDiff(clonePath, runtime.baseCommit ?? expectedCommit) : "",
+        implementation: implementationResult?.status === "success" ? implementationResult : null,
         objective: objective.goal,
         userGuidance: item.guidance ?? "",
         projectGuidance: projectSettings?.guidance ?? "",
-        markdownGuidance: await loadMarkdownGuidance(this.#workspacePath, [project.slug], role),
+        markdownGuidance: role === "implement" ? await loadMarkdownGuidance(this.#workspacePath, [project.slug], role) : [],
         repositoryInstructions: instructions,
-        dependencies: dependencyContext, latestReview, expectedCommit, baseUpdate,
+        dependencies: dependencyContext, latestReview: role === "review" ? actionablePriorFindings : latestReview,
+        expectedCommit, baseCommit: runtime.baseCommit ?? expectedCommit, baseUpdate,
       });
       const launchInput = {
         taskId, changeSetId: item.id, changeSlug: slug, taskName, role, project, clonePath,
@@ -2438,6 +2450,21 @@ export class MainOrchestrator {
       return [result.summary, ...result.findings.map((finding) => `${finding.severity}: ${finding.summary}`), verificationText(result.verification)].join("\n");
     } catch {
       return "Prior review result could not be parsed.";
+    }
+  }
+
+  #actionableReviewFindings(json: string): string | null {
+    try {
+      const findings = parseReviewResult(JSON.parse(json)).findings.filter((finding) => finding.severity === "blocking");
+      if (findings.length === 0) return null;
+      return findings.map((finding) => {
+        const lines = finding.line_start === undefined ? ""
+          : `:${finding.line_start}${finding.line_end !== undefined && finding.line_end !== finding.line_start ? `-${finding.line_end}` : ""}`;
+        const location = finding.file ? ` (${compactReviewText(finding.file, 160)}${lines})` : lines ? ` (line ${lines.slice(1)})` : "";
+        return `- ${compactReviewText(finding.summary, 300)}${location}`;
+      }).join("\n");
+    } catch {
+      return null;
     }
   }
 

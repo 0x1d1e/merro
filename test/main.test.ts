@@ -26,6 +26,8 @@ import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import { taskWindowName, WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
+const BASE_COMMIT = "b".repeat(40);
+
 async function approveProposal(tools: Map<string, Parameters<MainToolAPI["registerTool"]>[0]>, args: Record<string, unknown>) {
   const input = { change: "test-change", delivery: "separate", ...args };
   await tools.get("merro_propose_objective")!.execute("propose", input);
@@ -88,10 +90,8 @@ test("fresh Workers get scoped Markdown without steering existing Tasks or bypas
   assert.ok(review);
   assert.equal(review.role, "review");
   assert.notEqual(review.taskId, implement.taskId);
-  assert.match(review.taskFile, /Updated workspace convention/);
-  assert.match(review.taskFile, /Updated Kinetix convention/);
-  assert.match(review.taskFile, /Reviewer-only convention/);
-  assert.doesNotMatch(review.taskFile, /Implementer-only convention|Other Project convention/);
+  assert.match(review.taskFile, /normal Pi mechanisms/);
+  assert.doesNotMatch(review.taskFile, /Updated workspace convention|Updated Kinetix convention|Reviewer-only convention|Implementer-only convention|Other Project convention/);
   await harness.main.runPass();
   assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
   assert.equal([...harness.pullRequests.values()][0]?.state, "OPEN");
@@ -107,7 +107,11 @@ test("combined plan delivers three issues as one change, branch, worker flow and
     workerThinking: { implement: "high", review: "medium" },
     result(input, _number, result) {
       if (input.role === "implement") return { ...result, summary: `Harden plugin lifecycle safety (${input.changeSetId}, ${input.taskId}, ${uuid})`, pr: { title: `Harden plugin lifecycle safety ${uuid}`, body: "untrusted body" } };
-      if (!rejected) { rejected = true; return { ...result, status: "reject", findings: [{ severity: "blocking", summary: "Fix unsafe removal" }] }; }
+      if (!rejected) { rejected = true; return { ...result, status: "reject", findings: [
+        { severity: "blocking", summary: "Fix unsafe removal", file: "src/remove.ts", line_start: 12 },
+        { severity: "non-blocking", summary: "Optional cleanup suggestion" },
+        { severity: "note", summary: "Review note without an action" },
+      ] }; }
       return { ...result, summary: `Reviewed ${input.taskId} ${uuid}`, findings: [{ severity: "note", summary: `Safe removal ${input.changeSetId} ${uuid}` }] };
     } });
   harness.issues.get("kinetix:96")!.labels = ["chore"];
@@ -148,12 +152,22 @@ test("combined plan delivers three issues as one change, branch, worker flow and
     assert.match(input.taskFile, /Acceptance: approval precedes mutation/);
     assert.match(input.taskFile, /Marketplace lifecycle controls/);
     assert.match(input.taskFile, /Dependency-safe removal/);
-    assert.match(input.taskFile, /Full base\.\.\.HEAD diff/);
-    assert.match(input.taskFile, /safe lifecycle/);
+    assert.doesNotMatch(input.taskFile, /Full base\.\.\.HEAD diff|diff --git/);
+    assert.doesNotMatch(input.taskFile, /Repository instructions|Kinetix convention|Workspace convention/);
+    assert.doesNotMatch(input.taskFile, /"task_id"|"verification"\s*:|untrusted body/);
+    assert.match(input.taskFile, /Objective and acceptance/);
+    assert.match(input.taskFile, new RegExp(`Base commit: ${BASE_COMMIT}`));
+    assert.match(input.taskFile, new RegExp(`Reviewed commit: ${input.expectedCommit}`));
+    assert.match(input.taskFile, /normal Pi mechanisms/);
     assert.match(input.taskFile, /scripts\/run-ci.sh/);
-    assert.match(input.taskFile, /Implementation summary and verification/);
+    assert.match(input.taskFile, /Implementation and CI summary/);
   }
-  assert.match(harness.launches[2]!.taskFile, /Fix unsafe removal/);
+  const reviewTasks = harness.launches.filter((input) => input.role === "review");
+  assert.doesNotMatch(reviewTasks[0]!.taskFile, /Actionable prior findings/);
+  assert.match(reviewTasks[1]!.taskFile, /Actionable prior findings/);
+  assert.match(reviewTasks[1]!.taskFile, /Fix unsafe removal/);
+  assert.match(reviewTasks[1]!.taskFile, /src\/remove\.ts:12/);
+  assert.doesNotMatch(reviewTasks[1]!.taskFile, /Optional cleanup suggestion|Review note without an action/);
   visible.push(JSON.stringify(await restarted.publicSnapshot()), JSON.stringify(pr), ...harness.reviewComments.values(), ...harness.notifications, ...harness.launches.map((input) => input.taskFile));
   await restarted.resolveDecisionForChange("plugin-lifecycle-safety", true);
   visible.push(JSON.stringify(await restarted.publicSnapshot()), ...harness.notifications);
@@ -1321,7 +1335,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       const clonePath = [...cloneBranches].find(([, identity]) =>
         identity.projectSlug === project.slug && identity.branchName === branchName,
       )?.[0];
-      const headRefOid = clonePath ? heads.get(clonePath) ?? "base-sha" : "implementation-sha";
+      const headRefOid = clonePath ? heads.get(clonePath) ?? BASE_COMMIT : "implementation-sha";
       const pullRequest: GitHubPullRequest = {
         number,
         title,
@@ -1335,7 +1349,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         headRefName: branchName,
         baseRefName: project.defaultBranch,
         headRefOid,
-        baseRefOid: "base-sha",
+        baseRefOid: BASE_COMMIT,
         authorLogin: "issue-author",
         reviewDecision: null,
         reviews: [],
@@ -1352,7 +1366,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       if (options.pullRequestFailure?.(number)) throw new Error(`GitHub pull request ${number} unavailable`);
       const pullRequest = pullRequests.get(number);
       if (!pullRequest) throw new Error(`pull request ${number} not found`);
-      return baseMergeConflict && pullRequest.baseRefOid !== "base-sha"
+      return baseMergeConflict && pullRequest.baseRefOid !== BASE_COMMIT
         ? { ...pullRequest, mergeable: "CONFLICTING" } : pullRequest;
     },
     async syncPullRequestContent(_project: Project, pullRequest: GitHubPullRequest, body: string, notes: string) {
@@ -1399,16 +1413,15 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     async createChangeSetClone(project: Project, path: string, branchName: string) {
       cloneBaseBranches.push(project.defaultBranch);
       cloneBranches.set(path, { projectSlug: project.slug, branchName });
-      heads.set(path, "base-sha");
-      return { path, branchName, baseCommit: "base-sha" };
+      heads.set(path, BASE_COMMIT);
+      return { path, branchName, baseCommit: BASE_COMMIT };
     },
-    async fullDiff() { return "diff --git a/lifecycle.ts b/lifecycle.ts\n+safe lifecycle\n"; },
     async discardAttempt(path: string, commit: string) { heads.set(path, commit); },
     async currentCommit(path: string) {
-      return heads.get(path) ?? "base-sha";
+      return heads.get(path) ?? BASE_COMMIT;
     },
     async validateTaskCommit(path: string, expected: string, reported: string) {
-      assert.equal(heads.get(path) ?? "base-sha", expected);
+      assert.equal(heads.get(path) ?? BASE_COMMIT, expected);
       heads.set(path, reported);
       return reported;
     },
@@ -4107,11 +4120,10 @@ test("new Main consumes a healthy worker result after a crash without restarting
         if (!project) throw new Error(`unknown project ${slug}`);
         return { ...project, path };
       },
-      async createChangeSetClone(_project, path, branchName) { return { path, branchName, baseCommit: "base-sha" }; },
-      async fullDiff() { return "diff --git a/recovered b/recovered\n+recovered change\n"; },
-      async currentCommit() { return "base-sha"; },
+      async createChangeSetClone(_project, path, branchName) { return { path, branchName, baseCommit: BASE_COMMIT }; },
+      async currentCommit() { return BASE_COMMIT; },
       async validateTaskCommit(_path, expected, reported) {
-        assert.equal(expected, "base-sha");
+        assert.equal(expected, BASE_COMMIT);
         assert.equal(reported, commit);
         return reported;
       },
@@ -4630,8 +4642,11 @@ test("cross-Project dependency DAG gates work through implement, review, fix, an
   for (const dependency of webReview.dependencies ?? []) {
     assert.equal((await readFile(join(dependency.checkoutPath, "MERRO_COMMIT"), "utf8")).trim(), "e".repeat(40));
   }
+  assert.match(webReview.taskFile, /Direct dependency commits/);
+  assert.ok(webReview.taskFile.includes(`Commit: ${"e".repeat(40)}`));
   assert.ok(webReview.taskFile.includes("Read-only checkout: /merro-dependencies/1"));
   assert.ok(webReview.taskFile.includes("Read-only checkout: /merro-dependencies/2"));
+  assert.doesNotMatch(webReview.taskFile, /PR: |Final summary not available/);
 
   const webPullRequest = [...pullRequests.entries()].find(([, pr]) => pr.headRefName.includes("2"));
   assert.ok(webPullRequest);
