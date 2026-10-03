@@ -44,6 +44,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   let sessionExists = false;
   let containerId = "a".repeat(64);
   let environmentFile = "";
+  let workerEnvironment = "";
   let containerArgs: readonly string[] = [];
   const commands: CommandRunner = {
     async run(file, args) {
@@ -68,8 +69,9 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
           assert.ok(cidIndex >= 0 && envIndex >= 0);
           await writeFile(String(tokens[cidIndex + 1]), `${containerId}\n`);
           environmentFile = String(tokens[envIndex + 1]);
-          assert.match(await readFile(environmentFile, "utf8"), /GH_TOKEN=ghp_test-token/);
-          assert.match(await readFile(environmentFile, "utf8"), /^MERRO_RUNTIME=worker$/m);
+          workerEnvironment = await readFile(environmentFile, "utf8");
+          assert.match(workerEnvironment, /GH_TOKEN=ghp_test-token/);
+          assert.match(workerEnvironment, /^MERRO_RUNTIME=worker$/m);
           containerArgs = tokens;
           return { stdout: "%1\n", stderr: "" };
         }
@@ -119,6 +121,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
     project,
     clonePath,
     taskFile: "Review exactly this commit.",
+    systemPrompt: "Merro's scoped reviewer guidance. Keep APIs stable.",
     expectedCommit: "b".repeat(40),
     dependencies: [{ projectSlug: "dependency", checkoutPath: dependencyPath, mountPath: "/merro-dependencies/1" }],
     projectSettings: {
@@ -140,7 +143,14 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   assert.equal(await exists(environmentFile), false);
   const extensionRoot = join(workspacePath, "tasks", "review-safety", "merro-runtime");
   assert.equal(await exists(join(extensionRoot, "tools", "worker-result.js")), true);
+  assert.equal(await exists(join(extensionRoot, "tools", "worker-guidance.js")), true);
   assert.equal(await exists(join(extensionRoot, "protocol", "result.js")), true);
+  assert.equal(await readFile(join(workspacePath, "tasks", "review-safety", "worker-guidance.md"), "utf8"), "Merro's scoped reviewer guidance. Keep APIs stable.");
+  assert.match(workerEnvironment, /^MERRO_WORKER_GUIDANCE_PATH=\/merro-task\/worker-guidance\.md$/m);
+  assert.ok(containerArgs.includes("/merro-task/merro-runtime/tools/worker-guidance.js"));
+  const taskInput = await readFile(join(clonePath, ".merro-task.md"), "utf8");
+  assert.equal(taskInput, "Review exactly this commit.");
+  assert.ok(!taskInput.includes("Keep APIs stable"));
   assert.equal(await exists(join(extensionRoot, "node_modules", "typebox")), false);
   const mountArgs = containerArgs.flatMap((arg, index) => arg === "--mount" ? [containerArgs[index + 1] ?? ""] : []);
   assert.ok(!containerArgs.includes("--volume"));
@@ -492,7 +502,7 @@ test("Docker setup uses structured writable bind mounts and the worker UID and G
   assert.equal(setupArgs[setupArgs.indexOf("--mount") + 1], `type=bind,src=${clonePath},dst=/work`);
 });
 
-test("sandbox none launches Pi with host paths and no Docker dependency", async (t) => {
+test("sandbox none launches Pi with host paths and staged system-prompt context, without Docker", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-worker-host-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const projectPath = join(root, "source-project");
@@ -554,6 +564,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
     project,
     clonePath,
     taskFile: "Implement this issue.",
+    systemPrompt: "Scoped host worker context.",
     expectedCommit: "c".repeat(40),
     projectSettings: {
       guidance: "",
@@ -574,11 +585,14 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
   assert.ok(workerScript);
   const taskRoot = join(workspacePath, "tasks", "implement-safety");
   assert.equal(await exists(join(taskRoot, "pi-config")), false);
+  assert.equal(await readFile(join(taskRoot, "worker-guidance.md"), "utf8"), "Scoped host worker context.");
   const script = await readFile(workerScript, "utf8");
   assert.ok(script.includes("export MERRO_RUNTIME='worker'"));
   assert.ok(script.includes(`export HOME='${process.env.HOME}'`));
   assert.ok(!script.includes(`export PI_CODING_AGENT_DIR='${join(taskRoot, "pi-config")}'`));
   assert.ok(script.includes(`'${join(taskRoot, "merro-runtime", "tools", "worker-result.js")}'`));
+  assert.ok(script.includes(`'${join(taskRoot, "merro-runtime", "tools", "worker-guidance.js")}'`));
+  assert.ok(script.includes(`export MERRO_WORKER_GUIDANCE_PATH='${join(taskRoot, "worker-guidance.md")}'`));
   assert.ok(script.includes(`@${join(clonePath, ".merro-task.md")}`));
   assert.ok(!script.includes("/merro-task/"));
   assert.ok(!script.includes("/work/"));
@@ -610,6 +624,7 @@ test("sandbox none launches Pi with host paths and no Docker dependency", async 
     "--no-session", "--tui-mode", "regular", "--approve", "--extension",
     join(taskRoot, "merro-runtime", "tools", "worker-result.js"),
     "--extension", join(taskRoot, "merro-runtime", "tools", "worker-lifecycle.js"),
+    "--extension", join(taskRoot, "merro-runtime", "tools", "worker-guidance.js"),
     "--", `@${join(clonePath, ".merro-task.md")}`,
   ]);
   assert.equal(await exists(workerScript), false);

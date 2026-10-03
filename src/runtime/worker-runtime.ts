@@ -42,6 +42,8 @@ export interface WorkerLaunchInput {
   project: Project;
   clonePath: string;
   taskFile: string;
+  /** Additional Worker-only system-prompt context, staged outside the checkout. */
+  systemPrompt?: string;
   expectedCommit: string;
   baseUpdate?: BaseUpdate | null;
   projectSettings: ProjectSettingsRecord | null;
@@ -227,6 +229,8 @@ export class WorkerRuntime {
     const homePath = join(scratchPath, "home");
     const resultPath = plan.resultPath;
     const taskFilePath = plan.taskFilePath;
+    const workerGuidance = input.systemPrompt?.trim() ?? "";
+    const workerGuidancePath = join(scratchPath, "worker-guidance.md");
     const session = plan.tmuxSession;
     const window = plan.tmuxWindow;
 
@@ -234,6 +238,7 @@ export class WorkerRuntime {
     await mkdir(homePath, { recursive: true, mode: 0o700 });
     await taskExcludeFile(input.clonePath);
     await writeFile(taskFilePath, input.taskFile, { encoding: "utf8", mode: 0o600 });
+    if (workerGuidance) await writeFile(workerGuidancePath, workerGuidance, { encoding: "utf8", mode: 0o600 });
     if (sandbox === "docker") await this.#copyPiConfig(scratchConfigPath);
     await this.#copyWorkerExtension(extensionRoot);
 
@@ -245,6 +250,7 @@ export class WorkerRuntime {
       MERRO_TASK_ROLE: input.role,
       MERRO_RESULT_PATH: join(TASK_MOUNT, ".merro-result.json"),
       MERRO_TASK_SCRATCH: TASK_MOUNT,
+      ...(workerGuidance ? { MERRO_WORKER_GUIDANCE_PATH: sandbox === "docker" ? join(TASK_MOUNT, "worker-guidance.md") : workerGuidancePath } : {}),
     };
     const workerGithub = input.projectSettings?.workerGithub ?? this.#config.worker_github === "on";
     if (workerGithub) {
@@ -262,6 +268,7 @@ export class WorkerRuntime {
       "pi", ...commonPiArgs,
       "--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-result.js"),
       "--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-lifecycle.js"),
+      ...(workerGuidance ? ["--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-guidance.js")] : []),
       "--", `@${CLONE_MOUNT}/.merro-task.md`,
     ];
     const cidPath = join(this.#workspacePath, "container-ids", `${safeName(input.taskName)}.cid`);
@@ -330,6 +337,7 @@ export class WorkerRuntime {
           "pi", ...commonPiArgs,
           "--extension", join(extensionRoot, "tools", "worker-result.js"),
           "--extension", join(extensionRoot, "tools", "worker-lifecycle.js"),
+          ...(workerGuidance ? ["--extension", join(extensionRoot, "tools", "worker-guidance.js")] : []),
           "--", `@${taskFilePath}`,
         ];
         const command = hostArgs.map(shellQuote).join(" ");
@@ -732,6 +740,7 @@ export class WorkerRuntime {
     await copyFile(workerExtension, join(tools, "worker-result.js"));
     await copyFile(resultProtocol, join(protocol, "result.js"));
     await copyFile(join(compiledSource, "tools", "worker-lifecycle.js"), join(tools, "worker-lifecycle.js"));
+    await copyFile(join(compiledSource, "tools", "worker-guidance.js"), join(tools, "worker-guidance.js"));
     await copyFile(join(compiledSource, "protocol", "worker-state.js"), join(protocol, "worker-state.js"));
     await writeFile(join(target, "package.json"), '{"type":"module"}\n', { encoding: "utf8", mode: 0o600 });
   }

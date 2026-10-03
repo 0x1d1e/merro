@@ -72,6 +72,9 @@ test("fresh Workers get scoped Markdown without steering existing Tasks or bypas
   await writeFile(join(dir, "REVIEWER.md"), "Reviewer-only convention.");
   await writeFile(join(dir, "projects", "kinetix.md"), "Kinetix convention.");
   await writeFile(join(dir, "projects", "kinetix-plugins.md"), "Other Project convention.");
+  const settings = new MerroStore(join(dir, "state.db"));
+  settings.saveProjectSettings("kinetix", { guidance: "Stored Project guidance. Keep public API stable.", image: null, setupCommand: null, sandbox: null, network: null, workerGithub: null });
+  settings.close();
   await harness.main.startObjective({ goal: "Fix #42", changeSlug: "markdown-change", projectSlugs: ["kinetix"], issues: [{ projectSlug: "kinetix", numbers: [42] }] });
   await harness.main.runPass();
   const implement = harness.launches[0];
@@ -91,7 +94,13 @@ test("fresh Workers get scoped Markdown without steering existing Tasks or bypas
   assert.equal(review.role, "review");
   assert.notEqual(review.taskId, implement.taskId);
   assert.match(review.taskFile, /normal Pi mechanisms/);
-  assert.doesNotMatch(review.taskFile, /Updated workspace convention|Updated Kinetix convention|Reviewer-only convention|Implementer-only convention|Other Project convention/);
+  assert.doesNotMatch(review.taskFile, /Updated workspace convention|Updated Kinetix convention|Reviewer-only convention|Implementer-only convention|Other Project convention|Stored Project guidance/);
+  const systemPrompt = review.systemPrompt ?? "";
+  for (const text of [
+    "Updated workspace convention.", "Reviewer-only convention.", "Updated Kinetix convention.",
+    "Stored Project guidance. Keep public API stable.", "built-in safety invariants cannot be overridden",
+  ]) assert.ok(systemPrompt.includes(text), text);
+  assert.doesNotMatch(systemPrompt, /Implementer-only convention|Other Project convention/);
   await harness.main.runPass();
   assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
   assert.equal([...harness.pullRequests.values()][0]?.state, "OPEN");

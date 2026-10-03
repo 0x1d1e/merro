@@ -13,7 +13,7 @@ import { GitHubClient, GitHubMergeError, isTransientGitHubFailure, type BranchPo
 import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
-import { loadMarkdownGuidance } from "./guidance.js";
+import { loadMarkdownGuidance, renderMarkdownGuidance } from "./guidance.js";
 import { normalizedVerification, renderPullRequestContent } from "./pr-content.js";
 import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
@@ -1334,6 +1334,15 @@ export class MainOrchestrator {
           }];
         });
       const projectSettings = store.getProjectSettings(project.slug);
+      const markdownGuidance = await loadMarkdownGuidance(this.#workspacePath, [project.slug], role);
+      const workerSystemPrompt = role === "review"
+        ? renderMarkdownGuidance([
+          ...(projectSettings?.guidance.trim() ? [{ path: "Persisted Project guidance", text: projectSettings.guidance.trim() }] : []),
+          ...markdownGuidance.filter(({ path }) => path.startsWith(".merro/projects/")),
+          ...markdownGuidance.filter(({ path }) => path === ".merro/WORKSPACE.md"),
+          ...markdownGuidance.filter(({ path }) => path === ".merro/REVIEWER.md"),
+        ])
+        : "";
       const useDocker = (projectSettings?.sandbox ?? this.#config.sandbox) === "docker";
       const dependencyMounts = role === "review" ? directDependencies.map((dependency, index) => {
         if (!dependency.project) throw new Error(`dependency Project ${dependency.projectSlug} is not registered`);
@@ -1369,14 +1378,16 @@ export class MainOrchestrator {
         objective: objective.goal,
         userGuidance: item.guidance ?? "",
         projectGuidance: projectSettings?.guidance ?? "",
-        markdownGuidance: role === "implement" ? await loadMarkdownGuidance(this.#workspacePath, [project.slug], role) : [],
+        markdownGuidance: role === "implement" ? markdownGuidance : [],
         repositoryInstructions: instructions,
         dependencies: dependencyContext, latestReview: role === "review" ? actionablePriorFindings : latestReview,
         expectedCommit, baseCommit: runtime.baseCommit ?? expectedCommit, baseUpdate,
       });
       const launchInput = {
         taskId, changeSetId: item.id, changeSlug: slug, taskName, role, project, clonePath,
-        taskFile: publicText(taskFile, this.#names), expectedCommit, baseUpdate, projectSettings, dependencies: dependencyMounts.map(({ mount }) => mount),
+        taskFile: publicText(taskFile, this.#names), expectedCommit, baseUpdate, projectSettings,
+        ...(workerSystemPrompt ? { systemPrompt: workerSystemPrompt } : {}),
+        dependencies: dependencyMounts.map(({ mount }) => mount),
       };
       runtimeIntent = this.#workers.plan?.(launchInput) ?? {
         taskId,
