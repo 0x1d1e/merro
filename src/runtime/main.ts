@@ -5,7 +5,7 @@ import type { MerroConfig, WorkerSettings } from "../config.js";
 import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type Project, type Relation, type Task, type TaskRole, type ChangeSet } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
-import { analyzeIssueRelations, findRequiresCycle } from "../domain/relations.js";
+import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
 import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
 import { GitHubClient, GitHubMergeError, isTransientGitHubFailure, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
@@ -45,19 +45,43 @@ export interface ObjectiveProposal {
   changeSets: ChangeSet[];
   branches: Record<string, string>;
   relations: Relation[];
+  relationNames: Record<string, string>;
   unresolved: Array<{ changeSetId: string; references: string[] }>;
   cycle: string[] | null;
+  runnableImmediately: number;
 }
 
-export interface ObjectiveStartInput {
+export interface ObjectiveChangeSetInput {
+  name: string;
+  projectSlug: string;
+  issues: number[];
+}
+
+export interface ObjectiveRelationInput {
+  kind: "Requires" | "Conflicts";
+  from: string;
+  to: string;
+}
+
+interface ObjectiveInputOptions {
   goal: string;
-  projectSlugs: string[];
-  issues: ObjectiveIssueScope[];
   priority?: Priority;
   maxReviewRounds?: number | "unlimited";
+}
+
+export interface ObjectiveStartInput extends ObjectiveInputOptions {
+  projectSlugs: string[];
+  issues: ObjectiveIssueScope[];
   changeSlug?: string;
   delivery?: "together" | "separate";
 }
+
+export interface NamedObjectiveStartInput extends ObjectiveInputOptions {
+  changeSets: ObjectiveChangeSetInput[];
+  relations?: ObjectiveRelationInput[];
+}
+
+type ObjectiveRequest = ObjectiveStartInput | NamedObjectiveStartInput;
 
 const emptyRuntime = (changeSetId: string): ChangeSetRuntimeRecord => ({
   changeSetId, branchName: null, clonePath: null, baseCommit: null,
@@ -69,9 +93,18 @@ const emptyRuntime = (changeSetId: string): ChangeSetRuntimeRecord => ({
 
 type ObjectiveGraph = Omit<ObjectiveProposal, "id" | "workerSettings">;
 
-function proposalFingerprint(graph: ObjectiveGraph): string {
-  return JSON.stringify({ changeSets: graph.changeSets.map((item) => item.id), branches: graph.branches, relations: graph.relations,
-    unresolved: graph.unresolved, cycle: graph.cycle });
+function relationKey(relation: Relation): string {
+  return `${relation.kind}\0${relation.from}\0${relation.to}`;
+}
+
+function proposalFingerprint(graph: ObjectiveGraph, projects: readonly Project[]): string {
+  return JSON.stringify({
+    projects: projects.map(({ slug, path, baseRemote, pushRemote, defaultBranch }) => ({ slug, path, baseRemote, pushRemote, defaultBranch })),
+    changeSets: graph.changeSets.map((item) => ({ id: item.id, name: changeName(item), projectSlug: item.projectSlug,
+      issues: item.issues, generation: item.generation })),
+    branches: graph.branches, relations: graph.relations, relationNames: graph.relationNames,
+    unresolved: graph.unresolved, cycle: graph.cycle, runnableImmediately: graph.runnableImmediately,
+  });
 }
 
 function sourceId(projectSlug: string, number: number, generation: number): string {
@@ -289,7 +322,7 @@ export class MainOrchestrator {
   readonly #workers: WorkerAdapter;
   readonly #commands: CommandRunner;
   #storeQueue: Promise<unknown> = Promise.resolve();
-  readonly #proposals = new Map<string, { input: string; graph: string }>();
+  readonly #proposals = new Map<string, { input: string; graph: string; names: string[] }>();
   readonly #pendingNotifications: Array<{ event: string; subjectId: string; message: string }> = [];
   readonly #reviewNotificationsInFlight = new Set<string>();
   readonly #names = new Map<string, string>();
@@ -391,7 +424,10 @@ export class MainOrchestrator {
     });
   }
 
-  async proposeObjective(input: ObjectiveStartInput): Promise<ObjectiveProposal> {
+  proposeObjective(input: NamedObjectiveStartInput): Promise<ObjectiveProposal>;
+  proposeObjective(input: ObjectiveStartInput): Promise<ObjectiveProposal>;
+  proposeObjective(input: NamedObjectiveStartInput | ObjectiveStartInput): Promise<ObjectiveProposal>;
+  async proposeObjective(input: ObjectiveRequest): Promise<ObjectiveProposal> {
     return this.#withStore(async (store) => {
       const prepared = await this.#prepareObjective(store, input);
       const id = randomUUID();
@@ -401,56 +437,130 @@ export class MainOrchestrator {
       };
       const proposal = { id, workerSettings, ...prepared.graph };
       this.#proposals.clear();
-      this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph) });
+      this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph, prepared.projects),
+        names: prepared.graph.changeSets.map((item) => changeName(item)) });
       return proposal;
     });
   }
 
-  async #prepareObjective(store: MerroStore, input: ObjectiveStartInput) {
-    const projects = [...new Set(input.projectSlugs)].map((slug) => {
-      const project = store.getProject(slug);
-      if (!project) throw new Error(`unknown Project: ${slug}`);
-      return project;
-    });
-    const issueScopes = parseObjectiveIssueScopes(input.issues, projects.map((project) => project.slug));
+  async #prepareObjective(store: MerroStore, input: ObjectiveRequest) {
+    const explicit = "changeSets" in input;
+    let projects: Project[];
+    let issueScopes: ObjectiveIssueScope[];
+    let selections: Array<{ name: string | null; projectSlug: string; scope: ObjectiveIssueScope }>;
+    if (explicit) {
+      if (!Array.isArray(input.changeSets) || input.changeSets.length === 0) throw new Error("Objective requires at least one ChangeSet");
+      if ("projectSlugs" in input || "issues" in input || "changeSlug" in input || "delivery" in input) {
+        throw new Error("Use either named ChangeSets or the legacy Project selection, not both");
+      }
+      const names = input.changeSets.map((item) => semanticSlug(item.name));
+      if (new Set(names).size !== names.length) throw new Error("ChangeSet names must be unique in an Objective");
+      const projectSlugs = [...new Set(input.changeSets.map((item) => item.projectSlug))];
+      projects = projectSlugs.map((slug) => {
+        const project = store.getProject(slug);
+        if (!project) throw new Error(`unknown Project: ${slug}`);
+        return project;
+      });
+      selections = input.changeSets.map((item, index) => ({
+        name: names[index]!, projectSlug: item.projectSlug,
+        scope: parseObjectiveIssueScopes([{ projectSlug: item.projectSlug, numbers: item.issues }], [item.projectSlug])[0]!,
+      }));
+      issueScopes = [];
+    } else {
+      if (!Array.isArray(input.projectSlugs) || input.projectSlugs.length === 0 || !Array.isArray(input.issues)) {
+        throw new Error("Objective requires registered Projects and issue selections");
+      }
+      projects = [...new Set(input.projectSlugs)].map((slug) => {
+        const project = store.getProject(slug);
+        if (!project) throw new Error(`unknown Project: ${slug}`);
+        return project;
+      });
+      issueScopes = parseObjectiveIssueScopes(input.issues, projects.map((project) => project.slug));
+      selections = issueScopes.map((scope) => ({ name: null, projectSlug: scope.projectSlug, scope }));
+    }
+
+    const projectBySlug = new Map(projects.map((project) => [project.slug, project]));
     const issueRows = new Map<string, GitHubIssue>();
-    for (const scope of issueScopes) {
-      const project = projects.find((candidate) => candidate.slug === scope.projectSlug)!;
-      const open = await this.#github.listOpenIssues(project, "query" in scope ? scope.query : undefined);
-      const selected = open.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(scope, issue));
-      if ("numbers" in scope) {
-        for (const number of scope.numbers) {
+    const selectedGroups: GitHubIssue[][] = [];
+    const issueOwners = new Map<string, string>();
+    for (const selection of selections) {
+      const project = projectBySlug.get(selection.projectSlug);
+      if (!project) throw new Error(`unknown Project: ${selection.projectSlug}`);
+      const open = await this.#github.listOpenIssues(project, "query" in selection.scope ? selection.scope.query : undefined);
+      const selected = open.filter((issue) => issue.state.toUpperCase() === "OPEN" && matchesIssueScope(selection.scope, issue))
+        .sort((a, b) => a.number - b.number);
+      if ("numbers" in selection.scope) {
+        for (const number of selection.scope.numbers) {
           if (!selected.some((issue) => issue.number === number)) throw new Error(`issue #${number} is not open in Project '${project.slug}'`);
         }
       }
-      for (const issue of selected.sort((a, b) => a.number - b.number)) issueRows.set(`${project.slug}\0${issue.number}`, issue);
+      if (explicit && selected.length === 0) throw new Error(`ChangeSet '${selection.name}' must select at least one open issue`);
+      for (const issue of selected) {
+        const key = `${project.slug}\0${issue.number}`;
+        const previousOwner = issueOwners.get(key);
+        if (explicit && previousOwner) throw new Error(`Issue #${issue.number} in Project '${project.slug}' is assigned to both '${previousOwner}' and '${selection.name}'`);
+        if (explicit) issueOwners.set(key, selection.name!);
+        issueRows.set(key, issue);
+      }
+      selectedGroups.push(selected);
     }
-    const groups: Array<{ projectSlug: string; issues: GitHubIssue[] }> = [];
-    for (const project of projects) {
-      const issues = [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue);
-      if (input.delivery === "separate") groups.push(...issues.map((issue) => ({ projectSlug: project.slug, issues: [issue] })));
-      else if (issues.length) groups.push({ projectSlug: project.slug, issues });
+
+    const groups: Array<{ name: string | null; projectSlug: string; issues: GitHubIssue[] }> = [];
+    if (explicit) {
+      selections.forEach((selection, index) => groups.push({ name: selection.name, projectSlug: selection.projectSlug, issues: selectedGroups[index]! }));
+    } else {
+      for (const project of projects) {
+        const issues = [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue);
+        if (input.delivery === "separate") groups.push(...issues.map((issue) => ({ name: null, projectSlug: project.slug, issues: [issue] })));
+        else if (issues.length) groups.push({ name: null, projectSlug: project.slug, issues });
+      }
     }
     const plannedNames = new Set<string>();
-    const changeSets = groups.map(({ projectSlug, issues }): ChangeSet => {
+    const namesToIds = new Map<string, string>();
+    const legacyChangeSlug = "changeSlug" in input ? input.changeSlug : undefined;
+    const requestedRelations = "relations" in input ? input.relations ?? [] : [];
+    const changeSets = groups.map(({ name, projectSlug, issues }): ChangeSet => {
       const numbers = issues.map((issue) => issue.number);
       const existing = store.findNonTerminalChangeSet(projectSlug, numbers);
-      if (existing) return existing;
+      if (existing) {
+        if (name && existing.slug !== name) throw new Error(`These issues already belong to ChangeSet '${existing.slug}', not '${name}'`);
+        plannedNames.add(existing.slug);
+        if (name) namesToIds.set(name, existing.id);
+        return existing;
+      }
       const overlaps = store.listChangeSets().filter((item) => item.projectSlug === projectSlug && !terminal(item)
         && issueNumbers(item).some((number) => issues.some((issue) => issue.number === number)));
       if (overlaps.length) throw new Error(`Issues already belong to ${overlaps.map(changeName).join(", ")}. Stop that change before regrouping its issues.`);
       const generation = store.nextGeneration(projectSlug, numbers);
-      const baseName = semanticSlug(input.changeSlug ?? (issues.length === 1 ? issues[0]!.title : input.goal));
+      const baseName = name ?? semanticSlug(legacyChangeSlug ?? (issues.length === 1 ? issues[0]!.title : input.goal));
       const slug = store.availableChangeName(baseName, plannedNames);
       plannedNames.add(slug);
       const id = issues.length === 1 ? sourceId(projectSlug, issues[0]!.number, generation) : `${projectSlug}:change:${slug}:g${generation}`;
       this.#names.set(id, slug);
+      if (name) namesToIds.set(name, id);
       return { id, slug, projectSlug, issues: numbers.map((number) => ({ projectSlug, number })), generation,
         state: "Planned", priority: input.priority ?? "normal", readySince: null, blockedReason: null, blockedResumeState: null };
     });
+
+    const explicitRelations: Relation[] = [];
+    const seenExplicitRelations = new Set<string>();
+    for (const edge of requestedRelations) {
+      if (edge.kind !== "Requires" && edge.kind !== "Conflicts") throw new Error("Relation kind must be Requires or Conflicts");
+      const fromName = semanticSlug(edge.from);
+      const toName = semanticSlug(edge.to);
+      const from = namesToIds.get(fromName);
+      const to = namesToIds.get(toName);
+      if (!from || !to) throw new Error(`Relation must reference named ChangeSets in this Objective: '${fromName}' -> '${toName}'`);
+      const relation = normalizeRelation({ kind: edge.kind, from, to, confidence: "explicit",
+        rationale: "Approved in the Objective plan.", evidence: `${fromName} ${edge.kind} ${toName}` });
+      const key = `${relation.kind}\0${relation.from}\0${relation.to}`;
+      if (!seenExplicitRelations.has(key)) explicitRelations.push(relation);
+      seenExplicitRelations.add(key);
+    }
+
     // Shared ChangeSets retain relations to work already approved by another active Objective.
     const objectives = store.listObjectives().filter((candidate) => candidate.state === "Active");
-    const relations: Relation[] = [];
+    const automaticRelations: Relation[] = [];
     const unresolved: ObjectiveProposal["unresolved"] = [];
     for (const item of changeSets) {
       const approved = new Map(changeSets.map((candidate) => [candidate.id, candidate]));
@@ -464,38 +574,55 @@ export class MainOrchestrator {
       for (const number of issueNumbers(item)) {
         const issue = issueRows.get(`${item.projectSlug}\0${number}`)!;
         const analysis = analyzeIssueRelations(item, issue, [...approved.values()]);
-        relations.push(...analysis.relations);
+        automaticRelations.push(...analysis.relations);
         for (const reference of analysis.unresolved) references.add(reference);
       }
       if (references.size) unresolved.push({ changeSetId: item.id, references: [...references] });
     }
     const ids = new Set(changeSets.map((item) => item.id));
-    const effective = store.previewAutomaticRelations([...ids], relations)
+    const effective = store.previewAutomaticRelations([...ids], [...automaticRelations, ...explicitRelations])
       .filter((relation) => ids.has(relation.from) || ids.has(relation.to));
-    return { projects, issueScopes, issueRows, automaticRelations: relations,
+    const fixedIssueScopes = projects.map((project) => ({ projectSlug: project.slug,
+      numbers: [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue.number) }));
+    const approvedIssueScopes = !explicit && input.delivery === "separate" ? issueScopes
+      : parseObjectiveIssueScopes(fixedIssueScopes, projects.map((project) => project.slug), { allowEmptyFixedSelections: true });
+    const relatedIds = new Set([...ids, ...effective.flatMap((relation) => [relation.from, relation.to])]);
+    const relatedChangeSets = [...relatedIds].map((id) => changeSets.find((item) => item.id === id) ?? store.getChangeSet(id))
+      .filter((item): item is ChangeSet => item !== null && item !== undefined);
+    const relationNames = Object.fromEntries(relatedChangeSets.map((item) => [item.id, changeName(item)]));
+    const participants = relatedChangeSets
+      .map((item) => item.state === "Planned" ? { ...item, state: "Ready" as const } : item);
+    const activeIds = store.listTasks().filter((task) => task.status === "active" && relatedIds.has(task.changeSetId)).map((task) => task.changeSetId);
+    const unresolvedIds = new Set(unresolved.map((item) => item.changeSetId));
+    const runnableImmediately = schedule({ changeSets: participants, relations: effective, activeTaskCount: 0,
+      maxConcurrentTasks: "unlimited", activeChangeSetIds: activeIds }).selected
+      .filter((item) => ids.has(item.id) && !unresolvedIds.has(item.id)).length;
+    return { projects, issueScopes, approvedIssueScopes, issueRows, automaticRelations, explicitRelations,
       graph: { changeSets, branches: Object.fromEntries(changeSets.map((item) => [item.id,
         store.getChangeSetRuntime(item.id)?.branchName ?? branchName(issueRows.get(`${item.projectSlug}\0${issueNumbers(item)[0]}`)!, item.slug)])),
-        relations: effective, unresolved, cycle: findRequiresCycle(effective) } };
+        relations: effective, relationNames, unresolved, cycle: findRequiresCycle(effective), runnableImmediately } };
   }
 
-  async startObjective(input: ObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
+  startObjective(input: NamedObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }>;
+  startObjective(input: ObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }>;
+  startObjective(input: NamedObjectiveStartInput | ObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }>;
+  async startObjective(input: ObjectiveRequest, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
     if (!input.goal.trim()) throw new Error("Objective goal must not be empty");
-    if (input.projectSlugs.length === 0) throw new Error("Objective requires at least one Project");
     return this.#withStore(async (store) => {
-      const { projects, issueScopes, issueRows, graph, automaticRelations } = await this.#prepareObjective(store, input);
+      const { projects, approvedIssueScopes, graph, automaticRelations, explicitRelations } = await this.#prepareObjective(store, input);
       if (proposalId !== undefined) {
         const proposal = this.#proposals.get(proposalId);
-        if (!proposal || proposal.input !== JSON.stringify(input) || proposal.graph !== proposalFingerprint(graph)) {
+        if (!proposal || proposal.input !== JSON.stringify(input) || proposal.graph !== proposalFingerprint(graph, projects)) {
           throw new Error("Objective proposal changed or expired. Run merro_propose_objective and obtain approval again.");
         }
-        this.#proposals.delete(proposalId);
       }
+      await this.#validateNewExplicitRelations(store, graph.changeSets, graph.relations, explicitRelations);
+      if (proposalId !== undefined) this.#proposals.delete(proposalId);
 
       const objective: Objective = {
         id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
         projectSlugs: projects.map((project) => project.slug),
-        issueScopes: input.delivery === "separate" ? issueScopes : projects.map((project) => ({ projectSlug: project.slug,
-          numbers: [...issueRows].filter(([key]) => key.startsWith(`${project.slug}\0`)).map(([, issue]) => issue.number) })),
+        issueScopes: approvedIssueScopes,
         ...(input.maxReviewRounds === undefined ? {} : { maxReviewRounds: input.maxReviewRounds }),
       };
       store.createObjective(objective);
@@ -506,10 +633,16 @@ export class MainOrchestrator {
         store.attachChangeSet(objective.id, planned.id);
         const item = store.getChangeSet(planned.id)!;
         this.#names.set(item.id, changeName(item));
+        const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
+        if (!runtime.branchName) {
+          const approvedBranch = graph.branches[item.id];
+          if (!approvedBranch) throw new Error(`Approved branch is missing for ${changeName(item)}`);
+          store.saveChangeSetRuntime({ ...runtime, branchName: approvedBranch });
+        }
         if (priorityRank(objective.priority) < priorityRank(item.priority)) store.setChangeSetPriority(item.id, objective.priority);
         items.push(store.getChangeSet(item.id)!);
       }
-      store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations);
+      store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations, [], explicitRelations);
       this.#notify(`Started ${items.map(changeName).join(", ")}.`);
       return { objective, changeSets: items };
     });
@@ -519,8 +652,11 @@ export class MainOrchestrator {
     const [entry] = this.#proposals;
     if (!entry) throw new Error("No pending plan. Propose a plan and obtain approval first.");
     const [id, proposal] = entry;
-    const input = JSON.parse(proposal.input) as ObjectiveStartInput;
-    if (name && semanticSlug(name) !== semanticSlug(input.changeSlug ?? input.goal)) throw new Error("That name does not match the pending plan.");
+    const input = JSON.parse(proposal.input) as ObjectiveRequest;
+    const acceptedNames = ["changeSlug" in input ? input.changeSlug : undefined, input.goal,
+      ...("changeSets" in input ? input.changeSets.map((item) => item.name) : []), ...proposal.names]
+      .filter((candidate): candidate is string => candidate !== undefined).map(semanticSlug);
+    if (name && !acceptedNames.includes(semanticSlug(name))) throw new Error("That name does not match the pending plan.");
     return this.startObjective(input, id);
   }
 
@@ -1205,6 +1341,41 @@ export class MainOrchestrator {
     runtime.lastIssueState = "OPEN";
     store.saveChangeSetRuntime(runtime);
     this.#notify(`Reopened issue #${issue.number} created ChangeSet generation ${generation}.`);
+  }
+
+  async #validateNewExplicitRelations(
+    store: MerroStore,
+    planned: readonly ChangeSet[],
+    effective: readonly Relation[],
+    explicit: readonly Relation[],
+  ): Promise<void> {
+    const existing = new Set(store.listRelations().map(relationKey));
+    const explicitKeys = new Set(explicit.map(relationKey));
+    const additions = effective.filter((relation) => explicitKeys.has(relationKey(relation)) && !existing.has(relationKey(relation)));
+    if (!additions.length) return;
+
+    const { unsafeProjects, changeSetIds } = await this.#workerSafetyPreflight(store);
+    const changeSetsById = new Map([...store.listChangeSets(), ...planned].map((item) => [item.id, item]));
+    const occupied = new Set([
+      ...changeSetIds,
+      ...store.listTasks().filter((task) => task.status === "active").map((task) => task.changeSetId),
+    ]);
+    for (const relation of additions) {
+      const from = changeSetsById.get(relation.from);
+      const to = changeSetsById.get(relation.to);
+      if (!from || !to) throw new Error("Cannot approve a relation with an unknown ChangeSet");
+      for (const item of [from, to]) {
+        if (unsafeProjects.has(item.projectSlug)) {
+          throw new Error(`Cannot approve a new relation involving ${changeName(item)}: Worker safety is unverified in Project ${item.projectSlug}. Inspect Workers and retry.`);
+        }
+      }
+      if (relation.kind === "Conflicts" && occupied.has(from.id) && occupied.has(to.id)) {
+        throw new Error(`Cannot approve Conflicts between ${changeName(from)} and ${changeName(to)} while both have active Workers; retry after the Workers safely exit.`);
+      }
+      if (relation.kind === "Requires" && occupied.has(from.id) && to.state !== "Done") {
+        throw new Error(`Cannot approve Requires for ${changeName(from)} while its Worker is active and prerequisite ${changeName(to)} is not Done; retry after the Worker exits or the prerequisite completes.`);
+      }
+    }
   }
 
   async #workerSafetyPreflight(store: MerroStore, unsafeProjects = new Set<string>()): Promise<{ unsafeProjects: Set<string>; count: number; changeSetIds: Set<string>; liveTaskIds: Set<string> }> {
