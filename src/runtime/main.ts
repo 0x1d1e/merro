@@ -456,6 +456,14 @@ export class MainOrchestrator {
     return this.#withStore((store) => store.listProjects());
   }
 
+  async presentPlanningContext(input: ObjectivePlanningContext): Promise<ObjectivePlanningContext> {
+    return this.#withStore((store) => {
+      const planning = normalizePlanningContext(input, store, new Map(), []);
+      this.#proposals.clear();
+      return planning;
+    });
+  }
+
   async discoverIssues(projectSlug: string): Promise<GitHubIssue[]> {
     const project = await this.#withStore((store) => {
       const registered = store.getProject(projectSlug);

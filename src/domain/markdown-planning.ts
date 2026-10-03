@@ -33,7 +33,7 @@ interface RoadmapRow extends MarkdownRoadmapItem {
   changeName: string;
 }
 
-const STOP_WORDS = new Set(["all", "and", "or", "with", "parallel", "stage", "the"]);
+const STOP_WORDS = new Set(["all", "and", "with", "parallel", "stage", "the"]);
 
 function headingKey(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -202,7 +202,7 @@ interface RelationClause {
 }
 
 function relationClause(value: string): RelationClause | undefined {
-  const source = value.trim().split(/;\s*parallel\b/i)[0]!.trim().replace(/[.;,]+$/, "").trim();
+  const source = value.trim().replace(/[.;,]+$/, "").trim();
   const targetText = source.replace(/^(?:yes[,;:]?\s+|parallel[,;:]?\s+)/i, "");
   if (!targetText || /^(?:yes|true|parallel|foundation|none|n\/a)$/i.test(targetText)
     || /^with\s+\d+[a-z](?:\s*(?:\/|-|\+|,|&|\band\b)\s*\d+[a-z])*$/i.test(targetText)) return undefined;
@@ -224,9 +224,12 @@ function relationClause(value: string): RelationClause | undefined {
   return { target: source, statement: source, unsupported: true };
 }
 
-function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappings: readonly MarkdownProjectMapping[]): string | undefined {
-  const parsedClause = relationClause(row.parallel);
-  if (!parsedClause) return undefined;
+function resolveDependencyClause(
+  row: RoadmapRow,
+  parsedClause: RelationClause,
+  rows: readonly RoadmapRow[],
+  mappings: readonly MarkdownProjectMapping[],
+): string | undefined {
   if (parsedClause.last) {
     const previous = rows.slice(0, rows.indexOf(row)).filter((candidate) => candidate.projectSlug === row.projectSlug);
     if (!previous.length) return `${parsedClause.statement} (no preceding workstream in this Project)`;
@@ -235,11 +238,12 @@ function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappi
   }
   if (parsedClause.unsupported) return parsedClause.statement;
   const clause = parsedClause.target;
-  if (/\ball\s+3x\s*\/\s*4x\b/i.test(clause)) {
+  if (/\bor\b/i.test(clause)) return parsedClause.statement;
+  const barrier = clause.match(/^all\s+3x\s*\/\s*4x\b(.*)$/i);
+  if (barrier) {
     const barriers = rows.filter((candidate) => candidate !== row && candidate.order && /^[34][a-z0-9]*$/i.test(candidate.order));
-    if (!barriers.length) return parsedClause.statement;
-    row.dependencies.push(...barriers);
-    return undefined;
+    if (barriers.length) row.dependencies.push(...barriers);
+    return !barriers.length || (barrier[1] ?? "").trim() ? parsedClause.statement : undefined;
   }
 
   const issueMatches = [...clause.matchAll(/#(\d+)/g)];
@@ -282,6 +286,17 @@ function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappi
     row.dependencies.push(dependency);
   }
   return undefined;
+}
+
+function resolveDependencies(row: RoadmapRow, rows: readonly RoadmapRow[], mappings: readonly MarkdownProjectMapping[]): string | undefined {
+  const unresolved = new Set<string>();
+  for (const clause of row.parallel.split(";").map((part) => part.trim()).filter(Boolean)) {
+    const parsedClause = relationClause(clause);
+    const statement = parsedClause ? resolveDependencyClause(row, parsedClause, rows, mappings) : undefined;
+    if (statement) unresolved.add(statement);
+  }
+  row.dependencies = [...new Set(row.dependencies)];
+  return [...unresolved].join("; ") || undefined;
 }
 
 function blockerFor(row: RoadmapRow, visiting = new Set<RoadmapRow>()): string[] {

@@ -613,6 +613,108 @@ test("Markdown dependency wording fails closed and 'last' waits for all earlier 
   assert.equal(lastDetails.runnableImmediately, 2);
 });
 
+test("Markdown dependency qualifiers and alternatives remain unresolved in Main proposals", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2, 3] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  const propose = tools.get("merro_propose_objective")!;
+  const cases = [
+    {
+      label: "semicolon qualifier",
+      rows: ["| 1 | Provider | #1 | yes |", "| 2 | Consumer | #2 | after #1; parallel after interfaces stabilize |"],
+      selected: ["provider"],
+      unresolved: "after interfaces stabilize",
+    },
+    {
+      label: "qualified barrier",
+      rows: ["| 3A | Interfaces | #1 | yes |", "| 4A | Docs | #2 | yes |", "| 5 | Consumer | #3 | after all 3x/4x once interfaces stabilize |"],
+      selected: ["interfaces", "docs"],
+      unresolved: "after all 3x/4x once interfaces stabilize",
+    },
+    {
+      label: "alternative prerequisites",
+      rows: ["| 1 | Interfaces | #1 | yes |", "| 2 | Docs | #2 | yes |", "| 3 | Consumer | #3 | after #1 or #2 |"],
+      selected: ["interfaces", "docs"],
+      unresolved: "after #1 or #2",
+    },
+  ];
+  for (const scenario of cases) {
+    const proposed = await propose.execute(scenario.label, {
+      goal: "Interpret dependency wording without inventing relations",
+      markdown: ["| Order | Workstream | Issues | Parallel? |", "|---|---|---|---|", ...scenario.rows].join("\n"),
+      project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
+    });
+    const details = proposed.details as {
+      plans: Array<{ change: string }>;
+      relations: Array<{ from: string; to: string }>;
+      planning: { items: Array<{ workstream: string; changeSet?: string }>; unresolved: Array<{ workstream: string; statement: string }> };
+    };
+    assert.deepEqual(details.plans.map(({ change }) => change), scenario.selected, scenario.label);
+    assert.equal(details.planning.items.find(({ workstream }) => workstream === "Consumer")?.changeSet, undefined, scenario.label);
+    assert.deepEqual(details.planning.unresolved, [{ workstream: "Consumer", projectSlug: "kinetix", statement: scenario.unresolved }], scenario.label);
+    assert.ok(details.relations.every((relation) => relation.from !== "consumer"), scenario.label);
+    assert.ok((proposed.content[0]?.text ?? "").includes(scenario.unresolved), scenario.label);
+  }
+});
+
+test("Markdown roadmaps without executable work return read-only context", async (t) => {
+  const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  const propose = tools.get("merro_propose_objective")!;
+  const approve = tools.get("merro_start_objective")!;
+  const scenarios = [
+    {
+      label: "unresolved-only",
+      markdown: ["| Order | Workstream | Issues | Parallel? |", "|---|---|---|---|", "| 2 | Consumer | #2 | once interfaces stabilize |"].join("\n"),
+      unresolved: ["once interfaces stabilize"],
+    },
+    {
+      label: "context-only",
+      markdown: [
+        "| Status | Order | Workstream | Issues | Parallel? |",
+        "|---|---|---|---|---|",
+        "| Done | 0 | Completed work | #1 | yes |",
+        "| Parked | parked | Parked work | #2 | blocked |",
+        "| Future | future | Future work | - | after #1 |",
+      ].join("\n"),
+      unresolved: [],
+    },
+  ];
+  for (const scenario of scenarios) {
+    await propose.execute("pending-plan", {
+      goal: "Pending executable plan",
+      change_sets: [{ name: "pending-change", project_slug: "kinetix", issues: [1] }],
+    });
+    const result = await propose.execute(scenario.label, {
+      goal: "Show roadmap context",
+      markdown: scenario.markdown,
+      project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
+    });
+    const text = result.content[0]?.text ?? "";
+    const details = result.details as {
+      plans: unknown[];
+      relations: unknown[];
+      planning: { items: Array<{ workstream: string; status?: string; changeSet?: string }>; unresolved: Array<{ statement: string }> };
+      runnableImmediately: number;
+    };
+    assert.deepEqual(details.plans, [], scenario.label);
+    assert.deepEqual(details.relations, [], scenario.label);
+    assert.equal(details.runnableImmediately, 0, scenario.label);
+    assert.deepEqual(details.planning.unresolved.map(({ statement }) => statement), scenario.unresolved, scenario.label);
+    assert.match(text, /Read-only roadmap context/);
+    assert.match(text, /cannot be approved/);
+    assert.doesNotMatch(text, /Approve\?/);
+    if (scenario.label === "context-only") {
+      assert.deepEqual(details.planning.items.map(({ status }) => status), ["Done", "Parked", "Future"]);
+    }
+    await assert.rejects(approve.execute("approve", {}), /No pending plan/);
+    const snapshot = await harness.main.statusSnapshot();
+    assert.deepEqual(snapshot.objectives, [], scenario.label);
+    assert.deepEqual(snapshot.changeSets, [], scenario.label);
+  }
+});
+
 test("full Kinetix roadmaps enter through Markdown, retain typed structure, and never reach Workers", async (t) => {
   const fixture = await readFile(join(process.cwd(), "test", "fixtures", "kinetix-roadmap.md"), "utf8");
   const harness = await createHarness(t, {
