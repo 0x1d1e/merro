@@ -41,6 +41,23 @@ export interface MainOptions {
   progress?: (message: string) => void;
 }
 
+export type RoadmapStatus = "Done" | "In Progress" | "Not Started" | "Parked" | "Future";
+
+export interface ObjectiveRoadmapItem {
+  workstream: string;
+  projectSlug: string;
+  issues: number[];
+  order?: string;
+  status?: RoadmapStatus;
+  changeSet?: string;
+  sourceDependencies?: Array<{ workstream: string; projectSlug: string }>;
+}
+
+export interface ObjectivePlanningContext {
+  items: ObjectiveRoadmapItem[];
+  unresolved: Array<{ workstream: string; projectSlug: string; statement: string }>;
+}
+
 export interface ObjectiveProposal {
   id: string;
   workerSettings: WorkerSettings;
@@ -49,6 +66,7 @@ export interface ObjectiveProposal {
   relations: Relation[];
   relationNames: Record<string, string>;
   unresolved: Array<{ changeSetId: string; references: string[] }>;
+  planning?: ObjectivePlanningContext;
   cycle: string[] | null;
   runnableImmediately: number;
 }
@@ -82,6 +100,7 @@ export interface ObjectiveStartInput extends ObjectiveInputOptions {
 export interface NamedObjectiveStartInput extends ObjectiveInputOptions {
   changeSets: ObjectiveChangeSetInput[];
   relations?: ObjectiveRelationInput[];
+  planning?: ObjectivePlanningContext;
 }
 
 type ObjectiveRequest = ObjectiveStartInput | NamedObjectiveStartInput;
@@ -100,13 +119,96 @@ function relationKey(relation: Relation): string {
   return `${relation.kind}\0${relation.from}\0${relation.to}`;
 }
 
+function normalizePlanningContext(
+  input: ObjectivePlanningContext,
+  store: MerroStore,
+  namesToIds: ReadonlyMap<string, string>,
+  changeSets: readonly ChangeSet[],
+): ObjectivePlanningContext {
+  if (!Array.isArray(input.items) || !Array.isArray(input.unresolved)) throw new Error("Planning context requires items and unresolved statements");
+  const validStatuses = new Set<RoadmapStatus>(["Done", "In Progress", "Not Started", "Parked", "Future"]);
+  const keys = new Set<string>();
+  const selected = new Map(changeSets.map((item) => [item.id, item]));
+  const mapped = new Set<string>();
+  const items = input.items.map((item) => {
+    if (!item || typeof item !== "object" || typeof item.workstream !== "string" || !item.workstream.trim()) {
+      throw new Error("Planning workstreams must have a name");
+    }
+    if (typeof item.projectSlug !== "string" || !store.getProject(item.projectSlug)) throw new Error(`unknown planning Project: ${item.projectSlug}`);
+    if (!Array.isArray(item.issues) || item.issues.some((number) => !Number.isSafeInteger(number) || number < 1)
+      || new Set(item.issues).size !== item.issues.length) throw new Error(`Planning issues for '${item.workstream}' must be unique positive issue numbers`);
+    if (item.order !== undefined && (typeof item.order !== "string" || !item.order.trim())) throw new Error(`Planning order for '${item.workstream}' must not be empty`);
+    if (item.status !== undefined && !validStatuses.has(item.status)) throw new Error(`Unknown roadmap status for '${item.workstream}'`);
+    const workstream = item.workstream.trim();
+    const key = `${item.projectSlug}\0${semanticSlug(workstream)}`;
+    if (keys.has(key)) throw new Error(`Duplicate planning workstream '${workstream}' in Project '${item.projectSlug}'`);
+    keys.add(key);
+    let changeSet: string | undefined;
+    if (item.changeSet !== undefined) {
+      if (typeof item.changeSet !== "string" || !item.changeSet.trim()) throw new Error(`ChangeSet mapping for '${workstream}' must not be empty`);
+      const id = namesToIds.get(semanticSlug(item.changeSet));
+      const planned = id ? selected.get(id) : undefined;
+      if (!planned) throw new Error(`Planning workstream '${workstream}' maps to an unselected ChangeSet '${item.changeSet}'`);
+      const plannedIssues = issueNumbers(planned).sort((a, b) => a - b);
+      const requestedIssues = [...item.issues].sort((a, b) => a - b);
+      if (mapped.has(planned.id)) throw new Error(`ChangeSet '${item.changeSet}' maps to multiple planning workstreams`);
+      if (planned.projectSlug !== item.projectSlug || plannedIssues.length !== requestedIssues.length
+        || plannedIssues.some((number, index) => number !== requestedIssues[index])) {
+        throw new Error(`Planning workstream '${workstream}' does not match ChangeSet '${item.changeSet}'`);
+      }
+      if (item.status === "Done" || item.status === "Parked" || item.status === "Future") {
+        throw new Error(`Roadmap workstream '${workstream}' is ${item.status} and cannot be selected for execution`);
+      }
+      mapped.add(planned.id);
+      changeSet = changeName(planned);
+    }
+    let sourceDependencies: ObjectiveRoadmapItem["sourceDependencies"];
+    if (item.sourceDependencies !== undefined) {
+      if (!Array.isArray(item.sourceDependencies)) throw new Error(`Source dependencies for '${workstream}' must be an array`);
+      sourceDependencies = item.sourceDependencies.map((dependency) => {
+        if (!dependency || typeof dependency !== "object" || typeof dependency.workstream !== "string" || !dependency.workstream.trim()
+          || typeof dependency.projectSlug !== "string" || !store.getProject(dependency.projectSlug)) {
+          throw new Error(`Invalid source dependency for '${workstream}'`);
+        }
+        return { workstream: dependency.workstream.trim(), projectSlug: dependency.projectSlug };
+      });
+      if (new Set(sourceDependencies.map((dependency) => `${dependency.projectSlug}\0${semanticSlug(dependency.workstream)}`)).size !== sourceDependencies.length) {
+        throw new Error(`Duplicate source dependency for '${workstream}'`);
+      }
+    }
+    return { workstream, projectSlug: item.projectSlug, issues: [...item.issues],
+      ...(item.order === undefined ? {} : { order: item.order.trim() }),
+      ...(item.status === undefined ? {} : { status: item.status }),
+      ...(changeSet === undefined ? {} : { changeSet }),
+      ...(sourceDependencies === undefined ? {} : { sourceDependencies }) };
+  });
+  for (const item of items) for (const dependency of item.sourceDependencies ?? []) {
+    const target = items.find((candidate) => candidate.projectSlug === dependency.projectSlug
+      && semanticSlug(candidate.workstream) === semanticSlug(dependency.workstream));
+    if (!target || target === item) throw new Error(`Source dependency for '${item.workstream}' references an unknown or identical workstream`);
+  }
+  if (mapped.size !== changeSets.length) throw new Error("Every selected ChangeSet must map to one planning workstream");
+  const unresolved = input.unresolved.map((entry) => {
+    if (!entry || typeof entry !== "object" || typeof entry.workstream !== "string" || !entry.workstream.trim()
+      || typeof entry.statement !== "string" || !entry.statement.trim()) throw new Error("Unresolved planning statements need a workstream and description");
+    if (typeof entry.projectSlug !== "string") throw new Error("Unresolved planning statements need a Project");
+    const workstream = entry.workstream.trim();
+    const item = items.find((candidate) => candidate.projectSlug === entry.projectSlug
+      && semanticSlug(candidate.workstream) === semanticSlug(workstream));
+    if (!item) throw new Error(`Unresolved statement references unknown planning workstream '${workstream}'`);
+    if (item.changeSet) throw new Error(`Unresolved workstream '${workstream}' must not be selected for execution`);
+    return { workstream, projectSlug: entry.projectSlug, statement: entry.statement.trim() };
+  });
+  return { items, unresolved };
+}
+
 function proposalFingerprint(graph: ObjectiveGraph, projects: readonly Project[]): string {
   return JSON.stringify({
     projects: projects.map(({ slug, path, baseRemote, pushRemote, defaultBranch }) => ({ slug, path, baseRemote, pushRemote, defaultBranch })),
     changeSets: graph.changeSets.map((item) => ({ id: item.id, name: changeName(item), projectSlug: item.projectSlug,
       issues: item.issues, generation: item.generation, delivery: item.delivery, targetBranch: item.targetBranch })),
     branches: graph.branches, relations: graph.relations, relationNames: graph.relationNames,
-    unresolved: graph.unresolved, cycle: graph.cycle, runnableImmediately: graph.runnableImmediately,
+    unresolved: graph.unresolved, planning: graph.planning, cycle: graph.cycle, runnableImmediately: graph.runnableImmediately,
   });
 }
 
@@ -354,6 +456,14 @@ export class MainOrchestrator {
     return this.#withStore((store) => store.listProjects());
   }
 
+  async presentPlanningContext(input: ObjectivePlanningContext): Promise<ObjectivePlanningContext> {
+    return this.#withStore((store) => {
+      const planning = normalizePlanningContext(input, store, new Map(), []);
+      this.#proposals.clear();
+      return planning;
+    });
+  }
+
   async discoverIssues(projectSlug: string): Promise<GitHubIssue[]> {
     const project = await this.#withStore((store) => {
       const registered = store.getProject(projectSlug);
@@ -566,6 +676,9 @@ export class MainOrchestrator {
         state: "Planned", priority: input.priority ?? "normal", readySince: null, blockedReason: null, blockedResumeState: null };
     });
 
+    const planning = "changeSets" in input && input.planning
+      ? normalizePlanningContext(input.planning, store, namesToIds, changeSets) : undefined;
+
     const explicitRelations: Relation[] = [];
     const seenExplicitRelations = new Set<string>();
     for (const edge of requestedRelations) {
@@ -624,7 +737,8 @@ export class MainOrchestrator {
     return { projects, issueScopes, approvedIssueScopes, issueRows, automaticRelations, explicitRelations,
       graph: { changeSets, branches: Object.fromEntries(changeSets.map((item) => [item.id,
         store.getChangeSetRuntime(item.id)?.branchName ?? (item.issues.length ? branchName(issueRows.get(`${item.projectSlug}\0${issueNumbers(item)[0]}`)!, item.slug) : `chore/${item.slug}`)])),
-        relations: effective, relationNames, unresolved, cycle: findRequiresCycle(effective), runnableImmediately } };
+        relations: effective, relationNames, unresolved, ...(planning ? { planning } : {}),
+        cycle: findRequiresCycle(effective), runnableImmediately } };
   }
 
   startObjective(input: NamedObjectiveStartInput, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }>;

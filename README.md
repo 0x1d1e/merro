@@ -84,9 +84,26 @@ Add a settings screen to my local app.
 Do these two objectives in parallel.
 Show me current status.
 Open a PR for this change instead of delivering locally.
+Use ROADMAP.md to propose the next implementation stage.
 ```
 
 Issue-based work needs authenticated GitHub CLI (`gh auth login`). Plain local goals do not need GitHub issues or a remote. Main handles scheduling; normal use needs no graph language or internal identifiers.
+
+### Plan from Markdown
+
+Ask Main to use a roadmap file or paste a Markdown table:
+
+```markdown
+| Order | Workstream | Issues | Depends on |
+|---|---|---|---|
+| 1A | Provider primitives | #159 + #160 | |
+| 1B | Admin API | #105 | |
+| 2A | CLI contract | #101 + #103 | 1A |
+```
+
+Main presents a proposal with issue groups, order, statuses, dependencies, parallel work and any unresolved wording. Ambiguous text is not turned into a dependency. Done, parked and future work remain context, not executable work. Nothing starts before approval.
+
+After approval, Merro's durable ChangeSets and Relations control execution. Editing the roadmap has no effect; explicitly ask Main to update or re-plan before a changed roadmap can be used.
 
 ## Markdown customization
 
@@ -102,9 +119,9 @@ Issue-based work needs authenticated GitHub CLI (`gh auth login`). Plain local g
 
 Edit the generated templates. `WORKSPACE.md` holds goals, constraints, conventions, and Project relationships. Role files guide implementation or review. `projects/<name>.md` holds Project-specific context.
 
-Guidance precedence is current user instruction, Project instructions, workspace instructions, then Merro defaults. Approval, scope, verification, fresh review, result validation, and worker ownership remain non-overridable safety rules. Repository `AGENTS.md` still applies.
+Guidance precedence is current user instruction and approved ChangeSet requirements, Project Markdown, workspace Markdown, then Merro defaults. Role Markdown adds workspace-level instructions for that role. Approval, scope, verification, fresh review, result validation, and worker ownership remain non-overridable safety rules. Repository `AGENTS.md` still applies.
 
-Main reads Markdown each turn; fresh Workers receive the applicable instructions. Edits affect future attempts, never steer active Workers.
+Main reads customization Markdown each turn; fresh Workers receive the applicable instructions. Edits affect future attempts, never steer active Workers.
 
 Machine settings belong in the optional overrides in `config.json`, not prompts or review policy. For example:
 
