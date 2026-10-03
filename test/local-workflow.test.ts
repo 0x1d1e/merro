@@ -1,15 +1,15 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import test from "node:test";
 import { DEFAULT_CONFIG, validateConfig } from "../src/config.js";
-import { initializeWorkspace } from "../src/runtime/workspace.js";
 import { systemCommandRunner } from "../src/runtime/commands.js";
 import { MainOrchestrator } from "../src/runtime/main.js";
-import { GitClient } from "../src/vcs/git.js";
-import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import type { WorkerLaunchInput } from "../src/runtime/worker-runtime.js";
+import { initializeWorkspace } from "../src/runtime/workspace.js";
+import { type MainToolAPI, registerMainTools } from "../src/tools/main.js";
+import { GitClient } from "../src/vcs/git.js";
 
 const initCommands = { async run(file: string, args: readonly string[]) {
   if (file === "pi") return { stdout: args[0] === "--version" ? "1.0.0" : "--tui-mode", stderr: "" };
@@ -85,11 +85,12 @@ test("remote registration clones into configured workspace paths without GitHub 
   await assert.rejects(linked.addProject(remote, "escape"), /must not be a symlink/);
 });
 
-for (const scenario of ["remote-free", "with-remote", "base-moved", "approval-base-moved", "requirements-restart", "dirty-target", "merge-declined", "branch-switch-during-final-fetch"] as const) {
+for (const scenario of ["remote-free", "with-remote", "base-moved", "approval-base-moved", "requirements-restart", "dirty-target", "merge-declined", "branch-switch-during-final-fetch", "branch-switch-during-ref-update", "head-lock-during-final-fetch", "tracked-edit-after-ref-update", "read-tree-fails"] as const) {
 test(`tool flow approves, implements, reviews and delivers locally without gh: ${scenario}`, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-local-flow-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = await repository(root);
+  const initialBase = await source.git("rev-parse", "HEAD");
   if (scenario === "with-remote") await source.git("remote", "add", "origin", "https://github.invalid/example/app.git");
   const workspace = join(root, "workspace");
   await mkdir(workspace);
@@ -99,18 +100,41 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   const launches: WorkerLaunchInput[] = [];
   let implementationAttempts = 0;
   let switchedDuringFinalFetch = false;
+  let switchRejectedDuringRefUpdate = false;
+  let headLockCreated = false;
+  let editedAfterRefUpdate = false;
   const deliveryGit = new GitClient({ async run(file, args, commandOptions) {
+    if (scenario === "read-tree-fails" && file === "git" && commandOptions?.cwd === source.path && args[0] === "read-tree") {
+      throw new Error("Injected checkout synchronization failure");
+    }
+    if (scenario === "branch-switch-during-ref-update" && file === "git" && commandOptions?.cwd === source.path && args.includes("update-ref")) {
+      try {
+        await systemCommandRunner.run("git", ["switch", "-c", "other"], { cwd: source.path });
+      } catch {
+        switchRejectedDuringRefUpdate = true;
+      }
+    }
     const output = await systemCommandRunner.run(file, args, commandOptions);
-    if (scenario === "branch-switch-during-final-fetch" && !switchedDuringFinalFetch
-      && file === "git" && commandOptions?.cwd === source.path && args[0] === "fetch"
+    if (file === "git" && commandOptions?.cwd === source.path && args[0] === "fetch"
       && args[args.indexOf("--") + 1] === launches[0]?.clonePath) {
-      await systemCommandRunner.run("git", ["switch", "-c", "other"], { cwd: source.path });
-      switchedDuringFinalFetch = true;
+      if (scenario === "branch-switch-during-final-fetch" && !switchedDuringFinalFetch) {
+        await systemCommandRunner.run("git", ["switch", "-c", "other"], { cwd: source.path });
+        switchedDuringFinalFetch = true;
+      }
+      if (scenario === "head-lock-during-final-fetch" && !headLockCreated) {
+        await writeFile(join(source.path, ".git", "HEAD.lock"), "external Git lock\n");
+        headLockCreated = true;
+      }
+    }
+    if (scenario === "tracked-edit-after-ref-update" && !editedAfterRefUpdate
+      && file === "git" && commandOptions?.cwd === source.path && args.includes("update-ref")) {
+      await writeFile(join(source.path, "file.txt"), "concurrent edit\n");
+      editedAfterRefUpdate = true;
     }
     return output;
   } });
   const options = {
-    ...(scenario === "branch-switch-during-final-fetch" ? { git: deliveryGit } : {}),
+    ...(["branch-switch-during-final-fetch", "branch-switch-during-ref-update", "head-lock-during-final-fetch", "tracked-edit-after-ref-update", "read-tree-fails"].includes(scenario) ? { git: deliveryGit } : {}),
     workspacePath: workspace, config: scenario === "with-remote" ? validateConfig({ worktreesDir: "scratch/changes", git: { defaultDelivery: "local" }, tmux: { session: "work" } }) : { ...DEFAULT_CONFIG },
     github: new Proxy({}, { get(_target, name) { return () => { throw new Error(`GitHub must not be called: ${String(name)}`); }; } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>,
     workers: {
@@ -224,12 +248,41 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     assert.equal(switchedDuringFinalFetch, true);
     assert.doesNotMatch(approval.content[0]?.text ?? "", /Applied locally/);
     assert.equal(await source.git("branch", "--show-current"), "other");
-    assert.equal(await source.git("rev-parse", "refs/heads/main"), await source.git("rev-parse", "refs/heads/other"));
-    assert.equal(await source.git("rev-parse", "refs/heads/main"), await source.git("rev-parse", "HEAD"));
+    assert.equal(await source.git("rev-parse", "refs/heads/main"), initialBase);
+    assert.equal(await source.git("rev-parse", "refs/heads/other"), initialBase);
+    assert.equal(await source.git("rev-parse", "HEAD"), initialBase);
+    assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
     assert.equal((await main.statusSnapshot()).changeSets[0]!.state, "Blocked");
     assert.equal((await main.statusSnapshot()).decisions.length, 0);
     return;
   }
+  if (scenario === "head-lock-during-final-fetch") {
+    assert.equal(headLockCreated, true);
+    await rm(join(source.path, ".git", "HEAD.lock"), { force: true });
+    assert.doesNotMatch(approval.content[0]?.text ?? "", /Applied locally/);
+    assert.equal(await source.git("rev-parse", "refs/heads/main"), initialBase);
+    assert.equal(await source.git("rev-parse", "HEAD"), initialBase);
+    assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
+    assert.equal((await main.statusSnapshot()).changeSets[0]!.state, "Blocked");
+    assert.equal((await main.statusSnapshot()).decisions.length, 0);
+    return;
+  }
+  if (scenario === "tracked-edit-after-ref-update" || scenario === "read-tree-fails") {
+    if (scenario === "tracked-edit-after-ref-update") {
+      assert.equal(editedAfterRefUpdate, true);
+      assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "concurrent edit\n");
+    } else {
+      assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
+    }
+    assert.doesNotMatch(approval.content[0]?.text ?? "", /Applied locally/);
+    assert.equal(await source.git("branch", "--show-current"), "main");
+    assert.equal(await source.git("rev-parse", "refs/heads/main"), await source.git("rev-parse", "HEAD"));
+    assert.equal((await main.statusSnapshot()).changeSets[0]!.state, "Blocked");
+    assert.equal((await main.statusSnapshot()).objectives[0]!.state, "Active");
+    assert.equal((await main.statusSnapshot()).decisions.length, 0);
+    return;
+  }
+  if (scenario === "branch-switch-during-ref-update") assert.equal(switchRejectedDuringRefUpdate, true);
   assert.match(approval.content[0]?.text ?? "", /Applied locally: requested-change · main/);
   assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), scenario === "requirements-restart" ? "updated\n" : "implemented\n");
   assert.equal(await source.git("branch", "--show-current"), "main");

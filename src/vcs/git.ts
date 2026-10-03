@@ -1,9 +1,9 @@
-import { chmod, lstat, mkdir, open, readdir, rename, rm, type FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
+import { chmod, type FileHandle, lstat, mkdir, open, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { BaseUpdate, Project } from "../domain/model.js";
 import { assertProjectSlug } from "../domain/project.js";
-import { CommandError, systemCommandRunner, type CommandRunner } from "../runtime/commands.js";
+import { CommandError, type CommandRunner, systemCommandRunner } from "../runtime/commands.js";
 
 export interface ChangeSetClone {
   path: string;
@@ -134,71 +134,118 @@ export class GitClient {
     const inspected = await this.inspectLocalDelivery(project, path, targetBranch, reviewedCommit, expectedBase);
     if ("baseUpdate" in inspected) return inspected;
     if (expectedDiffHash && inspected.diffHash !== expectedDiffHash) throw new Error("Local reviewed diff changed before merge approval");
-    if (await this.currentCommit(project.path) !== expectedBase) {
-      return { baseUpdate: { baseRefName: targetBranch, baseCommit: await this.currentCommit(project.path) } };
-    }
     await this.#run("git", ["fetch", "--no-tags", "--", path, reviewedCommit], { cwd: project.path });
 
-    const targetRef = `refs/heads/${targetBranch}`;
-    const checkedOutBranch = (await this.#run("git", ["branch", "--show-current"], { cwd: project.path })).stdout.trim();
-    if (checkedOutBranch !== targetBranch) throw new Error(`Local delivery needs ${targetBranch} checked out in Project ${project.slug}`);
-    const targetBase = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
-    if (targetBase !== expectedBase) return { baseUpdate: { baseRefName: targetBranch, baseCommit: targetBase } };
-    if (await this.currentCommit(project.path) !== expectedBase) throw new Error("Local target changed during delivery; reconcile before retrying");
-    if ((await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: project.path })).stdout) {
-      throw new Error("Local delivery needs clean working copies; commit or stash unrelated changes first");
-    }
-
-    // Compare-and-swap the approved ref, never whichever branch happens to be checked out.
+    const releaseCheckout = await this.#lockLocalCheckout(project.path);
     try {
-      await this.#run("git", ["update-ref", "--no-deref", targetRef, reviewedCommit, expectedBase], { cwd: project.path });
-    } catch (error) {
-      const currentBase = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
-      if (currentBase !== expectedBase) return { baseUpdate: { baseRefName: targetBranch, baseCommit: currentBase } };
-      throw error;
+      // Repeat all approval checks after fetching, while Git branch changes are excluded.
+      const finalInspection = await this.inspectLocalDelivery(project, path, targetBranch, reviewedCommit, expectedBase);
+      if ("baseUpdate" in finalInspection) return finalInspection;
+      if (expectedDiffHash && finalInspection.diffHash !== expectedDiffHash) {
+        throw new Error("Local reviewed diff changed before merge approval");
+      }
+
+      const targetRef = `refs/heads/${targetBranch}`;
+      const checkedOutBranch = (await this.#run("git", ["branch", "--show-current"], { cwd: project.path })).stdout.trim();
+      if (checkedOutBranch !== targetBranch) throw new Error(`Local delivery needs ${targetBranch} checked out in Project ${project.slug}`);
+      const targetBase = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
+      if (targetBase !== expectedBase) return { baseUpdate: { baseRefName: targetBranch, baseCommit: targetBase } };
+      if (await this.currentCommit(project.path) !== expectedBase) throw new Error("Local target changed during delivery; reconcile before retrying");
+      if ((await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: project.path })).stdout) {
+        throw new Error("Local delivery needs clean working copies; commit or stash unrelated changes first");
+      }
+
+      // Compare-and-swap the approved ref while protecting the canonical checkout.
+      try {
+        await this.#updateRefWithCheckoutLocked(project.path, targetRef, reviewedCommit, expectedBase);
+      } catch (error) {
+        const currentBase = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
+        if (currentBase !== expectedBase) return { baseUpdate: { baseRefName: targetBranch, baseCommit: currentBase } };
+        throw error;
+      }
+      await this.#syncCheckedOutLocalTarget(project.path, targetBranch, expectedBase, reviewedCommit);
+      await this.#verifySynchronizedLocalTarget(project.path, targetBranch, reviewedCommit);
+      const deliveredRef = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
+      if (deliveredRef !== reviewedCommit) throw new Error("Approved local target ref changed during delivery; reconcile before retrying");
+      return { commit: reviewedCommit };
+    } finally {
+      await releaseCheckout();
     }
-    await this.#syncCheckedOutLocalTarget(project.path, targetBranch, expectedBase, reviewedCommit);
-    const deliveredRef = (await this.#run("git", ["rev-parse", "--verify", `${targetRef}^{commit}`], { cwd: project.path })).stdout.trim();
-    if (deliveredRef !== reviewedCommit) throw new Error("Approved local target ref changed during delivery; reconcile before retrying");
-    return { commit: reviewedCommit };
   }
 
-  async #syncCheckedOutLocalTarget(path: string, targetBranch: string, baseCommit: string, reviewedCommit: string): Promise<void> {
+  async #updateRefWithCheckoutLocked(path: string, targetRef: string, reviewedCommit: string, expectedBase: string): Promise<void> {
+    const commonDir = (await this.#run("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: path })).stdout.trim();
+    const detachedGitDir = join(commonDir, `.merro-ref-update-${randomUUID()}`);
+    await mkdir(detachedGitDir);
+    try {
+      // A detached per-command HEAD lets update-ref change the checked-out branch
+      // without trying to acquire the canonical checkout's already-held HEAD.lock.
+      await writeFile(join(detachedGitDir, "HEAD"), `${expectedBase}\n`, { flag: "wx", mode: 0o600 });
+      await writeFile(join(detachedGitDir, "commondir"), `${commonDir}\n`, { flag: "wx", mode: 0o600 });
+      await this.#run("git", ["--git-dir", detachedGitDir, "update-ref", "--no-deref", targetRef, reviewedCommit, expectedBase], { cwd: path });
+    } finally {
+      await rm(detachedGitDir, { recursive: true, force: true });
+    }
+  }
+
+  async #lockLocalCheckout(path: string): Promise<() => Promise<void>> {
     const headPath = (await this.#run("git", ["rev-parse", "--path-format=absolute", "--git-path", "HEAD"], { cwd: path })).stdout.trim();
     const lockPath = `${headPath}.lock`;
     let lock: FileHandle;
     try {
       lock = await open(lockPath, "wx", 0o600);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error("Local delivery cannot protect the canonical checkout because Git HEAD is locked; retry after Git finishes");
+      }
       throw error;
     }
-    try {
-      const branch = (await this.#run("git", ["branch", "--show-current"], { cwd: path })).stdout.trim();
-      if (branch !== targetBranch || await this.currentCommit(path) !== reviewedCommit) return;
-      const baseTree = (await this.#run("git", ["rev-parse", "--verify", `${baseCommit}^{tree}`], { cwd: path })).stdout.trim();
-      const indexTree = (await this.#run("git", ["write-tree"], { cwd: path })).stdout.trim();
-      const untracked = (await this.#run("git", ["ls-files", "--others", "--exclude-standard"], { cwd: path })).stdout;
-      let worktreeChanged = false;
+    return async () => {
       try {
-        await this.#run("git", ["diff", "--quiet", "--"], { cwd: path });
-      } catch (error) {
-        if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
-        worktreeChanged = true;
-      }
-      if (indexTree !== baseTree || worktreeChanged || untracked) return;
-      try {
-        await this.#run("git", ["read-tree", "-m", "-u", reviewedCommit], { cwd: path });
-      } catch (error) {
-        // The approved branch ref is authoritative; don't overwrite concurrent checkout edits.
-        if (!(error instanceof CommandError) || error.exitCode !== 128) throw error;
-      }
-    } finally {
-      try {
-        await lock.close();
-      } finally {
+        // Unlink while still holding the inode so a new Git lock is never removed accidentally.
         await rm(lockPath, { force: true });
+      } finally {
+        await lock.close();
       }
+    };
+  }
+
+  async #syncCheckedOutLocalTarget(path: string, targetBranch: string, baseCommit: string, reviewedCommit: string): Promise<void> {
+    const branch = (await this.#run("git", ["branch", "--show-current"], { cwd: path })).stdout.trim();
+    if (branch !== targetBranch || await this.currentCommit(path) !== reviewedCommit) {
+      throw new Error("Canonical checkout changed before local delivery synchronization");
+    }
+    const baseTree = (await this.#run("git", ["rev-parse", "--verify", `${baseCommit}^{tree}`], { cwd: path })).stdout.trim();
+    const indexTree = (await this.#run("git", ["write-tree"], { cwd: path })).stdout.trim();
+    const untracked = (await this.#run("git", ["ls-files", "--others", "--exclude-standard"], { cwd: path })).stdout;
+    let worktreeChanged = false;
+    try {
+      await this.#run("git", ["diff", "--quiet", "--"], { cwd: path });
+    } catch (error) {
+      if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
+      worktreeChanged = true;
+    }
+    if (indexTree !== baseTree || worktreeChanged || untracked) {
+      throw new Error("Canonical checkout changed during local delivery; refusing to overwrite edits");
+    }
+    await this.#run("git", ["read-tree", "-m", "-u", reviewedCommit], { cwd: path });
+  }
+
+  async #verifySynchronizedLocalTarget(path: string, targetBranch: string, reviewedCommit: string): Promise<void> {
+    const branch = (await this.#run("git", ["branch", "--show-current"], { cwd: path })).stdout.trim();
+    if (branch !== targetBranch) throw new Error(`Local delivery needs ${targetBranch} checked out in the canonical Project checkout`);
+    if (await this.currentCommit(path) !== reviewedCommit) throw new Error("Canonical checkout HEAD does not match the reviewed commit after synchronization");
+    const reviewedTree = (await this.#run("git", ["rev-parse", "--verify", `${reviewedCommit}^{tree}`], { cwd: path })).stdout.trim();
+    const indexTree = (await this.#run("git", ["write-tree"], { cwd: path })).stdout.trim();
+    if (indexTree !== reviewedTree) throw new Error("Canonical checkout index does not match the reviewed commit after synchronization");
+    if ((await this.#run("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: path })).stdout) {
+      throw new Error("Canonical checkout is not clean after local delivery synchronization");
+    }
+    try {
+      await this.#run("git", ["diff", "--quiet", "HEAD", "--"], { cwd: path });
+    } catch (error) {
+      if (!(error instanceof CommandError) || error.exitCode !== 1) throw error;
+      throw new Error("Canonical checkout files do not match the reviewed commit after synchronization");
     }
   }
 
