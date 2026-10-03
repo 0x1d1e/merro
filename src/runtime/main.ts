@@ -93,6 +93,10 @@ const emptyRuntime = (changeSetId: string): ChangeSetRuntimeRecord => ({
 
 type ObjectiveGraph = Omit<ObjectiveProposal, "id" | "workerSettings">;
 
+function relationKey(relation: Relation): string {
+  return `${relation.kind}\0${relation.from}\0${relation.to}`;
+}
+
 function proposalFingerprint(graph: ObjectiveGraph, projects: readonly Project[]): string {
   return JSON.stringify({
     projects: projects.map(({ slug, path, baseRemote, pushRemote, defaultBranch }) => ({ slug, path, baseRemote, pushRemote, defaultBranch })),
@@ -605,14 +609,15 @@ export class MainOrchestrator {
   async startObjective(input: ObjectiveRequest, proposalId?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
     if (!input.goal.trim()) throw new Error("Objective goal must not be empty");
     return this.#withStore(async (store) => {
-      const { projects, approvedIssueScopes, issueRows, graph, automaticRelations, explicitRelations } = await this.#prepareObjective(store, input);
+      const { projects, approvedIssueScopes, graph, automaticRelations, explicitRelations } = await this.#prepareObjective(store, input);
       if (proposalId !== undefined) {
         const proposal = this.#proposals.get(proposalId);
         if (!proposal || proposal.input !== JSON.stringify(input) || proposal.graph !== proposalFingerprint(graph, projects)) {
           throw new Error("Objective proposal changed or expired. Run merro_propose_objective and obtain approval again.");
         }
-        this.#proposals.delete(proposalId);
       }
+      await this.#validateNewExplicitRelations(store, graph.changeSets, graph.relations, explicitRelations);
+      if (proposalId !== undefined) this.#proposals.delete(proposalId);
 
       const objective: Objective = {
         id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
@@ -628,6 +633,12 @@ export class MainOrchestrator {
         store.attachChangeSet(objective.id, planned.id);
         const item = store.getChangeSet(planned.id)!;
         this.#names.set(item.id, changeName(item));
+        const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
+        if (!runtime.branchName) {
+          const approvedBranch = graph.branches[item.id];
+          if (!approvedBranch) throw new Error(`Approved branch is missing for ${changeName(item)}`);
+          store.saveChangeSetRuntime({ ...runtime, branchName: approvedBranch });
+        }
         if (priorityRank(objective.priority) < priorityRank(item.priority)) store.setChangeSetPriority(item.id, objective.priority);
         items.push(store.getChangeSet(item.id)!);
       }
@@ -1330,6 +1341,41 @@ export class MainOrchestrator {
     runtime.lastIssueState = "OPEN";
     store.saveChangeSetRuntime(runtime);
     this.#notify(`Reopened issue #${issue.number} created ChangeSet generation ${generation}.`);
+  }
+
+  async #validateNewExplicitRelations(
+    store: MerroStore,
+    planned: readonly ChangeSet[],
+    effective: readonly Relation[],
+    explicit: readonly Relation[],
+  ): Promise<void> {
+    const existing = new Set(store.listRelations().map(relationKey));
+    const explicitKeys = new Set(explicit.map(relationKey));
+    const additions = effective.filter((relation) => explicitKeys.has(relationKey(relation)) && !existing.has(relationKey(relation)));
+    if (!additions.length) return;
+
+    const { unsafeProjects, changeSetIds } = await this.#workerSafetyPreflight(store);
+    const changeSetsById = new Map([...store.listChangeSets(), ...planned].map((item) => [item.id, item]));
+    const occupied = new Set([
+      ...changeSetIds,
+      ...store.listTasks().filter((task) => task.status === "active").map((task) => task.changeSetId),
+    ]);
+    for (const relation of additions) {
+      const from = changeSetsById.get(relation.from);
+      const to = changeSetsById.get(relation.to);
+      if (!from || !to) throw new Error("Cannot approve a relation with an unknown ChangeSet");
+      for (const item of [from, to]) {
+        if (unsafeProjects.has(item.projectSlug)) {
+          throw new Error(`Cannot approve a new relation involving ${changeName(item)}: Worker safety is unverified in Project ${item.projectSlug}. Inspect Workers and retry.`);
+        }
+      }
+      if (relation.kind === "Conflicts" && occupied.has(from.id) && occupied.has(to.id)) {
+        throw new Error(`Cannot approve Conflicts between ${changeName(from)} and ${changeName(to)} while both have active Workers; retry after the Workers safely exit.`);
+      }
+      if (relation.kind === "Requires" && occupied.has(from.id) && to.state !== "Done") {
+        throw new Error(`Cannot approve Requires for ${changeName(from)} while its Worker is active and prerequisite ${changeName(to)} is not Done; retry after the Worker exits or the prerequisite completes.`);
+      }
+    }
   }
 
   async #workerSafetyPreflight(store: MerroStore, unsafeProjects = new Set<string>()): Promise<{ unsafeProjects: Set<string>; count: number; changeSetIds: Set<string>; liveTaskIds: Set<string> }> {

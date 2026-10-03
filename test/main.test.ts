@@ -339,6 +339,129 @@ test("named Objective displays and approves a cross-Project dependency graph", a
   assert.deepEqual(harness.launches.map((input) => input.changeSetId).sort(), ["reference:issue-74:g1", "runtime:issue-159:g1"]);
 });
 
+test("approved branch stays frozen when issue labels change before the first launch", async (t) => {
+  const harness = await createHarness(t);
+  const input: NamedObjectiveStartInput = {
+    goal: "Freeze the approved branch",
+    changeSets: [{ name: "frozen-change", projectSlug: "example", issues: [7] }],
+  };
+  const proposal = await harness.main.proposeObjective(input);
+  const changeSet = proposal.changeSets[0];
+  assert.ok(changeSet);
+  assert.equal(proposal.branches[changeSet.id], "feat/frozen-change");
+  await harness.main.startObjective(input, proposal.id);
+  const approvedStore = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.equal(approvedStore.getChangeSetRuntime(changeSet.id)?.branchName, "feat/frozen-change"); }
+  finally { approvedStore.close(); }
+
+  const issue = harness.issues.get("example:7");
+  assert.ok(issue);
+  issue.labels = ["bug"];
+  await harness.main.runPass();
+
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.equal(store.getChangeSetRuntime(changeSet.id)?.branchName, "feat/frozen-change"); }
+  finally { store.close(); }
+  assert.equal(harness.launches.length, 1);
+});
+
+test("approval rejects a new Conflicts relation between active shared Workers", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [1, 2] }],
+    result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+    ownedWorkers: async (project) => workers.filter((worker) => worker.projectSlug === project.slug),
+  });
+  const changes = [
+    { name: "first", projectSlug: "example", issues: [1] },
+    { name: "second", projectSlug: "example", issues: [2] },
+  ];
+  await harness.main.startObjective({ goal: "Start independent work", changeSets: changes });
+  await harness.main.runPass();
+  workers.push(...harness.launches.map((launch) => ({ taskId: launch.taskId, projectSlug: launch.project.slug,
+    changeSetId: launch.changeSetId, clonePath: launch.clonePath, tmuxSession: null, tmuxWindow: null,
+    paneId: null, containerId: null })));
+  assert.equal(workers.length, 2);
+
+  const input: NamedObjectiveStartInput = { goal: "Serialize shared work", changeSets: changes,
+    relations: [{ kind: "Conflicts", from: "first", to: "second" }] };
+  const proposal = await harness.main.proposeObjective(input);
+  await assert.rejects(harness.main.startObjective(input, proposal.id), /Conflicts.*Worker|Worker.*Conflicts/i);
+
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    assert.equal(store.listRelations().length, 0);
+    assert.equal(store.listObjectives().length, 1);
+  } finally { store.close(); }
+  assert.equal((await harness.main.statusSnapshot()).tasks.filter((task) => task.status === "active").length, 2);
+});
+
+test("approval can add Conflicts while only one endpoint has an active Worker", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [1, 2] }],
+    maxConcurrentTasks: 1,
+    result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+    ownedWorkers: async (project) => workers.filter((worker) => worker.projectSlug === project.slug),
+  });
+  const changes = [
+    { name: "first", projectSlug: "example", issues: [1] },
+    { name: "second", projectSlug: "example", issues: [2] },
+  ];
+  await harness.main.startObjective({ goal: "Start independent work", changeSets: changes });
+  await harness.main.runPass();
+  workers.push(...harness.launches.map((launch) => ({ taskId: launch.taskId, projectSlug: launch.project.slug,
+    changeSetId: launch.changeSetId, clonePath: launch.clonePath, tmuxSession: null, tmuxWindow: null,
+    paneId: null, containerId: null })));
+  assert.equal(workers.length, 1);
+
+  const input: NamedObjectiveStartInput = { goal: "Serialize shared work", changeSets: changes,
+    relations: [{ kind: "Conflicts", from: "first", to: "second" }] };
+  const proposal = await harness.main.proposeObjective(input);
+  await harness.main.startObjective(input, proposal.id);
+  await harness.main.runPass();
+
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.equal(store.listRelations()[0]?.kind, "Conflicts"); }
+  finally { store.close(); }
+  assert.equal(harness.launches.length, 1);
+  assert.equal((await harness.main.statusSnapshot()).tasks.filter((task) => task.status === "active").length, 1);
+});
+
+test("approval rejects a new Requires relation while its dependent Worker is active", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [1, 2] }],
+    result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+    ownedWorkers: async (project) => workers.filter((worker) => worker.projectSlug === project.slug),
+  });
+  const changes = [
+    { name: "prerequisite", projectSlug: "example", issues: [1] },
+    { name: "dependent", projectSlug: "example", issues: [2] },
+  ];
+  await harness.main.startObjective({ goal: "Start independent work", changeSets: changes });
+  await harness.main.runPass();
+  workers.push(...harness.launches.map((launch) => ({ taskId: launch.taskId, projectSlug: launch.project.slug,
+    changeSetId: launch.changeSetId, clonePath: launch.clonePath, tmuxSession: null, tmuxWindow: null,
+    paneId: null, containerId: null })));
+  assert.equal(workers.length, 2);
+
+  const input: NamedObjectiveStartInput = { goal: "Add a dependency", changeSets: changes,
+    relations: [{ kind: "Requires", from: "dependent", to: "prerequisite" }] };
+  const proposal = await harness.main.proposeObjective(input);
+  await assert.rejects(harness.main.startObjective(input, proposal.id), /Requires.*Worker|Worker.*Requires/i);
+
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    assert.equal(store.listRelations().length, 0);
+    assert.equal(store.listObjectives().length, 1);
+  } finally { store.close(); }
+  assert.equal((await harness.main.statusSnapshot()).tasks.filter((task) => task.status === "active").length, 2);
+});
+
 test("named proposal displays preserved external relations with semantic names", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "example", issueNumbers: [1, 2] }] });
   harness.issues.get("example:2")!.body = "Conflicts with #1.";
