@@ -327,5 +327,8 @@ ALTER TABLE task_runtime ADD COLUMN agent TEXT CHECK (agent IN ('pi', 'claude'))
 `;
 
 export const MIGRATION_22 = `
-ALTER TABLE objective_settings ADD COLUMN worker_settings_json TEXT;
+CREATE TABLE change_set_worker_settings (
+  work_item_id TEXT PRIMARY KEY REFERENCES work_items(id),
+  settings_json TEXT NOT NULL
+);
 `;

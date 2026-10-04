@@ -12,14 +12,14 @@ Merro reported its own orchestration: internal states, retry hints for Merro-own
 
 Public states are Working, Waiting, Needs you, Blocked and Done, derived from lifecycle state, dependencies and Decisions. Waiting carries a structured `waitingFor` (dependency, github_checks, github_review, github_availability, capacity, worker_exit) so ownership is explicit. Merro-owned conditions never show `Next:` or retry.
 
-Permanent notifications are reserved for conditions that need the user. Automatic recovery and waiting goes to the transient status line; permanent notifications are deduped per subject and re-arm when progress is reported for that subject. Diagnostics stay in `/merro <change>`; history is opt-in via `--history`.
+Permanent notifications are reserved for conditions that need the user. Automatic recovery and waiting goes to the transient status line; permanent notifications are deduped per subject and re-arm when progress is reported for that subject or a new block occurs. Diagnostics stay in `/merro <change>`; history is opt-in via `--history`.
 
-Approval is deterministic: the extension captures the raw user message from Pi's `input` event (ignoring extension-sourced input), and the approval tools read that, never a model-authored argument. Only exactly `approve` approves, and one reply authorizes one approval. Other input gets `Unknown choice` with the valid choices. `/merro approve` remains the escape hatch.
+Approval is deterministic: the extension captures the raw user message from Pi's `input` event (ignoring extension-sourced input), and the approval tools read that, never a model-authored argument. Only exactly `approve` approves, and one reply authorizes one approval. The reply must arrive after the plan or Decision it approves was shown; it is cleared at turn end and on extension input. Other input gets `Unknown choice` with the valid choices. `/merro approve` remains the escape hatch.
 
-Worker settings (model, thinking, runtime) are captured at plan proposal and the review-round limit is materialized at approval; both are persisted per Objective, so config hot reload affects only future plans. Concurrency, merge, notify and similar operational settings stay live.
+Worker settings (model, thinking, runtime) and the review-round limit are snapshotted at plan approval. Worker settings are persisted per ChangeSet and the first approval wins, so a ChangeSet shared by Objectives never switches settings when ownership changes. Config hot reload affects only future plans. Concurrency, merge, notify and similar operational settings stay live.
 
 Worker-proposed issues carry a persisted, monotonic number so `/merro issue approve N` never shifts after a dismissal.
 
 ## Consequences
 
-Approval tools gain no new parameters; `registerMainTools` requires a user-approval source. Schema version 22 adds `objective_settings.worker_settings_json`.
+Approval tools gain no new parameters; `registerMainTools` requires a user-approval source. Schema version 22 adds `change_set_worker_settings`.

@@ -3,7 +3,7 @@ import { parseObjectiveIssueScopes } from "../domain/objective.js";
 import { changeName, issueNumbers } from "../domain/names.js";
 import { interpretMarkdownRoadmap } from "../domain/markdown-planning.js";
 import { formatStatus, publicText } from "../runtime/presentation.js";
-import type { MainOrchestrator, NamedObjectiveStartInput, ObjectivePlanningContext, ObjectiveStartInput, RoadmapStatus } from "../runtime/main.js";
+import { StaleApprovalError, type MainOrchestrator, type NamedObjectiveStartInput, type ObjectivePlanningContext, type ObjectiveStartInput, type RoadmapStatus } from "../runtime/main.js";
 
 const empty = Type.Object({}, { additionalProperties: false });
 const deliveryMode = Type.Optional(Type.Union([Type.Literal("local"), Type.Literal("pr")], { description: "Default follows the Project checkout: PR for supported remotes, local merge when no supported remote exists. Override with local or pr." }));
@@ -202,14 +202,15 @@ function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | Na
  * model-authored tool argument, so a model cannot correct "approvve" into an approval.
  */
 export interface UserApprovalSource {
-  latest(): string | undefined;
+  /** `at` (epoch ms) lets Main refuse a reply that predates the plan or decision it would approve. */
+  latest(): { text: string; at: number } | undefined;
   /** Called once an approval is accepted so one user reply authorizes one approval. */
   consume(): void;
 }
 
 /** Approval is deterministic: only the exact word counts, so a typo can never start work or merge. */
-function approvalRefusal(reply: string | undefined): string | null {
-  const text = reply?.trim() ?? "";
+function approvalRefusal(reply: { text: string } | undefined): string | null {
+  const text = reply?.text.trim() ?? "";
   if (text.toLowerCase() === "approve") return null;
   const choice = text.toLowerCase();
   if (choice === "edit") return "Tell me what to change.";
@@ -321,10 +322,13 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator, appro
     } });
   pi.registerTool({ name: "merro_start_objective", label: "Approve plan", description: "Approve the single pending plan. Merro checks the user's own latest message; only exactly 'approve' starts work, never a corrected or inferred spelling. Optionally select by semantic change name; never ask for an identifier or repeat the plan parameters.", parameters: Type.Object({ change: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, args) {
-      const refusal = approvalRefusal(approvals.latest());
+      const reply = approvals.latest();
+      const refusal = approvalRefusal(reply);
       if (refusal) return result(refusal);
       approvals.consume();
-      const started = await main.approveObjective(typeof args.change === "string" ? args.change : undefined);
+      let started: Awaited<ReturnType<MainOrchestrator["approveObjective"]>>;
+      try { started = await main.approveObjective(typeof args.change === "string" ? args.change : undefined, { repliedAt: reply!.at }); }
+      catch (error) { if (error instanceof StaleApprovalError) return result(error.message); throw error; }
       await main.runPass();
       return result(`Working: ${started.changeSets.map(changeName).join(", ")}.`);
     } });
@@ -334,10 +338,14 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator, appro
   pi.registerTool({ name: "merro_resolve_decision", label: "Approve or leave open", description: "Approve or decline a pending PR or local merge decision. Approving requires the user's own latest message to be exactly 'approve'; never a corrected or inferred spelling. Infer a unique decision; approving an already merged change succeeds idempotently.",
     parameters: Type.Object({ change: Type.Optional(Type.String()), approved: Type.Boolean() }, { additionalProperties: false }),
     async execute(_id, args) {
-      const refusal = args.approved === true ? approvalRefusal(approvals.latest()) : null;
+      const reply = args.approved === true ? approvals.latest() : undefined;
+      const refusal = args.approved === true ? approvalRefusal(reply) : null;
       if (refusal) return result(refusal);
       if (args.approved === true) approvals.consume();
-      return result(await main.resolveDecisionForChange(typeof args.change === "string" ? args.change : undefined, args.approved === true));
+      try {
+        return result(await main.resolveDecisionForChange(typeof args.change === "string" ? args.change : undefined, args.approved === true,
+          reply ? { repliedAt: reply.at } : {}));
+      } catch (error) { if (error instanceof StaleApprovalError) return result(error.message); throw error; }
     } });
   pi.registerTool({ name: "merro_restart_change", label: "Restart attempt", description: "After explicit user approval of changed requirements, stop the current attempt and start a fresh implementer. Never send instructions to a running worker.",
     parameters: Type.Object({ change: Type.String(), requirements: Type.String() }, { additionalProperties: false }),

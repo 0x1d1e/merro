@@ -1,6 +1,7 @@
 import { changeName, issueNumbers } from "../domain/names.js";
 import type { BlockReason, ChangeSet, Task } from "../domain/model.js";
 import type { MerroStore } from "../store/store.js";
+import { currentlyReviewedIds } from "./reviewed.js";
 
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 const LEGACY = /\b[a-z0-9._-]+:(?:issue-\d+|(?:local|change):[^\s,)]+):g\d+\b/gi;
@@ -89,7 +90,7 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
   if (reason === "merge_rejected") return localDelivery
     ? { summary: "Local merge was declined; no changes were applied.", next: `Request approval again with /merro retry ${name}.` }
     : { summary: "The pull request was left open.", next: `Approve it later with /merro approve ${name}.` };
-  if (reason === "pr_closed") return { summary: "The pull request was closed without merging.", next: "Reopen it on GitHub; Merro continues automatically afterward." };
+  if (reason === "pr_closed") return { summary: "The pull request was closed without merging.", next: `Reopen it on GitHub, then /merro retry ${name}.` };
   if (reason === "review_cap") return { summary: "Review still found blocking issues after the allowed rounds.", next: `See /merro ${name} for findings; then /merro retry ${name} after fixing them.` };
   if (reason === "cycle") return { summary: "The approved changes depend on each other in a cycle.", next: "Update the Objective's dependencies before retrying." };
   if (reason === "task_failed") {
@@ -99,7 +100,7 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
     return { summary, next: `See /merro ${name} for details; then /merro retry ${name} after fixing the cause.` };
   }
   if (reason === "clone_lost") return { summary: "Merro could not find the working copy for this change.", next: `Restore the working copy, then /merro retry ${name}.` };
-  if (reason === "remote_branch_deleted") return { summary: "The pull request branch was deleted.", next: "Restore the branch on GitHub; Merro continues automatically afterward." };
+  if (reason === "remote_branch_deleted") return { summary: "The pull request branch was deleted.", next: `Restore the branch on GitHub, then /merro retry ${name}.` };
   if (reason === "merge_failed") return localDelivery
     ? { summary: oneLine(detail) || "Local delivery is blocked.", next: `Check the canonical checkout, then /merro retry ${name}.` }
     : { summary: `GitHub could not merge this pull request: ${oneLine(detail)}`, next: `Check the pull request, then /merro retry ${name} if needed.` };
@@ -159,11 +160,11 @@ export function workerName(item: ChangeSet, task: Pick<Task, "role">): string {
 }
 
 /** Default status contains only user-level state, decisions, and one-line context. */
-const REVIEWED_STATES: ReadonlySet<string> = new Set(["Reviewed", "Publishing", "AwaitingMerge", "AwaitingApproval", "AwaitingLocalMerge", "PublishBlocked", "Done"]);
-
 export interface PresentationOptions {
   /** Scheduler capacity; without it, capacity holds are not reported. */
   maxConcurrentTasks?: number | "unlimited";
+  /** Unverified live workers; like the scheduler, status counts them against capacity. */
+  orphanedTaskCount?: number;
 }
 
 export function presentWorkspace(store: MerroStore, options: PresentationOptions = {}) {
@@ -182,14 +183,10 @@ export function presentWorkspace(store: MerroStore, options: PresentationOptions
   const decisionByChange = new Map(decisionRows.map((decision) => [decision.change, decision]));
   const byId = new Map(items.map((item) => [item.id, item]));
   const requires = store.listRelations().filter((relation) => relation.kind === "Requires");
-  // Same gate semantics as the scheduler: a reviewed gate needs a passing review, a done gate needs Done.
-  const gateSatisfied = (required: ChangeSet, gate: "reviewed" | "done"): boolean => {
-    if (gate === "done") return required.state === "Done";
-    const reviewedState = REVIEWED_STATES.has(required.state)
-      || required.state === "Blocked" && required.blockedResumeState !== null && REVIEWED_STATES.has(required.blockedResumeState);
-    const latestReview = store.listTasks(required.id).filter((task) => task.role === "review").at(-1);
-    return reviewedState && latestReview?.outcome === "pass" && !!latestReview.reviewedCommit;
-  };
+  // Same gate semantics as the scheduler: a reviewed gate needs a current passing review, a done gate needs Done.
+  const reviewed = currentlyReviewedIds(store);
+  const gateSatisfied = (required: ChangeSet, gate: "reviewed" | "done"): boolean =>
+    gate === "done" ? required.state === "Done" : reviewed.has(required.id);
   const unfinished = (item: ChangeSet) => requires
     .filter((relation) => relation.from === item.id)
     .flatMap((relation) => {
@@ -197,7 +194,7 @@ export function presentWorkspace(store: MerroStore, options: PresentationOptions
       const gate = relation.gate ?? "done" as const;
       return required && !gateSatisfied(required, gate) ? [{ required, gate }] : [];
     });
-  const activeTaskCount = store.listTasks().filter((task) => task.status === "active").length;
+  const activeTaskCount = store.listTasks().filter((task) => task.status === "active").length + (options.orphanedTaskCount ?? 0);
   const atCapacity = options.maxConcurrentTasks !== undefined && options.maxConcurrentTasks !== "unlimited" && activeTaskCount >= options.maxConcurrentTasks;
   const waitingOn = (item: ChangeSet): string[] => unfinished(item)
     .map(({ required }) => required.projectSlug === item.projectSlug ? changeName(required) : `${changeName(required)} (${required.projectSlug})`);

@@ -541,23 +541,16 @@ export class MerroStore {
   }
 
   /** Snapshots worker runtime settings approved with an Objective so later config edits do not alter its work. */
-  saveObjectiveWorkerSettings(id: string, settings: WorkerSettings): void {
-    this.#db.prepare(`
-      INSERT INTO objective_settings(objective_id, worker_settings_json) VALUES (?, ?)
-      ON CONFLICT(objective_id) DO UPDATE SET worker_settings_json = excluded.worker_settings_json
-    `).run(id, JSON.stringify(settings));
+  /** First approval wins: a ChangeSet keeps the worker settings it was approved with, even when another Objective shares it. */
+  claimChangeSetWorkerSettings(changeSetId: string, settings: WorkerSettings): void {
+    this.#db.prepare("INSERT OR IGNORE INTO change_set_worker_settings(work_item_id, settings_json) VALUES (?, ?)")
+      .run(changeSetId, JSON.stringify(settings));
   }
 
-  /** Worker settings of the oldest active Objective that includes the ChangeSet, or null for pre-snapshot Objectives. */
-  objectiveWorkerSettings(changeSetId: string): WorkerSettings | null {
-    const row = this.#db.prepare(`
-      SELECT s.worker_settings_json FROM objective_work_items ow
-      JOIN objectives o ON o.id = ow.objective_id
-      JOIN objective_settings s ON s.objective_id = o.id
-      WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1 AND s.worker_settings_json IS NOT NULL
-      ORDER BY o.created_at, o.id LIMIT 1
-    `).get(changeSetId);
-    return row ? JSON.parse(String(row.worker_settings_json)) as WorkerSettings : null;
+  /** Null only for ChangeSets approved before settings were snapshotted. */
+  changeSetWorkerSettings(changeSetId: string): WorkerSettings | null {
+    const row = this.#db.prepare("SELECT settings_json FROM change_set_worker_settings WHERE work_item_id = ?").get(changeSetId);
+    return row ? JSON.parse(String(row.settings_json)) as WorkerSettings : null;
   }
 
   setObjectiveState(id: string, state: Objective["state"]): void {

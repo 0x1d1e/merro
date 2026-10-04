@@ -182,6 +182,26 @@ test("Main reads current workspace and registered Project Markdown each turn whi
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
 });
 
+test("only the user's own message in the current turn can approve", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "merro-approval-input-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await initializedState(cwd);
+  const startup = `import assert from 'node:assert/strict'; import merro from ${JSON.stringify(entrypoint)};
+    const tools=new Map(), events=new Map();
+    await merro({registerCommand(){},registerTool(tool){tools.set(tool.name,tool)},on(name,handler){events.set(name,handler)}});
+    const start=async()=>(await tools.get('merro_start_objective').execute('start',{reply:'approve'})).content[0].text;
+    const say=(text,source='interactive')=>assert.deepEqual(events.get('input')({text,source}),{action:'continue'});
+    say('approvve');
+    assert.equal(await start(),'Unknown choice: approvve\\nChoose: approve · edit · cancel');
+    say('approve'); say('Merro needs your attention','extension');
+    assert.match(await start(),/^Unknown choice: \\(empty\\)/);
+    say('approve'); events.get('agent_end')();
+    assert.match(await start(),/^Unknown choice: \\(empty\\)/);
+    say('approve');
+    await assert.rejects(start(),/No pending plan/);`;
+  await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
+});
+
 test("initialization works without Git installed", async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "merro-no-git-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));

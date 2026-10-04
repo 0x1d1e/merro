@@ -30,7 +30,7 @@ async function repository(root: string) {
   return { path, git };
 }
 
-const approveSource = { latest: () => "approve" as string | undefined, consume() {} };
+const approveSource = { latest: () => ({ text: "approve", at: Number.POSITIVE_INFINITY }), consume() {} };
 
 test("first init creates complete config and short templates; repeated init never repairs or validates dependencies", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-minimal-"));
