@@ -127,7 +127,7 @@ function publicStatus(
   if (decisionAction === "approve_fresh_attempt") return { status: "Needs you", reason: "merge conflicts", owner: "user", waitingFor: null };
   if (item.state === "AwaitingApproval" || reviewDecision?.toUpperCase() === "REVIEW_REQUIRED") return waiting({ kind: "github_review" }, "external");
   if (item.state === "AwaitingMerge" && checks.state !== "passed") return waiting({ kind: "github_checks" }, "external");
-  if ((item.state === "Ready" || item.state === "Planned") && dependency) return waiting(dependency, "merro");
+  if (dependency && (item.state === "Ready" || item.state === "Planned" || dependency.kind === "capacity")) return waiting(dependency, "merro");
   return { status: "Working", reason: null, owner: "merro", waitingFor: null };
 }
 
@@ -159,7 +159,14 @@ export function workerName(item: ChangeSet, task: Pick<Task, "role">): string {
 }
 
 /** Default status contains only user-level state, decisions, and one-line context. */
-export function presentWorkspace(store: MerroStore) {
+const REVIEWED_STATES: ReadonlySet<string> = new Set(["Reviewed", "Publishing", "AwaitingMerge", "AwaitingApproval", "AwaitingLocalMerge", "PublishBlocked", "Done"]);
+
+export interface PresentationOptions {
+  /** Scheduler capacity; without it, capacity holds are not reported. */
+  maxConcurrentTasks?: number | "unlimited";
+}
+
+export function presentWorkspace(store: MerroStore, options: PresentationOptions = {}) {
   const items = store.listChangeSets().filter((item) => item.state !== "Obsolete");
   const decisionRows = store.pendingDecisions().filter((decision) => decision.subjectType === "ChangeSet").map((decision) => {
     const payload = typeof decision.payload === "object" && decision.payload !== null ? decision.payload as Record<string, unknown> : {};
@@ -175,12 +182,23 @@ export function presentWorkspace(store: MerroStore) {
   const decisionByChange = new Map(decisionRows.map((decision) => [decision.change, decision]));
   const byId = new Map(items.map((item) => [item.id, item]));
   const requires = store.listRelations().filter((relation) => relation.kind === "Requires");
+  // Same gate semantics as the scheduler: a reviewed gate needs a passing review, a done gate needs Done.
+  const gateSatisfied = (required: ChangeSet, gate: "reviewed" | "done"): boolean => {
+    if (gate === "done") return required.state === "Done";
+    const reviewedState = REVIEWED_STATES.has(required.state)
+      || required.state === "Blocked" && required.blockedResumeState !== null && REVIEWED_STATES.has(required.blockedResumeState);
+    const latestReview = store.listTasks(required.id).filter((task) => task.role === "review").at(-1);
+    return reviewedState && latestReview?.outcome === "pass" && !!latestReview.reviewedCommit;
+  };
   const unfinished = (item: ChangeSet) => requires
     .filter((relation) => relation.from === item.id)
     .flatMap((relation) => {
       const required = byId.get(relation.to);
-      return required && required.state !== "Done" ? [{ required, gate: relation.gate ?? "done" as const }] : [];
+      const gate = relation.gate ?? "done" as const;
+      return required && !gateSatisfied(required, gate) ? [{ required, gate }] : [];
     });
+  const activeTaskCount = store.listTasks().filter((task) => task.status === "active").length;
+  const atCapacity = options.maxConcurrentTasks !== undefined && options.maxConcurrentTasks !== "unlimited" && activeTaskCount >= options.maxConcurrentTasks;
   const waitingOn = (item: ChangeSet): string[] => unfinished(item)
     .map(({ required }) => required.projectSlug === item.projectSlug ? changeName(required) : `${changeName(required)} (${required.projectSlug})`);
 
@@ -207,7 +225,9 @@ export function presentWorkspace(store: MerroStore) {
       const firstDependency = unfinished(item)[0];
       const dependency: WaitingFor | null = firstDependency
         ? { kind: "dependency", change: changeName(firstDependency.required), gate: firstDependency.gate } : null;
-      const { status: state, reason, owner, waitingFor } = publicStatus(item, blocked, runtime?.githubReviewDecision ?? null, decision?.action, checks, dependency);
+      const capacityHeld = atCapacity && !active && !dependency && (item.state === "Ready" || item.state === "Implementing");
+      const { status: state, reason, owner, waitingFor } = publicStatus(item, blocked, runtime?.githubReviewDecision ?? null, decision?.action, checks,
+        dependency ?? (capacityHeld ? { kind: "capacity" } : null));
       let summary: string;
       if (state === "Done") summary = item.delivery === "local" ? `Completed locally on ${item.targetBranch}` : runtime?.pullRequestNumber ? `PR #${runtime.pullRequestNumber} merged` : "Completed";
       else if (runtime?.pullRequestState?.toUpperCase() === "MERGED" && !runtime.mergedCommitSha) summary = `GitHub marked PR #${runtime.pullRequestNumber} merged; Merro is verifying completion`;
@@ -241,12 +261,12 @@ export function presentWorkspace(store: MerroStore) {
   };
 }
 
-export function presentChangeDetails(store: MerroStore, name: string) {
+export function presentChangeDetails(store: MerroStore, name: string, options: PresentationOptions = {}) {
   const item = store.listChangeSets().find((candidate) => changeName(candidate) === name);
   if (!item) return null;
   const runtime = store.getChangeSetRuntime(item.id);
   const tasks = store.listTasks(item.id);
-  const current = presentWorkspace(store).changes.find((change) => change.name === name)!;
+  const current = presentWorkspace(store, options).changes.find((change) => change.name === name)!;
   const latestBlock = store.latestBlock(item.id);
   const block = item.blockedReason
     ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, name, current.review === "passed", item.delivery === "local")

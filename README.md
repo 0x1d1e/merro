@@ -47,6 +47,17 @@ Paths derive from the initialized workspace root containing `.merro`. Start Main
 
 First init creates the directories above, `.merro/config.json` containing all editable defaults, three short Markdown templates, and `.merro/projects/`. It does not register Projects, launch agents, start tmux, or contact GitHub. Repeating init reports `Merro already initialized.` without rewriting files or repairing missing directories.
 
+## What using Merro feels like
+
+1. Tell Merro the goal in plain language.
+2. Read the compact plan: stages, change names, counts, delivery mode.
+3. Reply `approve` once. Anything else gets `Unknown choice: <text>` with `Choose: approve · edit · cancel`; a typo never starts work.
+4. Leave it alone. Progress shows on the transient status line, not as notifications.
+5. Merro interrupts only when you are needed (a merge to approve, a blocker only you can fix).
+6. Approve delivery. Done.
+
+Public states: **Working**, **Waiting** (on a dependency, GitHub, capacity or a worker exit; Merro owns it, no action), **Needs you**, **Blocked**, **Done**. `/merro` lists what needs attention first, `/merro status` is the roadmap, `/merro <change>` shows one change (add `--history` for attempts). `/merro watch <change>` attaches to the worker terminal.
+
 ## Core workflow
 
 ```text
@@ -101,7 +112,7 @@ Merro registers one Pi command: `/merro`.
 
 `/merro issue create <title> [--body <text>]` opens a GitHub issue, `list` and `show #n` read them, and `start #n` turns an open issue into an approved single-issue plan that is scheduled immediately. `approve` and `dismiss` resolve issues proposed by workers under `issues.create: "approval"`. Add `--project <name>` when more than one Project is registered.
 
-`/merro config` shows the config file location and effective Merro settings, including defaults for omitted fields. Edit that JSON file directly; `null` model/thinking values inherit normal Pi settings.
+`/merro config` shows the config file location and only your overrides (`--all` adds defaults). Config keys are camelCase; old names are accepted only as migration input. Edits hot reload for future plans and workers; approved work keeps the worker settings snapshotted at approval. Edit that JSON file directly; `null` model/thinking values inherit normal Pi settings.
 
 ## Natural-language first
 

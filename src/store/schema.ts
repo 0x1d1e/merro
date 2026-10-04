@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 
 export const MIGRATION_19 = `
 ALTER TABLE relations ADD COLUMN gate TEXT CHECK (gate IN ('reviewed','done'));
@@ -324,4 +324,8 @@ ALTER TABLE work_item_runtime ADD COLUMN github_review_decision TEXT;
 
 export const MIGRATION_21 = `
 ALTER TABLE task_runtime ADD COLUMN agent TEXT CHECK (agent IN ('pi', 'claude'));
+`;
+
+export const MIGRATION_22 = `
+ALTER TABLE objective_settings ADD COLUMN worker_settings_json TEXT;
 `;

@@ -82,7 +82,7 @@ async function runIssueCommand(main: MainOrchestrator, text: string): Promise<st
   }
   if (action === "approve" || action === "dismiss") {
     const proposals = await main.issueProposals();
-    const position = args.positional ? Number(args.positional) : proposals.length === 1 ? 1 : Number.NaN;
+    const position = args.positional ? Number(args.positional) : proposals.length === 1 ? proposals[0]!.position : Number.NaN;
     if (!Number.isInteger(position)) throw new Error(proposals.length ? "Choose a proposed issue number from /merro issue list." : "No proposed issues.");
     return main.resolveIssueProposal(position, action === "approve");
   }

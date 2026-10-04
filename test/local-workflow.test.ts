@@ -183,7 +183,7 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   assert.match(plan.content[0]!.text, /0 pull requests/);
   await main.runPass();
   assert.equal(launches.length, 0);
-  await call("merro_start_objective");
+  await call("merro_start_objective", { reply: "approve" });
   main = new MainOrchestrator(options); // Approved delivery survives Main restart.
   if (scenario === "base-moved") {
     await writeFile(join(source.path, "external.txt"), "external change\n");
@@ -240,7 +240,7 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     await writeFile(join(source.path, "external.txt"), "external change\n");
     await source.git("add", ".");
     await source.git("commit", "-m", "chore: advance local base during approval");
-    const staleApproval = await call("merro_resolve_decision", { change: "requested-change", approved: true });
+    const staleApproval = await call("merro_resolve_decision", { change: "requested-change", approved: true, reply: "approve" });
     assert.match(staleApproval.content[0]?.text ?? "", /fresh implementation, verification, review, and approval/);
     for (let pass = 0; pass < 3; pass++) await main.runPass();
     const refreshed = await main.statusSnapshot();
@@ -252,7 +252,7 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
     assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
   }
   if (scenario === "approval-dirty-target") await writeFile(join(source.path, "unrelated.txt"), "preserve this edit\n");
-  const approval = await call("merro_resolve_decision", { change: "requested-change", approved: true });
+  const approval = await call("merro_resolve_decision", { change: "requested-change", approved: true, reply: "approve" });
   if (scenario === "approval-dirty-target") {
     const message = approval.content[0]?.text ?? "";
     assert.match(message, /Local merge failed: Local delivery needs clean working copies/);

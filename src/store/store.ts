@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import type { WorkerSettings } from "../config.js";
 import {
   priorityRank,
   type BaseUpdate,
@@ -22,7 +23,7 @@ import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, MIGRATION_21, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, MIGRATION_21, MIGRATION_22, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
 import { migrateLocalMergeState } from "./local-merge-migration.js";
@@ -391,6 +392,15 @@ export class MerroStore {
         version = 21;
       } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
     }
+    if (version < 22) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_22);
+        this.#db.prepare("UPDATE schema_meta SET version = 22").run();
+        this.#db.exec("COMMIT");
+        version = 22;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -518,6 +528,26 @@ export class MerroStore {
       ON CONFLICT(objective_id) DO UPDATE SET max_review_rounds = excluded.max_review_rounds
     `).run(id, settings.maxReviewRounds === null ? null : String(settings.maxReviewRounds));
     this.appendEvent("Objective", id, "settings_changed", settings);
+  }
+
+  /** Snapshots worker runtime settings approved with an Objective so later config edits do not alter its work. */
+  saveObjectiveWorkerSettings(id: string, settings: WorkerSettings): void {
+    this.#db.prepare(`
+      INSERT INTO objective_settings(objective_id, worker_settings_json) VALUES (?, ?)
+      ON CONFLICT(objective_id) DO UPDATE SET worker_settings_json = excluded.worker_settings_json
+    `).run(id, JSON.stringify(settings));
+  }
+
+  /** Worker settings of the oldest active Objective that includes the ChangeSet, or null for pre-snapshot Objectives. */
+  objectiveWorkerSettings(changeSetId: string): WorkerSettings | null {
+    const row = this.#db.prepare(`
+      SELECT s.worker_settings_json FROM objective_work_items ow
+      JOIN objectives o ON o.id = ow.objective_id
+      JOIN objective_settings s ON s.objective_id = o.id
+      WHERE ow.work_item_id = ? AND o.state = 'Active' AND ow.in_scope = 1 AND s.worker_settings_json IS NOT NULL
+      ORDER BY o.created_at, o.id LIMIT 1
+    `).get(changeSetId);
+    return row ? JSON.parse(String(row.worker_settings_json)) as WorkerSettings : null;
   }
 
   setObjectiveState(id: string, state: Objective["state"]): void {
@@ -681,6 +711,15 @@ export class MerroStore {
   getDecision(id: string): Decision | null {
     const row = this.#db.prepare("SELECT * FROM decisions WHERE id = ?").get(id);
     return row ? decisionFromRow(row) : null;
+  }
+
+  /** Monotonic across resolved proposals so a displayed number is never reused for another proposal. */
+  nextIssueProposalNumber(): number {
+    const row = this.#db.prepare(`
+      SELECT MAX(CAST(json_extract(payload_json, '$.number') AS INTEGER)) AS highest FROM decisions
+      WHERE kind = 'issue' AND subject_type = 'IssueProposal'
+    `).get();
+    return Number(row?.highest ?? 0) + 1;
   }
 
   pendingDecisions(): Decision[] {

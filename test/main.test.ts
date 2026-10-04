@@ -32,7 +32,7 @@ const BASE_COMMIT = "b".repeat(40);
 async function approveProposal(tools: Map<string, Parameters<MainToolAPI["registerTool"]>[0]>, args: Record<string, unknown>) {
   const input = { change: "test-change", delivery: "separate", ...args };
   await tools.get("merro_propose_objective")!.execute("propose", input);
-  return tools.get("merro_start_objective")!.execute("approve", input);
+  return tools.get("merro_start_objective")!.execute("approve", { ...input, reply: "approve" });
 }
 
 test("first-worker walkthrough registers a Project, approves work and reaches a reviewed PR", async (t) => {
@@ -54,7 +54,7 @@ test("first-worker walkthrough registers a Project, approves work and reaches a 
   assert.match(proposed.content[0]?.text ?? "", /Approve · edit · cancel/);
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
-  assert.match((await call("merro_start_objective")).content[0]?.text ?? "", /Working: fix-42\./);
+  assert.match((await call("merro_start_objective", { reply: "approve" })).content[0]?.text ?? "", /Working: fix-42\./);
   assert.equal(harness.launches.length, 1);
   assert.match(harness.launches[0]?.taskFile ?? "", /Issues: #42/);
   for (let pass = 0; pass < 3; pass++) await harness.main.runPass();
@@ -139,7 +139,7 @@ test("combined plan delivers three issues as one change, branch, worker flow and
   assert.deepEqual(proposalDetails.relations, []);
   assert.equal(proposalDetails.runnableImmediately, 1);
   assert.deepEqual(proposalDetails.plans.map(({ change, issues }) => ({ change, issues })), [{ change: "plugin-lifecycle-safety", issues: [96, 97, 100] }]);
-  visible.push(JSON.stringify(await tools.get("merro_start_objective")!.execute("approve", {})));
+  visible.push(JSON.stringify(await tools.get("merro_start_objective")!.execute("approve", { reply: "approve" })));
   assert.equal(harness.launches.length, 1);
   assert.deepEqual(harness.issueBatches, [{ projectSlug: "kinetix", numbers: [96, 97, 100] }]);
   assert.equal(harness.launches[0]!.clonePath, join(harness.workspacePath, ".wt", "kinetix", "plugin-lifecycle-safety"));
@@ -321,14 +321,14 @@ test("authoritative proposal and approval persist exactly the acceptance graph",
   const displayed: string[] = [];
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { displayed.push(message.content); } }, harness.main);
   const args = { goal: "acceptance", change: "acceptance", delivery: "separate", project_slugs: ["example"], issues: [{ project_slug: "example", numbers: [1, 2, 3, 4] }] };
-  await assert.rejects(tools.get("merro_start_objective")!.execute("no-proposal", {}), /No pending plan/);
+  await assert.rejects(tools.get("merro_start_objective")!.execute("no-proposal", { reply: "approve" }), /No pending plan/);
   const proposed = await tools.get("merro_propose_objective")!.execute("proposal", args);
   const proposal = proposed.details as { relations: Array<{ from: string; to: string }> };
   assert.deepEqual(proposal.relations.map((edge) => [edge.from, edge.to]), [["acceptance-2", "acceptance"], ["acceptance-4", "acceptance-2"]]);
   assert.ok(displayed[0]?.includes("Approve · edit · cancel"));
   assert.ok(!displayed[0]?.includes(":issue-"));
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
-  await tools.get("merro_start_objective")!.execute("approved", {});
+  await tools.get("merro_start_objective")!.execute("approved", { reply: "approve" });
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try { assert.equal(store.listRelations().length, proposal.relations.length); } finally { store.close(); }
   assert.deepEqual(harness.launches.map((input) => input.changeSetId).sort(), ["example:issue-1:g1", "example:issue-3:g1"]);
@@ -351,7 +351,7 @@ test("named Objective displays and approves a cross-Project dependency graph", a
   assert.match(displayed, /plugin-runtime\n  runtime #159/);
   assert.match(displayed, /plugin-reference\n  reference #74/);
   assert.match(displayed, /plugin-conformance\n  reference #98\n  after plugin-reference/);
-  assert.match(displayed, /3 changes · 3 pull requests/);
+  assert.match(displayed, /3 changes in \d stages · 3 pull requests/);
   assert.doesNotMatch(displayed, /Branch:/);
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
 
@@ -494,7 +494,7 @@ test("Markdown roadmap interpretation preserves grouping, order, statuses, depen
   changedUnresolved.statement = "after interfaces are stable";
   const pending = await harness.main.proposeObjective(changedInput);
   await assert.rejects(harness.main.startObjective(changedContext, pending.id), /proposal changed or expired/);
-  await tools.get("merro_start_objective")!.execute("approve", {});
+  await tools.get("merro_start_objective")!.execute("approve", { reply: "approve" });
   await writeFile(join(harness.workspacePath, "ROADMAP.md"), "# Changed roadmap\n- Replace the plan with issue #999.\n");
   await harness.main.runPass();
   assert.ok(harness.launches.length >= 2);
@@ -825,7 +825,7 @@ test("Markdown roadmaps without executable work return read-only context", async
     if (scenario.label === "context-only") {
       assert.deepEqual(details.planning.items.map(({ status }) => status), ["Done", "Parked", "Future"]);
     }
-    await assert.rejects(approve.execute("approve", {}), /No pending plan/);
+    await assert.rejects(approve.execute("approve", { reply: "approve" }), /No pending plan/);
     const snapshot = await harness.main.statusSnapshot();
     assert.deepEqual(snapshot.objectives, [], scenario.label);
     assert.deepEqual(snapshot.changeSets, [], scenario.label);
@@ -964,7 +964,7 @@ test("full Kinetix roadmaps enter through Markdown, retain typed structure, and 
   assert.doesNotMatch(text, /\{:\s|Finish credential interchange.*ChangeSet/);
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
 
-  await tools.get("merro_start_objective")!.execute("approve", {});
+  await tools.get("merro_start_objective")!.execute("approve", { reply: "approve" });
   assert.equal(harness.launches.length, 15);
   assert.ok(harness.launches.every((launch) => !launch.taskFile.includes("Finish credential interchange")
     && !launch.taskFile.includes("Cline Free research") && !launch.taskFile.includes("after interfaces stabilize")
@@ -2091,7 +2091,7 @@ test("incomplete v11 Objective scopes remain readable and reconcile after upgrad
   try {
     database.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?")
       .run(JSON.stringify([{ projectSlug: "api", query: { labels: ["feature"] } }]), objective.id);
-    database.exec("DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE task_runtime DROP COLUMN agent; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
+    database.exec("DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE task_runtime DROP COLUMN agent; ALTER TABLE objective_settings DROP COLUMN worker_settings_json; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
   } finally { database.close(); }
   const restarted = harness.restartMain();
   assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, [
@@ -2747,7 +2747,7 @@ test("worker enumeration failure gates only that Project", async (t) => {
     issues: [{ projectSlug: "example", numbers: [7] }, { projectSlug: "other", numbers: [8] }] });
   await harness.main.runPass();
   assert.deepEqual(harness.launches.map((launch) => launch.project.slug), ["other"]);
-  assert.ok(harness.notifications.some((message) => message.includes("scan unavailable")));
+  assert.ok([...harness.notifications, ...harness.progressMessages].some((message) => message.includes("scan unavailable")));
 });
 
 test("failed inference preserves a conflict with a live worker while healthy analysis continues", async (t) => {
@@ -2825,7 +2825,7 @@ test("query scope failures keep a satisfied Objective Active until a fresh check
   fail = true;
   await harness.main.runPass();
   assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Active");
-  assert.ok(harness.notifications.some((message) => /Could not refresh the approved GitHub scope.*Details: GitHub scope unavailable/.test(message)));
+  assert.ok([...harness.notifications, ...harness.progressMessages].some((message) => /Could not refresh the approved GitHub scope.*Details: GitHub scope unavailable/.test(message)));
   fail = false;
   await harness.restartMain().runPass();
   assert.equal((await harness.main.statusSnapshot()).objectives[0]?.state, "Done");
@@ -3310,7 +3310,7 @@ for (const failCompletion of [false, true]) {
     assert.deepEqual(harness.cleanupCalls, [task.id]);
     await assert.rejects(readFile(join(harness.workspacePath, "worker-results", task.id, "pi-config", "auth.json")), { code: "ENOENT" });
     if (failCompletion) {
-      assert.ok(harness.notifications.some((message) => message.includes("cleanup completion write failed")));
+      assert.ok([...harness.notifications, ...harness.progressMessages].some((message) => message.includes("cleanup completion write failed")));
       const store = new MerroStore(path);
       try {
         assert.equal(store.getTaskRuntime(task.id)?.cleanupCompletedAt, null);
@@ -3420,7 +3420,7 @@ test("Task cleanup failure does not prevent review scheduling or reset of infras
   const reopened = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try { assert.equal(reopened.getChangeSetRuntime(id)?.infrastructureRetries, 0); } finally { reopened.close(); }
   assert.deepEqual(harness.launches.map((input) => input.role), ["implement", "review"]);
-  assert.ok(harness.notifications.some((message) => message.includes("Task cleanup failed")));
+  assert.ok([...harness.notifications, ...harness.progressMessages].some((message) => message.includes("Task cleanup failed")));
 });
 
 test("local ChangeSet launches without querying an issue", async (t) => {
@@ -3521,7 +3521,7 @@ test("applicable required team review waits for GitHub approval and resumes auto
   let state = await harness.main.statusSnapshot();
   assert.equal(state.changeSets[0]?.state, "AwaitingApproval");
   assert.equal(state.decisions.length, 0);
-  assert.ok(harness.notifications.some((message) => /Awaiting required team review/.test(message)));
+  assert.ok([...harness.notifications, ...harness.progressMessages].some((message) => /Awaiting required team review/.test(message)));
   let store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   assert.equal(store.getChangeSetRuntime(state.changeSets[0]!.id)?.githubTeamReviewPending, true);
   store.close();
@@ -4912,7 +4912,7 @@ test("Worker-discovered dependencies become an approval-gated Objective before c
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, recoveredMain);
   const approve = tools.get("merro_start_objective");
   assert.ok(approve);
-  assert.match((await approve.execute("approve", {})).content[0]?.text ?? "", /Working:/);
+  assert.match((await approve.execute("approve", { reply: "approve" })).content[0]?.text ?? "", /Working:/);
   assert.equal(harness.launches.at(-1)?.project.slug, "api");
 
   const afterApproval = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
@@ -5640,4 +5640,73 @@ test("an external merge completes the ChangeSet and resolves its pending merge D
   } finally {
     store.close();
   }
+});
+
+test("approval is deterministic: only the exact word approves, typos are refused", async (t) => {
+  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [42] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  const start = (reply: string) => tools.get("merro_start_objective")!.execute("s", { reply });
+  assert.equal((await start("approvve")).content[0]?.text, "Unknown choice: approvve\nChoose: approve · edit · cancel");
+  assert.match((await start("cancel")).content[0]?.text ?? "", /Nothing was started/);
+  assert.match((await start("edit")).content[0]?.text ?? "", /what to change/);
+  await harness.main.runPass();
+  assert.equal(harness.launches.length, 0);
+  assert.equal((await tools.get("merro_resolve_decision")!.execute("r", { approved: true, reply: "aprove" })).content[0]?.text, "Unknown choice: aprove\nChoose: approve · edit · cancel");
+  assert.match((await start("approve")).content[0]?.text ?? "", /Working/);
+  assert.equal(harness.launches.length, 1);
+});
+
+test("approved worker settings are snapshotted and used at launch", async (t) => {
+  const harness = await createHarness(t, {
+    together: true,
+    projects: [{ slug: "kinetix", issueNumbers: [42] }],
+    workerModels: { implement: "anthropic/claude-sonnet-4", review: "openai/gpt-4.1" },
+  });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  await approveProposal(tools, { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  await harness.main.runPass();
+  assert.equal(harness.launches[0]?.workerSettings?.implement.model, "anthropic/claude-sonnet-4");
+  assert.equal(harness.launches[0]?.workerSettings?.review.model, "openai/gpt-4.1");
+});
+
+test("a change held back only by task capacity reads as Waiting for capacity", async (t) => {
+  const workers: OwnedWorker[] = [];
+  const harness = await createHarness(t, {
+    projects: [{ slug: "example", issueNumbers: [1, 2] }],
+    maxConcurrentTasks: 1,
+    result: () => null,
+    inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+    ownedWorkers: async (project) => workers.filter((worker) => worker.projectSlug === project.slug),
+  });
+  await harness.main.startObjective({ goal: "Two independent changes", changeSets: [
+    { name: "first", projectSlug: "example", issues: [1] },
+    { name: "second", projectSlug: "example", issues: [2] },
+  ] });
+  await harness.main.runPass();
+  workers.push(...harness.launches.map((launch) => ({ taskId: launch.taskId, projectSlug: launch.project.slug,
+    changeSetId: launch.changeSetId, clonePath: launch.clonePath, tmuxSession: null, tmuxWindow: null,
+    paneId: null, containerId: null })));
+  const snapshot = await harness.main.publicSnapshot();
+  const held = snapshot.changes.find((change) => change.status === "Waiting");
+  assert.ok(held);
+  assert.equal(held.waitingFor?.kind, "capacity");
+  assert.equal(snapshot.changes.filter((change) => change.status === "Working").length, 1);
+});
+
+test("issue proposal numbers stay stable after an earlier proposal is dismissed", async (t) => {
+  const harness = await createHarness(t, { result: (input, _n, base) => input.role === "implement"
+    ? { ...base, proposed_issues: [{ title: "First", body: "a" }, { title: "Second", body: "b" }] } : base });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const before = await harness.main.issueProposals();
+  assert.deepEqual(before.map((entry) => [entry.position, entry.title]), [[1, "First"], [2, "Second"]]);
+  assert.match(await harness.main.resolveIssueProposal(1, false), /Dismissed/);
+  assert.deepEqual((await harness.main.issueProposals()).map((entry) => [entry.position, entry.title]), [[2, "Second"]]);
+  await assert.rejects(harness.main.resolveIssueProposal(1, true), /No proposed issue 1/);
+  assert.match(await harness.main.resolveIssueProposal(2, true), /Created example #/);
+  assert.equal(harness.createdIssues[0]?.title, "Second");
 });
