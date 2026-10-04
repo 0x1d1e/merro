@@ -96,7 +96,7 @@ test("atomically commits nested store writes together or not at all", () => {
   }
 });
 
-test("a transaction whose commit fails rolls back and later transactions still commit", async (t) => {
+test("a failed commit or a rollback SQLite did itself reports the cause and later transactions still commit", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-commit-failure-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const path = join(root, "state.db");
@@ -113,8 +113,15 @@ test("a transaction whose commit fails rolls back and later transactions still c
     ]) assert.throws(write, /FOREIGN KEY/);
     store.createObjective({ id: "good", goal: "good", priority: "normal", state: "Active", projectSlugs: ["p"] });
     store.atomically(() => store.createObjective({ id: "also-good", goal: "also-good", priority: "normal", state: "Active", projectSlugs: ["p"] }));
+    // RAISE(ROLLBACK) makes SQLite undo the whole transaction itself; the caller still sees that cause, not the failed rollbacks.
+    other.exec("CREATE TRIGGER self_rollback BEFORE INSERT ON objectives WHEN NEW.id = 'undone' BEGIN SELECT RAISE(ROLLBACK, 'database or disk is full'); END;");
+    for (const write of [
+      () => store.atomically(() => store.createObjective({ id: "undone", goal: "undone", priority: "normal", state: "Active", projectSlugs: ["p"] })),
+      () => store.createObjective({ id: "undone", goal: "undone", priority: "normal", state: "Active", projectSlugs: ["p"] }),
+    ]) assert.throws(write, /database or disk is full/);
+    store.atomically(() => store.createObjective({ id: "after", goal: "after", priority: "normal", state: "Active", projectSlugs: ["p"] }));
     // Another connection sees only committed rows.
-    assert.deepEqual(other.prepare("SELECT id FROM objectives ORDER BY id").all().map((row) => row.id), ["also-good", "good"]);
+    assert.deepEqual(other.prepare("SELECT id FROM objectives ORDER BY id").all().map((row) => row.id), ["after", "also-good", "good"]);
   } finally {
     other.close();
     store.close();

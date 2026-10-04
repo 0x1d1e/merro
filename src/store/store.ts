@@ -150,140 +150,84 @@ export class MerroStore {
       throw new Error(`unsupported Merro schema version ${String(row.version)}; expected 1-${SCHEMA_VERSION}`);
     }
     if (version < 2) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_2);
         this.#db.prepare("UPDATE schema_meta SET version = 2").run();
-        this.#commit();
-        version = 2;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 2;
     }
     if (version < 3) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_3);
         this.#db.prepare("UPDATE schema_meta SET version = 3").run();
-        this.#commit();
-        version = 3;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 3;
     }
     if (version < 4) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_4);
         this.#db.prepare("UPDATE schema_meta SET version = 4").run();
-        this.#commit();
-        version = 4;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 4;
     }
     if (version < 5) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_5);
         this.#db.prepare("UPDATE schema_meta SET version = 5").run();
-        this.#commit();
-        version = 5;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 5;
     }
     if (version < 6) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_6);
         this.#db.prepare("UPDATE schema_meta SET version = 6").run();
-        this.#commit();
-        version = 6;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 6;
     }
     if (version < 7) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_7);
         this.#db.prepare("UPDATE schema_meta SET version = 7").run();
-        this.#commit();
-        version = 7;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 7;
     }
     if (version < 8) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_8);
         this.#db.prepare("UPDATE schema_meta SET version = 8").run();
-        this.#commit();
-        version = 8;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 8;
     }
     if (version < 9) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_9);
         this.#db.prepare("UPDATE schema_meta SET version = 9").run();
-        this.#commit();
-        version = 9;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 9;
     }
     if (version < 10) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_10);
         this.#db.prepare("UPDATE schema_meta SET version = 10").run();
-        this.#commit();
-        version = 10;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 10;
     }
     if (version < 11) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_11);
         this.#db.prepare("UPDATE schema_meta SET version = 11").run();
-        this.#commit();
-        version = 11;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 11;
     }
     if (version < 12) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_12);
         this.#db.prepare("UPDATE schema_meta SET version = 12").run();
-        this.#commit();
-        version = 12;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 12;
     }
     if (version < 13) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         // v10-v12 could persist scopes for only some linked Projects. Preserve approved
         // scopes and recover missing selections from attached issues, never from the goal.
         for (const objective of this.#db.prepare("SELECT id, issue_scopes_json FROM objectives WHERE issue_scopes_json IS NOT NULL").all()) {
@@ -310,16 +254,11 @@ export class MerroStore {
           }
         }
         this.#db.prepare("UPDATE schema_meta SET version = 13").run();
-        this.#commit();
-        version = 13;
-      } catch (error) {
-        this.#rollback();
-        throw error;
-      }
+      });
+      version = 13;
     }
     if (version < 14) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec("ALTER TABLE work_items ADD COLUMN slug TEXT; ALTER TABLE task_runtime ADD COLUMN window_id TEXT");
         const used = new Set<string>();
         for (const row of this.#db.prepare("SELECT * FROM work_items ORDER BY created_at, id").all()) {
@@ -342,70 +281,58 @@ export class MerroStore {
               AND w.state NOT IN ('Done', 'Obsolete', 'Cancelled') AND existing.value = incoming.value
           ); END;`);
         this.#db.prepare("UPDATE schema_meta SET version = 14").run();
-        this.#commit();
-        version = 14;
-      } catch (error) { this.#rollback(); throw error; }
+      });
+      version = 14;
     }
     if (version < 15) {
       migratePublicationStates(this.#db);
       version = 15;
     }
     if (version < 16) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_16);
         this.#db.prepare("UPDATE schema_meta SET version = 16").run();
-        this.#commit();
-        version = 16;
-      } catch (error) { this.#rollback(); throw error; }
+      });
+      version = 16;
     }
     if (version < 17) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_17);
         this.#db.prepare("UPDATE schema_meta SET version = 17").run();
-        this.#commit();
-        version = 17;
-      } catch (error) { this.#rollback(); throw error; }
+      });
+      version = 17;
     }
     if (version < 18) {
       migrateLocalMergeState(this.#db);
       version = 18;
     }
     if (version < 19) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_19);
         this.#db.prepare("UPDATE schema_meta SET version = 19").run();
-        this.#commit();
-        version = 19;
-      } catch (error) { this.#rollback(); throw error; }
+      });
+      version = 19;
     }
     if (version < 20) {
       migrateTeamReviewState(this.#db);
       version = 20;
     }
     if (version < 21) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_21);
         this.#db.prepare("UPDATE schema_meta SET version = 21").run();
-        this.#commit();
-        version = 21;
-      } catch (error) { this.#rollback(); throw error; }
+      });
+      version = 21;
     }
     if (version < 22) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_22);
         this.#db.prepare("UPDATE schema_meta SET version = 22").run();
-        this.#commit();
-        version = 22;
-      } catch (error) { this.#rollback(); throw error; }
+      });
+      version = 22;
     }
     if (version < 23) {
-      this.#begin();
-      try {
+      this.atomically(() => {
         const columns = this.#db.prepare("SELECT name FROM pragma_table_info('objective_settings')").all();
         if (!columns.some((column) => column.name === "worker_settings_json")) this.#db.exec(MIGRATION_22);
         this.#db.exec(MIGRATION_23);
@@ -421,9 +348,8 @@ export class MerroStore {
           this.#db.prepare("UPDATE decisions SET payload_json = json_set(payload_json, '$.number', ?) WHERE id = ?").run(next + index, row.id);
         });
         this.#db.prepare("UPDATE schema_meta SET version = 23").run();
-        this.#commit();
-        version = 23;
-      } catch (error) { this.#rollback(); throw error; }
+      });
+      version = 23;
     }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
@@ -504,7 +430,8 @@ export class MerroStore {
       this.#commit();
       return result;
     } catch (error) {
-      this.#rollback();
+      // The cause wins: a rollback that fails because SQLite already undid the transaction must not mask it.
+      try { this.#rollback(); } catch { /* level already abandoned; see #rollback */ }
       throw error;
     }
   }
@@ -534,8 +461,7 @@ export class MerroStore {
   createObjective(objective: Objective): void {
     if (objective.projectSlugs.length === 0) throw new Error("Objective requires at least one Project");
     const timestamp = now();
-    this.#begin();
-    try {
+    this.atomically(() => {
       this.#db.prepare(`
         INSERT INTO objectives(id, goal, priority, state, created_at, updated_at, issue_scopes_json)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -548,11 +474,7 @@ export class MerroStore {
           .run(objective.id, String(objective.maxReviewRounds));
       }
       this.appendEvent("Objective", objective.id, "created", objective);
-      this.#commit();
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   restoreObjectiveIssueScopes(id: string, scopes: ObjectiveIssueScope[]): void {
@@ -625,8 +547,7 @@ export class MerroStore {
 
   replaceRelations(relations: readonly Relation[]): void {
     const effective = effectiveRelations(relations.map(normalizeRelation));
-    this.#begin();
-    try {
+    this.atomically(() => {
       this.#db.prepare("UPDATE relations SET active = 0 WHERE active = 1").run();
       const upsert = this.#db.prepare(`
         INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, gate, consumed_reviewed_commit, active, created_at)
@@ -647,11 +568,7 @@ export class MerroStore {
           relation.kind === "Requires" ? relation.gate ?? null : null, relation.consumedReviewedCommit ?? null, now());
       }
       this.appendEvent("Relations", "workspace", "replaced", effective);
-      this.#commit();
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   #relationRebuild(analyzedIds: readonly string[], relations: readonly Relation[], occupiedChangeSetIds: readonly string[]) {
@@ -692,8 +609,7 @@ export class MerroStore {
     occupiedChangeSetIds: readonly string[] = [],
     explicitRelations: readonly Relation[] = [],
   ): void {
-    this.#begin();
-    try {
+    this.atomically(() => {
       const rebuild = this.#relationRebuild(analyzedIds, relations, occupiedChangeSetIds);
       const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE id = ?");
       for (const id of rebuild.deactivateIds) deactivate.run(id);
@@ -726,11 +642,7 @@ export class MerroStore {
       const rebuilt = this.listRelations();
       const previous = this.#db.prepare("SELECT payload_json FROM event_log WHERE entity_type = 'Relations' AND event_type = 'rebuilt' ORDER BY id DESC LIMIT 1").get();
       if (previous?.payload_json !== JSON.stringify(rebuilt)) this.appendEvent("Relations", "workspace", "rebuilt", rebuilt);
-      this.#commit();
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   listRelations(includeInactive = false): Relation[] {
@@ -866,19 +778,14 @@ export class MerroStore {
   }
 
   markPullRequestRework(runtime: ChangeSetRuntimeRecord): void {
-    this.#begin();
-    try {
+    this.atomically(() => {
       const item = this.getChangeSet(runtime.changeSetId);
       if (!item || item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval") {
         throw new Error(`ChangeSet ${runtime.changeSetId} is not awaiting pull request review or merge`);
       }
       this.saveChangeSetRuntime(runtime);
       this.transitionChangeSet(item.id, "Implementing");
-      this.#commit();
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   getTaskRuntime(taskId: string): TaskRuntimeRecord | null {
@@ -952,8 +859,7 @@ export class MerroStore {
     }
 
     const timestamp = now();
-    this.#begin();
-    try {
+    this.atomically(() => {
       this.#db.prepare(`
         INSERT INTO work_items(
           id, project_slug, source_type, source_ref, generation, state, priority,
@@ -968,11 +874,7 @@ export class MerroStore {
         .run(item.id, item.guidance ?? "");
       this.#db.prepare("INSERT INTO work_item_runtime(work_item_id) VALUES (?)").run(item.id);
       this.appendEvent("ChangeSet", item.id, "created", item);
-      this.#commit();
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   availableChangeName(name: string, reserved: ReadonlySet<string> = new Set()): string {
@@ -1108,8 +1010,7 @@ export class MerroStore {
   }
 
   completeLocalChangeSet(id: string, commit: string): void {
-    this.#begin();
-    try {
+    this.atomically(() => {
       const item = this.getChangeSet(id);
       const review = this.listTasks(id).at(-1);
       if (item?.delivery !== "local" || item.state !== "AwaitingLocalMerge" || this.activeTask(id)
@@ -1132,21 +1033,18 @@ export class MerroStore {
         .run(id, JSON.stringify({ change: item.slug, delivery: "local", branch: item.targetBranch, baseCommit: runtime.baseCommit, commit }), now());
       this.appendEvent("ChangeSet", id, "final_summary_written", { createdAt: now() });
       this.appendEvent("ChangeSet", id, "completed", { reason: "local_delivery", commit });
-      this.#commit();
-    } catch (error) { this.#rollback(); throw error; }
+    });
   }
 
   completeChangeSetAfterMerge(id: string, payload: unknown): boolean {
     const serialized = JSON.stringify(payload);
     if (serialized === undefined) throw new Error("final summary must be JSON serializable");
-    this.#begin();
-    try {
+    return this.atomically(() => {
       const item = this.getChangeSet(id);
       if (!item) throw new Error(`unknown ChangeSet: ${id}`);
       const existing = this.getFinalSummary(id);
       if (existing) {
         if (item.state !== "Done") throw new Error(`ChangeSet ${id} has a final summary but is not Done`);
-        this.#commit();
         return false;
       }
       if (item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing" && item.state !== "Done") {
@@ -1171,12 +1069,8 @@ export class MerroStore {
         });
       }
       this.appendEvent("ChangeSet", id, "final_summary_written", { createdAt });
-      this.#commit();
       return true;
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   completeChangeSetAfterExternalMerge(id: string): void {
@@ -1269,19 +1163,14 @@ export class MerroStore {
     if (input.runtime && input.runtime.taskId !== input.id) {
       throw new Error("Task runtime identity does not match Task ID");
     }
-    this.#begin();
-    try {
+    this.atomically(() => {
       this.#db.prepare(`
         INSERT INTO tasks(id, work_item_id, role, attempt, status, started_at)
         VALUES (?, ?, ?, ?, 'active', ?)
       `).run(input.id, input.changeSetId, input.role, input.attempt, now());
       if (input.runtime) this.saveTaskRuntime(input.runtime);
       this.appendEvent("Task", input.id, "created", { ...input, runtime: undefined });
-      this.#commit();
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   finalizeTask(input: {
@@ -1318,17 +1207,12 @@ export class MerroStore {
   }
 
   finalizePassingReview(input: { id: string; summary: string; resultJson: string; reviewedCommit: string }): void {
-    this.#begin();
-    try {
+    this.atomically(() => {
       const task = this.getTask(input.id);
       if (!task || task.role !== "review") throw new Error("Passing review requires a review Task");
       this.finalizeTask({ ...input, outcome: "pass" });
       this.transitionChangeSet(task.changeSetId, "Reviewed");
-      this.#commit();
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   getTask(id: string): Task | null {
@@ -1400,8 +1284,7 @@ export class MerroStore {
   }
 
   stopActiveObjectives(objectiveId?: string): number {
-    this.#begin();
-    try {
+    return this.atomically(() => {
       const requested = objectiveId === undefined ? null : this.getObjective(objectiveId);
       if (objectiveId !== undefined && !requested) throw new Error(`unknown Objective: ${objectiveId}`);
       const objectives = requested
@@ -1433,12 +1316,8 @@ export class MerroStore {
           }
         }
       }
-      this.#commit();
       return objectives.length;
-    } catch (error) {
-      this.#rollback();
-      throw error;
-    }
+    });
   }
 
   hasEvent(entityType: string, entityId: string, eventType: string): boolean {
