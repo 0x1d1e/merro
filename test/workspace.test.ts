@@ -198,6 +198,12 @@ test("only the user's own message in the current turn can approve", async (t) =>
     // Pi ends the agent run before an automatic retry or post-compaction continuation; the reply still authorizes.
     say('approve'); events.get('agent_end')?.();
     await assert.rejects(start(),/No pending plan/);
+    // An approval that found nothing to approve leaves the reply usable for the rest of the turn.
+    await assert.rejects(start(),/No pending plan/);
+    await assert.rejects(tools.get('merro_resolve_decision').execute('resolve',{change:'missing',approved:true}));
+    await assert.rejects(start(),/No pending plan/);
+    say('Merro needs your attention','extension');
+    assert.match(await start(),/^Unknown choice: \\(empty\\)/);
     say('approve'); events.get('agent_settled')();
     assert.match(await start(),/^Unknown choice: \\(empty\\)/);
     say('approve');

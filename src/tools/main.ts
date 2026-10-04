@@ -204,8 +204,10 @@ function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | Na
 export interface UserApprovalSource {
   /** `at` (epoch ms) lets Main refuse a reply that predates the plan or decision it would approve. */
   latest(): { text: string; at: number } | undefined;
-  /** Called once an approval is accepted so one user reply authorizes one approval. */
+  /** Claims the reply before any await so one user reply authorizes one approval, even across parallel tool calls. */
   consume(): void;
+  /** Returns a claimed reply that was never spent (wrong name, nothing pending), unless newer input or the turn's end replaced it. */
+  restore(reply: { text: string; at: number }): void;
 }
 
 /** Approval is deterministic: only the exact word counts, so a typo can never start work or merge. */
@@ -326,9 +328,14 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator, appro
       const refusal = approvalRefusal(reply);
       if (refusal) return result(refusal);
       approvals.consume();
+      let accepted = false;
       let started: Awaited<ReturnType<MainOrchestrator["approveObjective"]>>;
-      try { started = await main.approveObjective(typeof args.change === "string" ? args.change : undefined, { repliedAt: reply!.at }); }
-      catch (error) { if (error instanceof StaleApprovalError) return result(error.message); throw error; }
+      try { started = await main.approveObjective(typeof args.change === "string" ? args.change : undefined, { repliedAt: reply!.at, accepted: () => { accepted = true; } }); }
+      catch (error) {
+        if (error instanceof StaleApprovalError) return result(error.message);
+        if (!accepted) approvals.restore(reply!);
+        throw error;
+      }
       await main.runPass();
       return result(`Working: ${started.changeSets.map(changeName).join(", ")}.`);
     } });
@@ -342,10 +349,15 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator, appro
       const refusal = args.approved === true ? approvalRefusal(reply) : null;
       if (refusal) return result(refusal);
       if (args.approved === true) approvals.consume();
+      let accepted = false;
       try {
         return result(await main.resolveDecisionForChange(typeof args.change === "string" ? args.change : undefined, args.approved === true,
-          reply ? { repliedAt: reply.at } : {}));
-      } catch (error) { if (error instanceof StaleApprovalError) return result(error.message); throw error; }
+          reply ? { repliedAt: reply.at, accepted: () => { accepted = true; } } : {}));
+      } catch (error) {
+        if (error instanceof StaleApprovalError) return result(error.message);
+        if (reply && !accepted) approvals.restore(reply);
+        throw error;
+      }
     } });
   pi.registerTool({ name: "merro_restart_change", label: "Restart attempt", description: "After explicit user approval of changed requirements, stop the current attempt and start a fresh implementer. Never send instructions to a running worker.",
     parameters: Type.Object({ change: Type.String(), requirements: Type.String() }, { additionalProperties: false }),

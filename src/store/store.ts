@@ -1391,7 +1391,7 @@ export class MerroStore {
         if (this.activeTask(item.id)) continue;
         this.transitionChangeSet(item.id, "Obsolete");
         for (const decision of this.pendingDecisions()) {
-          if ((decision.kind === "merge" || decision.kind === "merge_conflict" || decision.kind === "local_merge") && decision.subjectId === item.id) {
+          if ((decision.kind === "merge" || decision.kind === "merge_conflict" || decision.kind === "local_merge" || decision.kind === "worker_settings") && decision.subjectId === item.id) {
             this.resolveDecision(decision.id, "resolved");
           }
         }

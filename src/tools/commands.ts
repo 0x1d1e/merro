@@ -27,7 +27,7 @@ async function withStore<T>(cwd: string, action: (store: MerroStore) => T | Prom
   finally { try { store?.close(); } finally { await lock.release(); } }
 }
 
-const commandUsage = "Commands: /merro · /merro init · /merro status · /merro <change> [--history] · /merro watch <change> · /merro issue create|list|show|start|approve|dismiss · /merro approve [change] · /merro leave [change] · /merro retry [change] · /merro stop [objective] · /merro run · /merro export · /merro unlock · /merro config [--all]";
+const commandUsage = "Commands: /merro · /merro init · /merro status · /merro <change> [--history] · /merro watch <change> · /merro issue create|list|show|start|approve|dismiss · /merro approve [plan|merge] [change] · /merro leave [change] · /merro retry [change] · /merro stop [objective] · /merro run · /merro export · /merro unlock · /merro config [--all]";
 const issueUsage = "Usage: /merro issue create <title> [--project <name>] [--body <text>] · list [--project <name>] · show #<n> [--project <name>] · start #<n> [--project <name>] · approve [<n>] · dismiss [<n>]";
 
 interface IssueArguments { positional: string; project: string | undefined; body: string }

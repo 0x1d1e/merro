@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import type { MerroConfig, WorkerSettings } from "../config.js";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { validateDirectory, type MerroConfig, type WorkerSettings } from "../config.js";
 import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate, type RequiresGate } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
@@ -20,7 +20,7 @@ import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { requireWorkspace } from "./workspace.js";
 import { currentlyReviewedIds } from "./reviewed.js";
-import { formatChecks, objectiveName, presentChangeDetails, presentWorkspace, publicText, workerName } from "./presentation.js";
+import { formatChecks, objectiveName, presentChangeDetails, presentWorkspace, publicText, workerName, workerSettingsText } from "./presentation.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
@@ -453,6 +453,21 @@ export class MainOrchestrator {
   readonly #workspacePath: string;
   readonly #stateDirectory: string;
   get #workRoot(): string { return join(this.#workspacePath, this.#config.worktreesDir); }
+  /** Recorded clone paths stay authoritative after worktreesDir changes: a clone created as <root>/<project>/<change> is removed from that root. */
+  #cloneRoot(item: ChangeSet, clonePath: string): string {
+    const workspace = resolve(this.#workspacePath);
+    const clone = resolve(clonePath);
+    const root = dirname(dirname(clone));
+    if (basename(clone) !== changeName(item) || basename(dirname(clone)) !== item.projectSlug) return this.#workRoot;
+    try {
+      const directory = validateDirectory(relative(workspace, root), "worktreesDir");
+      const projects = this.#config.projectsDir;
+      if (directory === projects || directory.startsWith(`${projects}${sep}`) || projects.startsWith(`${directory}${sep}`)) return this.#workRoot;
+      return join(workspace, directory);
+    } catch {
+      return this.#workRoot;
+    }
+  }
   readonly #config: MerroConfig;
   readonly #notifiedBySubject = new Map<string, string>();
   readonly #notify: (message: string, level?: "info" | "warning" | "error") => void;
@@ -974,12 +989,14 @@ export class MainOrchestrator {
    * `repliedAt` is when the user's approving message arrived; a plan proposed at or after it was never seen
    * by that reply, so it cannot authorize the plan.
    */
-  async approveObjective(name?: string, options: { repliedAt?: number } = {}): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
+  /** `accepted` fires once the approval is spent on this plan; earlier failures leave the user's reply usable. */
+  async approveObjective(name?: string, options: { repliedAt?: number; accepted?: () => void } = {}): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
     const [entry] = this.#proposals;
     if (!entry) throw new Error("No pending plan. Propose a plan and obtain approval first.");
     const [id, proposal] = entry;
     if (options.repliedAt !== undefined && proposal.createdAt >= options.repliedAt) throw new StaleApprovalError();
     if (!this.#pendingPlanAccepts(name)) throw new Error("That name does not match the pending plan.");
+    options.accepted?.();
     return this.startObjective(JSON.parse(proposal.input) as ObjectiveRequest, id);
   }
 
@@ -999,17 +1016,20 @@ export class MainOrchestrator {
    * `/merro approve`: the typed command is itself the user's approval, so it approves the pending plan it names (or
    * the only thing waiting) and otherwise resolves a merge Decision.
    */
-  async approvePending(name?: string): Promise<string> {
-    const requested = name?.trim() || undefined;
-    if (this.#pendingPlanAccepts(requested)) {
-      const decisionAlsoMatches = await this.#withStore((store) => store.pendingDecisions().some((decision) => {
+  /** `/merro approve [plan|merge] [name]`; the qualifier is needed only when the plan and a merge Decision could both match. */
+  async approvePending(target?: string): Promise<string> {
+    const [first, ...rest] = target?.trim().split(/\s+/) ?? [];
+    const kind = first === "plan" || first === "merge" ? first : undefined;
+    const requested = (kind ? rest.join(" ") : target?.trim()) || undefined;
+    if (kind === "plan" || (!kind && this.#pendingPlanAccepts(requested))) {
+      const decisionAlsoMatches = !kind && await this.#withStore((store) => store.pendingDecisions().some((decision) => {
         const item = decision.subjectType === "ChangeSet" ? store.getChangeSet(decision.subjectId) : null;
         return !!item && (!requested || changeName(item) === semanticSlug(requested));
       }));
       if (decisionAlsoMatches) {
-        const goal = semanticSlug((JSON.parse([...this.#proposals.values()][0]!.input) as ObjectiveRequest).goal);
-        throw new Error(requested ? `The pending plan and a merge decision both name ${semanticSlug(requested)}. Use /merro approve ${goal} for the plan; the merge can be approved once the plan is settled.`
-          : "A plan and a merge decision are both waiting. Name one: /merro approve <change>.");
+        throw new Error(requested
+          ? `The pending plan and a merge decision both name ${semanticSlug(requested)}. Use /merro approve plan ${semanticSlug(requested)} or /merro approve merge ${semanticSlug(requested)}.`
+          : "A plan and a merge decision are both waiting. Use /merro approve plan or /merro approve merge <change>.");
       }
       const started = await this.approveObjective(requested);
       await this.runPass();
@@ -1066,7 +1086,8 @@ export class MainOrchestrator {
     await this.runPass();
   }
 
-  async resolveDecisionForChange(name: string | undefined, approved: boolean, options: { repliedAt?: number } = {}): Promise<string> {
+  /** `accepted` fires once the approval is spent on a selected Decision; selection failures leave the user's reply usable. */
+  async resolveDecisionForChange(name: string | undefined, approved: boolean, options: { repliedAt?: number; accepted?: () => void } = {}): Promise<string> {
     this.#notifiedBySubject.clear(); // A user action starts a new conversation about the change.
     const requested = name?.trim() || undefined;
     const alreadyMerged = () => this.#withStore((store) => {
@@ -1086,16 +1107,22 @@ export class MainOrchestrator {
     } catch (error) {
       if (approved) {
         const message = await alreadyMerged();
-        if (message) return message;
+        if (message) { options.accepted?.(); return message; }
       }
       throw error;
     }
     const decision = await this.#withStore((store) => store.getDecision(decisionId));
+    if (!approved && decision?.kind === "worker_settings") {
+      const { objective } = decision.payload as { objective: string };
+      throw new Error(`New work waits for worker settings. Approve: /merro approve ${semanticSlug(requested ?? "") || "<change>"} · Skip: /merro stop ${objective}`);
+    }
     if (approved && options.repliedAt !== undefined && decision && Date.parse(decision.createdAt) >= options.repliedAt) throw new StaleApprovalError();
+    options.accepted?.();
     const kind = decision?.kind;
     let localMergeOutcome: LocalMergeOutcome | undefined;
     try {
       if (kind === "merge_conflict") await this.resolveMergeConflictDecision(decisionId, approved ? "resolved" : "abandon");
+      else if (kind === "worker_settings") await this.#resolveWorkerSettingsDecision(decisionId);
       else if (kind === "local_merge") localMergeOutcome = await this.resolveLocalMergeDecision(decisionId, approved);
       else await this.resolveMergeDecision(decisionId, approved);
     } catch (error) {
@@ -1112,6 +1139,7 @@ export class MainOrchestrator {
       return item && runtime ? { name: changeName(item), state: item.state, pr: runtime.pullRequestNumber, targetBranch: item.targetBranch } : null;
     });
     if (!resolved) return "Decision resolved.";
+    if (kind === "worker_settings") return `Approved worker settings for ${resolved.name}.`;
     if (kind === "local_merge") {
       if (!approved) return `Local merge declined for ${resolved.name}; no changes applied.`;
       if (localMergeOutcome === "done") return `Applied locally: ${resolved.name} · ${resolved.targetBranch}.`;
@@ -1526,6 +1554,9 @@ export class MainOrchestrator {
         const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds, issueCache);
         for (const id of scopeGates) relationGates.add(id);
         for (const id of discoveredGates) relationGates.add(id);
+        for (const decision of store.pendingDecisions()) {
+          if (decision.kind === "worker_settings") relationGates.add(decision.subjectId);
+        }
         for (const relation of store.listRelations()) {
           if (relation.kind !== "Requires") continue;
           const prerequisite = store.getChangeSet(relation.to);
@@ -1976,6 +2007,7 @@ export class MainOrchestrator {
     // A reopened issue continues the change it reopened, so it keeps that change's approved worker settings.
     const settings = store.changeSetWorkerSettings(previous.id) ?? store.objectiveWorkerSettings(owners[0]!.id);
     if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
+    else this.#askWorkerSettings(store, owners[0]!, item);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = "OPEN";
     store.saveChangeSetRuntime(runtime);
@@ -2191,7 +2223,7 @@ export class MainOrchestrator {
         const clonePath = store.getChangeSetRuntime(item.id)?.clonePath;
         if (needed || !clonePath) continue;
         try {
-          await this.#git.deleteClone(join(this.#workspacePath, this.#config.worktreesDir), clonePath);
+          await this.#git.deleteClone(this.#cloneRoot(item, clonePath), clonePath);
           store.appendEvent("ChangeSet", item.id, "dependency_clone_cleanup_complete", {});
         } catch (error) {
           this.#progress(`${changeName(item)} · Dependency clone cleanup failed: ${errorText(error)}. Merro will retry automatically.`);
@@ -2961,7 +2993,7 @@ export class MainOrchestrator {
     if (runtime.clonePath && neededReviewedCheckout) store.appendEvent("ChangeSet", item.id, "dependency_clone_retained", {});
     if (runtime.clonePath && this.#git.deleteClone && !unsafeProjects.has(item.projectSlug) && !neededReviewedCheckout) {
       try {
-        await this.#git.deleteClone(this.#workRoot, runtime.clonePath);
+        await this.#git.deleteClone(this.#cloneRoot(item, runtime.clonePath), runtime.clonePath);
       } catch (error) {
         this.#notify(`${changeName(item)} is done, but Merro could not remove its working copy: ${errorText(error)}. Remove it manually if disk space is a concern.`, "warning");
       }
@@ -3209,6 +3241,32 @@ export class MainOrchestrator {
     this.#progress(`${changeName(item)} · The pull request's base changed; Merro is rechecking the changes.`);
   }
 
+  /**
+   * Objectives approved before Merro recorded worker settings (schema 22) have no snapshot to give new work.
+   * Live config was never approved for them, so new work waits until the user approves the settings it would use.
+   */
+  #askWorkerSettings(store: MerroStore, objective: Objective, item: ChangeSet): void {
+    const settings: WorkerSettings = { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
+    const objectiveSlug = objectiveName(objective.goal);
+    store.createDecision({ id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "worker_settings", payload: { objectiveId: objective.id, objective: objectiveSlug, settings } });
+    this.#notify(`${changeName(item)} · Needs you\n\n${objectiveSlug} was approved before Merro recorded worker settings. Start its new work with ${workerSettingsText(settings)}?\nApprove: /merro approve ${changeName(item)} · Skip: /merro stop ${objectiveSlug}`, "warning");
+  }
+
+  /** Approving the settings for one change records them for its Objective, so its other waiting changes start too. */
+  async #resolveWorkerSettingsDecision(decisionId: string): Promise<void> {
+    await this.#withStore((store) => {
+      const decision = store.getDecision(decisionId);
+      if (decision?.state !== "pending" || decision.kind !== "worker_settings") throw new Error(`pending worker settings Decision not found: ${decisionId}`);
+      const { objectiveId, settings } = decision.payload as { objectiveId: string; settings: WorkerSettings };
+      if (!store.objectiveWorkerSettings(objectiveId)) store.saveObjectiveWorkerSettings(objectiveId, settings);
+      for (const pending of store.pendingDecisions()) {
+        if (pending.kind !== "worker_settings" || (pending.payload as { objectiveId?: string }).objectiveId !== objectiveId) continue;
+        store.claimChangeSetWorkerSettings(pending.subjectId, settings);
+        store.resolveDecision(pending.id, "approved");
+      }
+    });
+  }
+
   #attachIssue(store: MerroStore, objective: Objective, projectSlug: string, issue: GitHubIssue): ChangeSet {
     // Issues entering approved scope run with the settings their Objective was approved with.
     const settings = store.objectiveWorkerSettings(objective.id);
@@ -3228,6 +3286,7 @@ export class MainOrchestrator {
     store.createChangeSet(item);
     store.attachChangeSet(objective.id, item.id);
     if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
+    else this.#askWorkerSettings(store, objective, item);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = issue.state.toUpperCase();
     store.saveChangeSetRuntime(runtime);

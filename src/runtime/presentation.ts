@@ -1,6 +1,7 @@
 import { changeName, issueNumbers } from "../domain/names.js";
 import type { BlockReason, ChangeSet, Task } from "../domain/model.js";
 import type { MerroStore } from "../store/store.js";
+import type { WorkerRoleSettings, WorkerSettings } from "../config.js";
 import { currentlyReviewedIds } from "./reviewed.js";
 
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -112,6 +113,14 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
   return { summary: oneLine(detail) || "This change is blocked.", next: `Fix the cause, then /merro retry ${name}.` };
 }
 
+function workerRoleText(role: string, settings: WorkerRoleSettings): string {
+  return `${role} ${settings.runtime}${settings.model ? ` ${settings.model}` : ""}${settings.thinking ? ` (${settings.thinking} thinking)` : ""}`;
+}
+
+export function workerSettingsText(settings: WorkerSettings): string {
+  return `${workerRoleText("implementer", settings.implement)}, ${workerRoleText("reviewer", settings.review)}`;
+}
+
 type PublicStatus = { status: UserChangeState; reason: string | null; owner: Owner; waitingFor: WaitingFor | null };
 
 function publicStatus(
@@ -126,6 +135,7 @@ function publicStatus(
   }
   if (decisionAction === "approve_merge" || decisionAction === "approve_local_merge") return { status: "Needs you", reason: "ready to merge", owner: "user", waitingFor: null };
   if (decisionAction === "approve_fresh_attempt") return { status: "Needs you", reason: "merge conflicts", owner: "user", waitingFor: null };
+  if (decisionAction === "approve_worker_settings") return { status: "Needs you", reason: "worker settings", owner: "user", waitingFor: null };
   if (item.state === "AwaitingApproval" || reviewDecision?.toUpperCase() === "REVIEW_REQUIRED") return waiting({ kind: "github_review" }, "external");
   if (item.state === "AwaitingMerge" && checks.state !== "passed") return waiting({ kind: "github_checks" }, "external");
   if (dependency && (item.state === "Ready" || item.state === "Planned" || dependency.kind === "capacity")) return waiting(dependency, "merro");
@@ -175,10 +185,14 @@ export function presentWorkspace(store: MerroStore, options: PresentationOptions
     const runtime = item && store.getChangeSetRuntime(item.id);
     const pr = typeof payload.pullRequest === "number" ? payload.pullRequest : runtime?.pullRequestNumber ?? null;
     const action = decision.kind === "merge_conflict" ? "approve_fresh_attempt"
+      : decision.kind === "worker_settings" ? "approve_worker_settings"
       : decision.kind === "local_merge" ? "approve_local_merge" : "approve_merge";
+    const settings = action === "approve_worker_settings" ? workerSettingsText(payload.settings as WorkerSettings) : null;
     const summary = action === "approve_fresh_attempt" ? "Approve a fresh attempt to resolve merge conflicts?"
+      : settings ? `${String(payload.objective)} was approved before Merro recorded worker settings. Start with ${settings}?`
       : action === "approve_local_merge" ? "Approve local merge?" : "Approve merge?";
-    return { change: item ? changeName(item) : "change", action, pr, summary };
+    const objective = typeof payload.objective === "string" ? payload.objective : null;
+    return { change: item ? changeName(item) : "change", action, pr, summary, objective };
   });
   const decisionByChange = new Map(decisionRows.map((decision) => [decision.change, decision]));
   const byId = new Map(items.map((item) => [item.id, item]));
@@ -229,6 +243,7 @@ export function presentWorkspace(store: MerroStore, options: PresentationOptions
       if (state === "Done") summary = item.delivery === "local" ? `Completed locally on ${item.targetBranch}` : runtime?.pullRequestNumber ? `PR #${runtime.pullRequestNumber} merged` : "Completed";
       else if (runtime?.pullRequestState?.toUpperCase() === "MERGED" && !runtime.mergedCommitSha) summary = `GitHub marked PR #${runtime.pullRequestNumber} merged; Merro is verifying completion`;
       else if (reason === "ready to merge") summary = decision?.action === "approve_local_merge" ? `Ready to apply locally to ${item.targetBranch}` : "Ready for merge approval";
+      else if (reason === "worker settings") summary = decision!.summary;
       else if (state === "Needs you") summary = runtime?.pullRequestNumber
         ? `PR #${runtime.pullRequestNumber} · Merge conflicts need a resolution`
         : "A decision is needed";
@@ -327,6 +342,7 @@ function checksWord(checks: CheckObservation): string {
 /** Commands the user can run, only for changes the user owns. */
 function userActions(change: ChangeView): string[] {
   if (change.decision?.action === "approve_local_merge") return [`Approve local merge: /merro approve ${change.name}`, `Leave unchanged: /merro leave ${change.name}`];
+  if (change.decision?.action === "approve_worker_settings") return [`Approve worker settings: /merro approve ${change.name}`, `Skip: /merro stop ${change.decision.objective}`];
   if (change.decision?.action === "approve_fresh_attempt") return [`Approve fresh attempt: /merro approve ${change.name}`, `Leave unchanged: /merro leave ${change.name}`];
   if (change.decision) return [`Approve merge: /merro approve ${change.name}`, `Leave open: /merro leave ${change.name}`];
   return [];

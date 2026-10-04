@@ -45,7 +45,7 @@ export default async function merro(pi: MerroExtensionAPI): Promise<void> {
   let sessionStarted = false;
   const configPath = join(cwd, ".merro", "config.json");
   let configError: string | undefined;
-  /** Config edits apply to future plans and workers; approved work keeps its snapshotted settings. */
+  /** Config edits apply to future plans and workers; approved work keeps its snapshotted settings, and recorded working-copy paths stay authoritative. */
   const reloadConfig = async () => {
     try {
       Object.assign(config, await loadConfig(configPath));
@@ -74,13 +74,19 @@ export default async function merro(pi: MerroExtensionAPI): Promise<void> {
   // Capture the raw user message before the model sees it; approval tools read this, not model-authored arguments.
   // Extension-injected input can never authorize, and an unused approval expires once the user's turn settles; Pi's
   // agent_end also fires before automatic retries and post-compaction continuations of that same turn.
-  let latestUserInput: { text: string; at: number } | undefined;
+  // A claimed reply is restored only while it is still the turn's newest input.
+  let currentUserInput: { text: string; at: number } | undefined;
+  let latestUserInput: typeof currentUserInput;
   pi.on("input", (event) => {
-    latestUserInput = event.source === "extension" ? undefined : { text: event.text, at: Date.now() };
+    currentUserInput = latestUserInput = event.source === "extension" ? undefined : { text: event.text, at: Date.now() };
     return { action: "continue" };
   });
-  pi.on("agent_settled", () => { latestUserInput = undefined; });
-  registerMainTools(pi, main, { latest: () => latestUserInput, consume: () => { latestUserInput = undefined; } });
+  pi.on("agent_settled", () => { currentUserInput = latestUserInput = undefined; });
+  registerMainTools(pi, main, {
+    latest: () => latestUserInput,
+    consume: () => { latestUserInput = undefined; },
+    restore: (reply) => { if (reply === currentUserInput) latestUserInput = reply; },
+  });
   pi.on("before_agent_start", async (event) => {
     delete event.systemPromptOptions.sections.merro_workspace;
     delete event.systemPromptOptions.sections.merro_planning;

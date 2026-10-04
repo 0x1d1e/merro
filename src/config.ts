@@ -191,7 +191,7 @@ function settingsObject(value: unknown, name: string, keys: string[]): Record<st
   return input;
 }
 
-function validateDirectory(value: unknown, name: string): string {
+export function validateDirectory(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim() || isAbsolute(value) || /[\r\n\0]/.test(value) || value.split(/[\\/]/).includes("..")) {
     throw new Error(`${name} must be a workspace-relative directory without traversal`);
   }

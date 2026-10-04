@@ -12,6 +12,7 @@ import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest, type Requir
 import { MainOrchestrator, type NamedObjectiveStartInput, type ObjectiveProposal, type ObjectiveStartInput, type RoadmapStatus } from "../src/runtime/main.js";
 import { formatChangeDetails, formatOverview, formatStatus } from "../src/runtime/presentation.js";
 import { initializedState } from "./fixtures.js";
+import { GitClient } from "../src/vcs/git.js";
 
 // These reconciliation scenarios intentionally deliver each issue as a separate change.
 class SeparateChangesMain extends MainOrchestrator {
@@ -27,7 +28,7 @@ import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import { taskWindowName, WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
-const approveSource = { latest: () => ({ text: "approve", at: Number.POSITIVE_INFINITY }), consume() {} };
+const approveSource = { latest: () => ({ text: "approve", at: Number.POSITIVE_INFINITY }), consume() {}, restore() {} };
 const BASE_COMMIT = "b".repeat(40);
 
 async function approveProposal(tools: Map<string, Parameters<MainToolAPI["registerTool"]>[0]>, args: Record<string, unknown>) {
@@ -1534,8 +1535,9 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     async effectiveDiffFingerprint(_project: Project, _path: string, _baseRefName: string, _baseCommit: string, headCommit: string) {
       return options.effectiveDiffFingerprint?.(headCommit) ?? headCommit;
     },
-    async deleteClone(_workRoot: string, path: string) {
+    async deleteClone(workRoot: string, path: string) {
       if (options.deleteCloneFailure) throw new Error("clone cleanup failed");
+      await new GitClient().deleteClone(workRoot, path);
       deletedClones.push(path);
     },
   };
@@ -3483,6 +3485,22 @@ test("local ChangeSet launches without querying an issue", async (t) => {
   assert.ok(![...harness.pullRequests.values()][0]!.body.includes("Closes"));
 });
 
+test("changing worktreesDir still cleans working copies recorded under the previous directory", async (t) => {
+  for (const restart of [false, true]) {
+    const harness = await createHarness(t);
+    const changeSetId = await startDefaultObjective(harness.main);
+    for (let pass = 0; pass < 4; pass++) await harness.main.runPass();
+    const clone = harness.launches[0]!.clonePath;
+    assert.equal(relative(harness.workspacePath, clone).split(sep)[0], DEFAULT_CONFIG.worktreesDir);
+    harness.config.worktreesDir = "moved";
+    const main = restart ? harness.restartMain() : harness.main;
+    await main.resolveMergeDecision((await main.statusSnapshot()).decisions[0]!.id, true);
+    assert.equal((await main.statusSnapshot()).changeSets.find((item) => item.id === changeSetId)?.state, "Done");
+    assert.deepEqual(harness.deletedClones, [clone]);
+    assert.deepEqual(harness.notifications.filter((message) => /working copy/.test(message)), []);
+  }
+});
+
 test("merge finalization remains complete when terminal clone cleanup fails", async (t) => {
   const harness = await createHarness(t, { deleteCloneFailure: true });
   const changeSetId = await startDefaultObjective(harness.main);
@@ -5031,6 +5049,7 @@ test("approved dependency gates queue cross-Project work and supply exact read-o
       try { assert.equal(store.listRelations()[0]?.consumedReviewedCommit, consumed); } finally { store.close(); }
       const apiDecision = snapshot.decisions.find((decision) => decision.subjectId === api.id)!;
       const apiClone = harness.launches.find((launch) => launch.changeSetId === api.id)!.clonePath;
+      harness.config.worktreesDir = "moved"; // Hot reload; the retained clone keeps its recorded location.
       await harness.main.resolveMergeDecision(apiDecision.id, true);
       assert.equal(harness.deletedClones.includes(apiClone), false, "reviewed input must survive prerequisite squash merge");
       await harness.main.runPass();
@@ -5698,7 +5717,7 @@ test("approval reads the raw user message, never a model-authored argument", asy
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   let raw: { text: string; at: number } | undefined;
   const say = (text: string) => { raw = { text, at: Number.POSITIVE_INFINITY }; };
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => raw, consume() { raw = undefined; } });
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => raw, consume() { raw = undefined; }, restore() {} });
   await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
   // A model passing a "corrected" reply cannot change what the user actually typed.
   const start = () => tools.get("merro_start_objective")!.execute("s", { reply: "approve" });
@@ -5725,7 +5744,7 @@ test("an approve sent before the plan or merge decision existed cannot authorize
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   let raw: { text: string; at: number } | undefined;
   const say = async (text: string) => { await new Promise((resolve) => setTimeout(resolve, 2)); raw = { text, at: Date.now() }; };
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => raw, consume() { raw = undefined; } });
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => raw, consume() { raw = undefined; }, restore() {} });
   const start = () => tools.get("merro_start_objective")!.execute("s", {});
 
   await say("approve");
@@ -5792,10 +5811,49 @@ test("changes an approved Objective gains later keep its approved worker setting
   assert.deepEqual([...new Set(harness.launches.map((launch) => launch.workerSettings?.implement.model))], ["model/a"]);
 });
 
+test("new work for an Objective approved without recorded worker settings waits for the user to approve settings", async (t) => {
+  const harness = await createHarness(t, { workerModels: { implement: "model/a", review: "model/a-review" } });
+  const original = harness.issues.get("example:7")!;
+  const { objective } = await harness.main.startObjective({ goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }] });
+  await harness.main.runPass();
+  // Schema 22 recorded no worker settings, so a migrated Objective and its changes have none.
+  const database = new DatabaseSync(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    database.prepare("UPDATE objective_settings SET worker_settings_json = NULL WHERE objective_id = ?").run(objective.id);
+    database.exec("DELETE FROM change_set_worker_settings");
+  } finally { database.close(); }
+  harness.config.workers = { implementer: { runtime: "pi", model: "model/b", thinking: null }, reviewer: { runtime: "pi", model: "model/b-review", thinking: "high" } };
+  const main = harness.restartMain();
+  harness.issues.set("example:9", { ...original, number: 9, title: "Add export", url: original.url.replace("/7", "/9") } as GitHubIssue);
+  harness.setIssueState("example", 7, "CLOSED");
+  await main.runPass();
+  harness.setIssueState("example", 7, "OPEN");
+  await main.runPass();
+  await main.runPass();
+  const launchedBefore = harness.launches.length;
+  assert.deepEqual(harness.launches.map((launch) => launch.changeSetId), ["example:issue-7:g1"]);
+  const waiting = (await main.publicSnapshot()).changes.filter((change) => change.status === "Needs you");
+  assert.deepEqual(waiting.map((change) => change.reason), ["worker settings", "worker settings"]);
+  assert.ok(harness.notifications.some((message) => message.includes("add-export · Needs you")
+    && message.includes("Start its new work with implementer pi model/b, reviewer pi model/b-review (high thinking)?")
+    && message.includes("Approve: /merro approve add-export · Skip: /merro stop features")), harness.notifications.join("\n---\n"));
+  await assert.rejects(main.resolveDecisionForChange("add-export", false), /Skip: \/merro stop features/);
+
+  const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
+  registerCommands({ registerCommand(name, definition) { commands.set(name, definition); } }, harness.workspacePath, main);
+  const messages: string[] = [];
+  await commands.get("merro")!.handler("approve add-export", { ui: { notify(message: string) { messages.push(message); } } });
+  assert.equal(messages.pop(), "Approved worker settings for add-export.");
+  await main.runPass();
+  const launched = harness.launches.slice(launchedBefore);
+  assert.deepEqual(launched.map((launch) => launch.changeSetId).sort(), ["example:issue-7:g2", "example:issue-9:g1"]);
+  assert.deepEqual([...new Set(launched.map((launch) => launch.workerSettings?.review.model))], ["model/b-review"]);
+});
+
 test("/merro approve approves the pending plan it names, and asks when a merge decision also waits", async (t) => {
   const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [42, 43] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => undefined, consume() {} });
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => undefined, consume() {}, restore() {} });
   const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
   registerCommands({ registerCommand(name, definition) { commands.set(name, definition); } }, harness.workspacePath, harness.main);
   const messages: string[] = [];
@@ -5810,19 +5868,46 @@ test("/merro approve approves the pending plan it names, and asks when a merge d
 
   await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #43", change: "fix-43", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [43] }] });
   await run("approve");
-  assert.match(messages.pop() ?? "", /both waiting\. Name one/);
+  assert.equal(messages.pop(), "A plan and a merge decision are both waiting. Use /merro approve plan or /merro approve merge <change>.");
   assert.deepEqual(harness.mergeCalls, []);
   await run("approve fix-43");
   assert.equal(messages.pop(), "Working: fix-43.");
-  // A plan that shares the change awaiting merge cannot be approved by that change's name alone.
-  await tools.get("merro_propose_objective")!.execute("p", { goal: "Track 42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  // A plan whose goal and change both name the change awaiting merge needs the plan/merge qualifier, and the suggestion works.
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
   await run("approve fix-42");
-  assert.match(messages.pop() ?? "", /both name fix-42\. Use \/merro approve track-42 for the plan/);
+  assert.equal(messages.pop(), "The pending plan and a merge decision both name fix-42. Use /merro approve plan fix-42 or /merro approve merge fix-42.");
   assert.deepEqual(harness.mergeCalls, []);
-  await run("approve track-42");
+  await run("approve plan fix-42");
   assert.equal(messages.pop(), "Working: fix-42.");
-  await run("approve fix-42");
+  assert.deepEqual(harness.mergeCalls, []);
+  await run("approve merge fix-42");
   assert.equal(harness.mergeCalls.length, 1);
+});
+
+test("a user's approve survives a wrong change name but is spent once an approval acts", async (t) => {
+  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [42] }] });
+  // Same claim/restore rules as the extension entrypoint.
+  let current: { text: string; at: number } | undefined;
+  let latest: typeof current;
+  const say = async () => { await new Promise((resolve) => setTimeout(resolve, 2)); current = latest = { text: "approve", at: Date.now() }; };
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main,
+    { latest: () => latest, consume() { latest = undefined; }, restore(reply) { if (reply === current) latest = reply; } });
+  const call = async (name: string, args: Record<string, unknown>) => (await tools.get(name)!.execute(name, args)).content[0]!.text;
+
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  await say();
+  await assert.rejects(call("merro_start_objective", { change: "fix-99" }), /does not match the pending plan/);
+  assert.equal(await call("merro_start_objective", { change: "fix-42" }), "Working: fix-42.");
+  assert.match(await call("merro_start_objective", {}), /^Unknown choice: \(empty\)/);
+  for (let pass = 0; pass < 3; pass++) await harness.main.runPass();
+
+  await say();
+  await assert.rejects(call("merro_resolve_decision", { change: "fix-99", approved: true }));
+  assert.equal(harness.mergeCalls.length, 0);
+  await call("merro_resolve_decision", { change: "fix-42", approved: true });
+  assert.equal(harness.mergeCalls.length, 1);
+  assert.match(await call("merro_resolve_decision", { change: "fix-42", approved: true }), /^Unknown choice: \(empty\)/);
 });
 
 test("the review-round limit is read when the plan is approved, not when it is proposed", async (t) => {
