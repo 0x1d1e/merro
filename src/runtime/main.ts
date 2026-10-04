@@ -363,7 +363,8 @@ function sameRemoteRepository(current: string, discovered: string): boolean {
 
 function requiredCheckFailed(pullRequest: GitHubPullRequest, policy: BranchPolicy): boolean {
   if (!policy.known) return false;
-  const failures = new Set(["FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE"]);
+  // Deterministic outcomes only. Infrastructure outcomes (STARTUP_FAILURE, CANCELLED, ACTION_REQUIRED) never spend a worker round on unchanged code.
+  const failures = new Set(["FAILURE", "ERROR", "TIMED_OUT"]);
   return policy.requiredStatusChecks.some((name) => pullRequest.checks.some((check) =>
     check.name === name
       && (failures.has(check.state.toUpperCase()) || (check.conclusion !== null && failures.has(check.conclusion.toUpperCase()))),

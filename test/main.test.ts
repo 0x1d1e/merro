@@ -3695,6 +3695,8 @@ test("reopened issue generations use distinct branches and pull requests", async
 
 const reworkScenarios: Array<{ name: string; update: Partial<GitHubPullRequest> }> = [
   { name: "failed required CI", update: { checks: [{ name: "CI", state: "COMPLETED", conclusion: "FAILURE", detailsUrl: null }] } },
+  { name: "errored required status context", update: { checks: [{ name: "CI", state: "ERROR", conclusion: null, detailsUrl: null }] } },
+  { name: "timed-out required CI", update: { checks: [{ name: "CI", state: "COMPLETED", conclusion: "TIMED_OUT", detailsUrl: null }] } },
 ];
 
 for (const scenario of reworkScenarios) {
@@ -3721,6 +3723,62 @@ for (const scenario of reworkScenarios) {
     assert.equal(afterRework.decisions.length, 0);
     assert.notEqual(harness.pullRequests.get(number)?.headRefOid, original.headRefOid);
     assert.equal(harness.pullRequests.get(number)?.reviewDecision, null);
+  });
+}
+
+test("pending required CI holds the manual merge Decision until it turns green", async (t) => {
+  const harness = await createHarness(t, { requireExternalApproval: true });
+  await startDefaultObjective(harness.main);
+  for (let pass = 0; pass < 3; pass += 1) await harness.main.runPass();
+  const [number, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number && pullRequest);
+  const approval = {
+    reviewDecision: "APPROVED",
+    reviews: [{ id: "approval", author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: pullRequest.headRefOid }],
+  };
+  for (const state of ["QUEUED", "IN_PROGRESS", "PENDING"]) {
+    harness.setPullRequest(number, { ...approval, checks: [{ name: "CI", state, conclusion: null, detailsUrl: null }] });
+    await harness.main.runPass();
+    const snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.decisions.length, 0, `${state} must not offer merge`);
+    assert.equal(snapshot.changeSets[0]?.state, "AwaitingMerge");
+  }
+  assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review"]);
+
+  harness.setPullRequest(number, { checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }] });
+  await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).decisions.filter((decision) => decision.kind === "merge").length, 1);
+  assert.deepEqual(harness.mergeCalls, []);
+});
+
+for (const transient of [
+  { state: "COMPLETED", conclusion: "STARTUP_FAILURE" },
+  { state: "COMPLETED", conclusion: "CANCELLED" },
+  { state: "COMPLETED", conclusion: "ACTION_REQUIRED" },
+]) {
+  test(`transient required CI ${transient.conclusion} waits for a rerun without spending a worker round`, async (t) => {
+    const harness = await createHarness(t, { requireExternalApproval: true });
+    await startDefaultObjective(harness.main);
+    for (let pass = 0; pass < 3; pass += 1) await harness.main.runPass();
+    const [number, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
+    assert.ok(number && pullRequest);
+    harness.setPullRequest(number, {
+      reviewDecision: "APPROVED",
+      reviews: [{ id: "approval", author: "maintainer", state: "APPROVED", submittedAt: "2026-01-02T00:00:00Z", commitId: pullRequest.headRefOid }],
+      checks: [{ name: "CI", ...transient, detailsUrl: null }],
+    });
+    for (let pass = 0; pass < 2; pass += 1) await harness.main.runPass();
+    let snapshot = await harness.main.statusSnapshot();
+    assert.deepEqual(harness.launches.map((launch) => launch.role), ["implement", "review"]);
+    assert.equal(snapshot.changeSets[0]?.state, "AwaitingMerge");
+    assert.equal(snapshot.decisions.length, 0);
+    assert.equal(harness.pullRequests.get(number)?.headRefOid, pullRequest.headRefOid);
+
+    harness.setPullRequest(number, { checks: [{ name: "CI", state: "COMPLETED", conclusion: "SUCCESS", detailsUrl: null }] });
+    await harness.main.runPass();
+    snapshot = await harness.main.statusSnapshot();
+    assert.equal(snapshot.decisions.filter((decision) => decision.kind === "merge").length, 1);
+    assert.equal(harness.launches.length, 2);
   });
 }
 
