@@ -14,7 +14,7 @@ Docker is optional. It stages normal Pi configuration into scratch, mounts only 
 
 One full local clone per ChangeSet: `<root>/.wt/<project>/<semantic-slug>`, or configured worktrees directory. The same clone/branch serves implementation, review, rework and merge preparation. Cloning preserves the configured Git identity. Local delivery points clone remotes at the canonical checkout; PR delivery points them at base/push repositories. The registered source checkout is not the worker working directory. Persisted legacy clone paths remain authoritative.
 
-Task scratch is `.merro/runtime/tasks/<implement-or-review>-<change>-<attempt>/`. Names and collision suffixes are semantic, never UUIDs. Exact completed dependency checkouts live under Task scratch, read-only, without a shared cache.
+Task scratch is `.merro/runtime/tasks/<implement-or-review>-<change>-<attempt>/`. Names and collision suffixes are semantic, never UUIDs. Exact dependency checkouts live under Task scratch, read-only, without a shared cache. Reviewed-gate implementers and reviewers receive the prerequisite's exact passing-review commit, PR, review summary and checkout. Source from its ChangeSet clone when the commit is not yet merged; retain that clone while unfinished approved reviewed-gate dependents need it.
 
 Main writes fresh `.merro-task.md` in the clone, excluded through Git's local exclude file. It contains change name, all issue contents/acceptance criteria, relevant Objective, role instructions, and role-appropriate context. Review handoffs stay compact; Main stages scoped guidance separately as Pi system-prompt context. Task text contains no private Task/Objective/Decision/ChangeSet keys. Task history retains the input; safe finalization removes the shared file only when no successor owns it.
 
@@ -35,7 +35,7 @@ Pi labels the initial CLI task input interactive. Accept that first input, then 
 
 ## tmux and identity
 
-Sessions are `<tmux.session>-<project>` (default `merro-<project>`), windows `impl-<change>` or `rev-<change>`. One pane per window. Disable automatic rename and allow-rename; persist stable window ID and exact pane ID. Sessions are detached, never auto-attached. Host workers enable `remain-on-exit`: an unexpected Pi exit leaves the exact dead pane, tmux exit status/signal and scrollback available to reconciliation. Main writes a bounded plain-text pane capture to `.merro/runtime/diagnostics/<task-attempt>.log` before finalizing the infrastructure failure; the log survives Task scratch cleanup. A missing pane remains distinct evidence of external tmux/session removal.
+Sessions are `<tmux.session>-<project>` (default `merro-<project>`), windows `impl-<change>` or `rev-<change>`. One pane per window. Disable automatic rename and allow-rename; persist stable window ID and exact pane ID. Sessions are detached, never auto-attached. Semantic lookup must be exact: sibling Project/session or change/window prefixes never prove existence or ownership. Verify each tmux command's target semantics rather than assuming `=` works identically everywhere. Host workers enable `remain-on-exit`: an unexpected Pi exit leaves the exact dead pane, tmux exit status/signal and scrollback available to reconciliation. Main writes a bounded plain-text pane capture to `.merro/runtime/diagnostics/<task-attempt>.log` before finalizing the infrastructure failure; the log survives Task scratch cleanup. A missing pane remains distinct evidence of external tmux/session removal.
 
 Ownership is private metadata: workspace owner marker, Project, Task and ChangeSet keys, runtime kind and clone path. Keep the workspace owner marker across restarts/moves. Tmux options and Docker labels are machine metadata, not public names. Persisted legacy ownership may migrate only after exact recorded runtime/process proof; never rediscover/adopt by window name alone.
 
@@ -53,7 +53,7 @@ The Worker calls `merro_submit_result`. Model parameters do not include `task_id
 
 Persisted protocol artifacts include private `task_id` for matching, not public presentation:
 
-- Implementation: success/failed, activity summary, commit, verification; optional `changes` with 1-20 single-line product-facing bullets, at most 300 characters each; failure reason/diagnostics. Legacy PR title/body remain accepted for historical compatibility but are never used to publish PR content.
+- Implementation: success/failed, activity summary, commit, verification; optional `changes` with 1-20 single-line product-facing bullets, at most 300 characters each; failure reason/diagnostics; optional `dependency_suggestions` on success or failure name existing issues in other registered Projects, a reviewed/done gate and a concise reason. Main alone proposes scope/Relations for approval. Legacy PR title/body remain accepted for historical compatibility but are never used to publish PR content.
 - Review: pass/reject/failed, summary, reviewed commit, findings, verification; failure reason.
 - Finding: blocking/non-blocking/note, summary, optional repo-relative file and line range. Blocking findings require rejection.
 - Verification: exact command, Project, working directory and exit code, or manual summary. No environment secrets or full logs.

@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { DEFAULT_CONFIG, type MerroConfig } from "../src/config.js";
 import { MerroStore } from "../src/store/store.js";
 import type { Project, Relation } from "../src/domain/model.js";
-import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest } from "../src/github/client.js";
+import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest, type RequiredTeamReviewRequirement } from "../src/github/client.js";
 import { MainOrchestrator, type NamedObjectiveStartInput, type ObjectiveProposal, type ObjectiveStartInput, type RoadmapStatus } from "../src/runtime/main.js";
 import { initializedState } from "./fixtures.js";
 
@@ -535,7 +535,7 @@ test("pasted Markdown tables work without a Project heading or Status column", a
   });
   const documentedDetails = documented.details as {
     plans: Array<{ change: string; issues: number[]; order?: string }>;
-    relations: Array<{ kind: string; from: string; to: string }>;
+    relations: Array<{ kind: string; from: string; to: string; gate?: string }>;
     planning: { unresolved: Array<{ statement: string }> };
     runnableImmediately: number;
   };
@@ -544,7 +544,7 @@ test("pasted Markdown tables work without a Project heading or Status column", a
     ["admin-api", [105], "1B"],
     ["cli-contract", [101, 103], "2A"],
   ]);
-  assert.deepEqual(documentedDetails.relations, [{ kind: "Requires", from: "cli-contract", to: "provider-primitives" }]);
+  assert.deepEqual(documentedDetails.relations, [{ kind: "Requires", from: "cli-contract", to: "provider-primitives", gate: "done" }]);
   assert.deepEqual(documentedDetails.planning.unresolved, []);
   assert.equal(documentedDetails.runnableImmediately, 2);
 
@@ -558,8 +558,8 @@ test("pasted Markdown tables work without a Project heading or Status column", a
     ].join("\n"),
     project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
   });
-  const dependencyDetails = dependencyColumn.details as { relations: Array<{ from: string; to: string }> };
-  assert.deepEqual(dependencyDetails.relations, [{ kind: "Requires", from: "consumer", to: "provider" }]);
+  const dependencyDetails = dependencyColumn.details as { relations: Array<{ kind: string; from: string; to: string; gate?: string }> };
+  assert.deepEqual(dependencyDetails.relations, [{ kind: "Requires", from: "consumer", to: "provider", gate: "done" }]);
 
   await assert.rejects(tools.get("merro_propose_objective")!.execute("unknown-column", {
     goal: "Do not discard unknown roadmap columns",
@@ -671,13 +671,13 @@ test("Markdown dependency wording fails closed and 'last' waits for all earlier 
     project_map: [{ heading: "Kinetix", project_slug: "kinetix" }],
   });
   const lastDetails = last.details as {
-    relations: Array<{ kind: string; from: string; to: string }>;
+    relations: Array<{ kind: string; from: string; to: string; gate?: string }>;
     planning: { items: Array<{ workstream: string; sourceDependencies?: Array<{ workstream: string; projectSlug: string }> }> };
     runnableImmediately: number;
   };
   assert.deepEqual(lastDetails.relations, [
-    { kind: "Requires", from: "final-release", to: "sibling-a" },
-    { kind: "Requires", from: "final-release", to: "sibling-b" },
+    { kind: "Requires", from: "final-release", to: "sibling-a", gate: "done" },
+    { kind: "Requires", from: "final-release", to: "sibling-b", gate: "done" },
   ]);
   assert.deepEqual(lastDetails.planning.items.find(({ workstream }) => workstream === "Final release")?.sourceDependencies, [
     { workstream: "Sibling A", projectSlug: "kinetix" },
@@ -1184,6 +1184,7 @@ interface HarnessOptions {
   maxConcurrentTasks?: number;
   requireExternalApproval?: boolean;
   dismissStaleApprovals?: boolean;
+  requiredTeamReviews?: RequiredTeamReviewRequirement[];
   reviewerWritePermission?: (username: string) => boolean;
   branchPolicyAvailable?: boolean;
   unsupportedPolicyReason?: string;
@@ -1397,6 +1398,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         requiredApprovingReviewCount: options.requireExternalApproval ? 1 : 0,
         requireCodeOwnerReviews: false,
         dismissStaleApprovals: options.dismissStaleApprovals ?? false,
+        requiredTeamReviews: options.requiredTeamReviews ?? [],
       };
     },
     async mergeSquash(_project: Project, number: number, expectedHead: string) {
@@ -1895,7 +1897,7 @@ test("incomplete v11 Objective scopes remain readable and reconcile after upgrad
   try {
     database.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?")
       .run(JSON.stringify([{ projectSlug: "api", query: { labels: ["feature"] } }]), objective.id);
-    database.exec("DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
+    database.exec("DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
   } finally { database.close(); }
   const restarted = harness.restartMain();
   assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, [
@@ -3293,6 +3295,78 @@ test("branch policy is evaluated against the pull request base branch", async (t
   assert.equal(harness.branchPolicyBranches.at(-1), "release");
 });
 
+test("applicable required team review waits for GitHub approval and resumes automatically", async (t) => {
+  const harness = await createHarness(t, {
+    requiredTeamReviews: [{ teamId: 42, minimumApprovals: 2, filePatterns: [] }],
+  });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const [number, pullRequest] = [...harness.pullRequests.entries()][0] ?? [];
+  assert.ok(number && pullRequest);
+
+  harness.setPullRequest(number, { changedFiles: ["src/index.ts"] });
+  await harness.main.runPass();
+
+  let state = await harness.main.statusSnapshot();
+  assert.equal(state.changeSets[0]?.state, "AwaitingApproval");
+  assert.equal(state.decisions.length, 0);
+  assert.ok(harness.notifications.some((message) => /Awaiting required team review/.test(message)));
+  let store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  assert.equal(store.getChangeSetRuntime(state.changeSets[0]!.id)?.githubTeamReviewPending, true);
+  store.close();
+
+  harness.setPullRequest(number, { reviewDecision: "APPROVED", mergeStateStatus: "CLEAN" });
+  await harness.main.runPass();
+
+  state = await harness.main.statusSnapshot();
+  assert.equal(state.changeSets[0]?.state, "AwaitingMerge");
+  assert.equal(state.decisions[0]?.kind, "merge");
+  store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  assert.equal(store.getChangeSetRuntime(state.changeSets[0]!.id)?.githubTeamReviewPending, false);
+  store.close();
+  const oldDecision = state.decisions[0]!;
+  const taskCount = state.tasks.length;
+  harness.setPullRequest(number, { reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED" });
+  await harness.main.resolveMergeDecision(oldDecision.id, true);
+  state = await harness.main.statusSnapshot();
+  assert.equal(state.changeSets[0]?.state, "AwaitingApproval");
+  assert.equal(state.decisions.length, 0);
+  assert.equal(state.tasks.length, taskCount, "team policy changes do not invalidate independent review");
+  assert.match(await harness.main.retryChangeSet(), /continue automatically once GitHub reports/);
+  harness.setPullRequest(number, { reviewDecision: "APPROVED", mergeStateStatus: "CLEAN" });
+  await harness.main.runPass();
+  const newDecision = (await harness.main.statusSnapshot()).decisions[0]!;
+  assert.notEqual(newDecision.id, oldDecision.id);
+  await harness.main.resolveMergeDecision(newDecision.id, true);
+  assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "Done");
+});
+
+test("team review gate fails closed on missing file data and ignores zero or unmatched requirements", async (t) => {
+  const scenarios = [
+    { minimumApprovals: 0, filePatterns: [], changedFiles: undefined, expected: "AwaitingMerge" },
+    { minimumApprovals: 2, filePatterns: ["src/**"], changedFiles: ["README.md"], expected: "AwaitingMerge" },
+    { minimumApprovals: 2, filePatterns: ["src/**"], changedFiles: undefined, expected: "AwaitingApproval" },
+  ];
+  for (const scenario of scenarios) {
+    const harness = await createHarness(t, {
+      requiredTeamReviews: [{ teamId: 42, minimumApprovals: scenario.minimumApprovals, filePatterns: scenario.filePatterns }],
+    });
+    await startDefaultObjective(harness.main);
+    await harness.main.runPass();
+    await harness.main.runPass();
+    await harness.main.runPass();
+    const [number] = [...harness.pullRequests.entries()][0] ?? [];
+    assert.ok(number);
+    harness.setPullRequest(number, scenario.changedFiles === undefined ? {} : { changedFiles: scenario.changedFiles });
+    await harness.main.runPass();
+    const state = await harness.main.statusSnapshot();
+    assert.equal(state.changeSets[0]?.state, scenario.expected);
+    assert.equal(state.decisions.length, scenario.expected === "AwaitingApproval" ? 0 : 1);
+  }
+});
+
 test("required approvals count only write-eligible reviewers and allow stale approvals when configured", async (t) => {
   const harness = await createHarness(t, { requireExternalApproval: true });
   await startDefaultObjective(harness.main);
@@ -4157,7 +4231,7 @@ test("new Main consumes a healthy worker result after a crash without restarting
       async createPullRequest() { throw new Error("not reached"); },
       async pullRequest() { throw new Error("not reached"); },
       async syncPullRequestContent() {},
-      async branchProtection() { return { known: true, requiredStatusChecks: [], requiredApprovingReviewCount: 0, requireCodeOwnerReviews: false, dismissStaleApprovals: false }; },
+      async branchProtection() { return { known: true, requiredStatusChecks: [], requiredApprovingReviewCount: 0, requireCodeOwnerReviews: false, dismissStaleApprovals: false, requiredTeamReviews: [] }; },
       async hasWritePermission() { return false; },
       async mergeSquash() {},
     },
@@ -4520,6 +4594,257 @@ test("review cap ignores stopped Objective owners and uses the strictest active 
   await capped.main.runPass();
   await capped.main.runPass();
   assert.equal((await capped.main.statusSnapshot()).changeSets[0]?.blockedReason, "review_cap");
+});
+
+test("Worker-discovered dependencies become an approval-gated Objective before companion work starts", async (t) => {
+  const harness = await createHarness(t, {
+    together: true,
+    projects: [
+      { slug: "app", issueNumbers: [1] },
+      { slug: "api", issueNumbers: [2] },
+    ],
+    result(input, _launchNumber, result) {
+      if (input.role !== "implement" || input.project.slug !== "app") return result;
+      return {
+        ...result,
+        dependency_suggestions: [{
+          project_slug: "api", issue_number: 2, gate: "reviewed",
+          reason: "The app change requires this API capability.",
+        }],
+      };
+    },
+  });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  await harness.main.startObjective({
+    goal: "Implement the app change",
+    projectSlugs: ["app"],
+    issues: [{ projectSlug: "app", numbers: [1] }],
+  });
+
+  await harness.main.runPass();
+  assert.match(harness.launches[0]?.taskFile ?? "", /Registered Projects: api, app/);
+  assert.match(harness.launches[0]?.taskFile ?? "", /do not create ChangeSets, Relations, or start cross-Project work/);
+  await harness.main.runPass();
+  await harness.main.runPass();
+
+  assert.deepEqual(harness.launches.map((launch) => [launch.project.slug, launch.role]), [
+    ["app", "implement"],
+  ]);
+  assert.equal(harness.pullRequests.size, 0, "unapproved prerequisite must hold dependent delivery");
+  assert.ok(harness.notifications.some((message) => message.includes("Worker-reported dependencies for")
+    && message.includes("app") && message.includes("api")
+    && message.includes("Requires(reviewed)") && message.includes("The app change requires this API capability.")), harness.notifications.join("\n---\n"));
+  const beforeApproval = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.deepEqual(beforeApproval.listRelations(), []); } finally { beforeApproval.close(); }
+
+  const recoveredMain = harness.restartMain();
+  await recoveredMain.runPass();
+  assert.equal(harness.launches.length, 1, "Main restart must preserve the discovery gate without starting work");
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, recoveredMain);
+  const approve = tools.get("merro_start_objective");
+  assert.ok(approve);
+  assert.match((await approve.execute("approve", {})).content[0]?.text ?? "", /Working:/);
+  assert.equal(harness.launches.at(-1)?.project.slug, "api");
+
+  const afterApproval = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    const app = afterApproval.listChangeSets().find((item) => item.projectSlug === "app");
+    const api = afterApproval.listChangeSets().find((item) => item.projectSlug === "api");
+    assert.ok(app && api);
+    assert.deepEqual(afterApproval.listRelations().filter((relation) => relation.kind === "Requires").map((relation) => ({
+      from: relation.from, to: relation.to, gate: relation.gate,
+    })), [{ from: app.id, to: api.id, gate: "reviewed" }]);
+  } finally { afterApproval.close(); }
+});
+
+test("explicit changed requirements supersede old Worker discoveries without rewriting Task history", async (t) => {
+  let implementations = 0;
+  const harness = await createHarness(t, { projects: [{ slug: "app", issueNumbers: [1] }],
+    result(input, _number, result) {
+      if (input.role !== "implement" || ++implementations !== 1) return result;
+      return { task_id: input.taskId, status: "failed", commit: input.expectedCommit, summary: "Cannot proceed", reason: "Assumed API dependency", verification: [],
+        dependency_suggestions: [{ project_slug: "unregistered-api", issue_number: 2, gate: "done", reason: "Assumed prerequisite" }] };
+    },
+  });
+  await harness.main.startObjective({ goal: "Refactor app", projectSlugs: ["app"], issues: [{ projectSlug: "app", numbers: [1] }] });
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const before = await harness.main.statusSnapshot();
+  assert.equal(before.changeSets[0]?.state, "Blocked");
+  const task = before.tasks[0];
+  assert.ok(task);
+  assert.equal(harness.notifications.filter((message) => message.includes("Could not prepare the Worker-reported")).length, 1);
+  await harness.main.restartChange(before.changeSets[0]!.slug, "Approved revised scope: local refactor, no API dependency.");
+  assert.equal(harness.launches.filter((launch) => launch.role === "implement").length, 2);
+  assert.deepEqual((await harness.main.statusSnapshot()).tasks.find((candidate) => candidate.id === task.id), task);
+});
+
+test("approved dependency gates queue cross-Project work and supply exact read-only commits", async (t) => {
+  for (const gate of ["reviewed", "done"] as const) {
+    const harness = await createHarness(t, { projects: [{ slug: "api", issueNumbers: [1] }, { slug: "app", issueNumbers: [2] }] });
+    const input: NamedObjectiveStartInput = {
+      goal: "Ship the API and app", changeSets: [{ name: "api-contract", projectSlug: "api", issues: [1] },
+        { name: "app-client", projectSlug: "app", issues: [2] }],
+      relations: [{ kind: "Requires", from: "app-client", to: "api-contract", gate }],
+    };
+    const proposal = await harness.main.proposeObjective(input);
+    assert.equal(proposal.runnableImmediately, 1);
+    await harness.main.startObjective(input, proposal.id);
+    await harness.main.runPass();
+    assert.deepEqual(harness.launches.map((launch) => launch.project.slug), ["api"]);
+    await harness.main.runPass();
+    assert.deepEqual(harness.launches.map((launch) => [launch.project.slug, launch.role]), [["api", "implement"], ["api", "review"]]);
+    await harness.main.runPass();
+    await harness.main.runPass();
+    const snapshot = await harness.main.statusSnapshot();
+    const api = snapshot.changeSets.find((item) => item.projectSlug === "api")!;
+    const app = snapshot.changeSets.find((item) => item.projectSlug === "app")!;
+    const apiReview = snapshot.tasks.find((task) => task.changeSetId === api.id && task.role === "review")!;
+    if (gate === "done") {
+      assert.equal(harness.launches.some((launch) => launch.project.slug === "app"), false);
+      assert.equal(app.state, "Planned");
+      const decision = snapshot.decisions.find((decision) => decision.subjectId === api.id)!;
+      await harness.main.resolveMergeDecision(decision.id, true);
+    }
+    const appLaunch = harness.launches.find((launch) => launch.project.slug === "app")!;
+    assert.ok(appLaunch, `${gate} did not automatically unlock app`);
+    const consumed = gate === "reviewed" ? apiReview.reviewedCommit : "e".repeat(40);
+    assert.match(appLaunch.taskFile, new RegExp(`Commit: ${consumed}`));
+    assert.equal(appLaunch.dependencies?.length, 1);
+    assert.equal((await readFile(join(appLaunch.dependencies![0]!.checkoutPath, "MERRO_COMMIT"), "utf8")).trim(), consumed);
+    if (gate === "reviewed") {
+      assert.match(appLaunch.taskFile, /PR: https:/);
+      assert.equal((await harness.main.statusSnapshot()).changeSets.find((item) => item.id === api.id)?.state, "AwaitingMerge");
+      const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+      try { assert.equal(store.listRelations()[0]?.consumedReviewedCommit, consumed); } finally { store.close(); }
+      const apiDecision = snapshot.decisions.find((decision) => decision.subjectId === api.id)!;
+      const apiClone = harness.launches.find((launch) => launch.changeSetId === api.id)!.clonePath;
+      await harness.main.resolveMergeDecision(apiDecision.id, true);
+      assert.equal(harness.deletedClones.includes(apiClone), false, "reviewed input must survive prerequisite squash merge");
+      await harness.main.runPass();
+      await harness.main.runPass();
+      const appReview = harness.launches.find((launch) => launch.changeSetId === app.id && launch.role === "review")!;
+      assert.match(appReview.taskFile, new RegExp(`Commit: ${consumed}`));
+      assert.match(appReview.taskFile, /PR: https:/);
+      assert.match(appReview.taskFile, /Summary: /);
+      const appDecision = (await harness.main.statusSnapshot()).decisions.find((decision) => decision.subjectId === app.id)!;
+      await harness.main.resolveMergeDecision(appDecision.id, true);
+      assert.equal(harness.deletedClones.includes(apiClone), true, "retained clone must be cleaned after approved consumers finish");
+    }
+  }
+});
+
+test("failed implementer discoveries reuse running prerequisites after fresh approval", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "api", issueNumbers: [1] }, { slug: "app", issueNumbers: [2] }],
+    result(input, _number, result) {
+      if (input.project.slug !== "app" || input.role !== "implement") return result;
+      return { task_id: input.taskId, status: "failed", commit: input.expectedCommit, summary: "Waiting for API support",
+        reason: "The approved API capability is missing", verification: [],
+        dependency_suggestions: [{ project_slug: "api", issue_number: 1, gate: "reviewed", reason: "Requires the API contract" }] };
+    },
+  });
+  const api = await harness.main.startObjective({ goal: "API support", projectSlugs: ["api"], issues: [{ projectSlug: "api", numbers: [1] }] });
+  await harness.main.runPass();
+  await harness.main.startObjective({ goal: "App support", projectSlugs: ["app"], issues: [{ projectSlug: "app", numbers: [2] }] });
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.ok(harness.notifications.some((message) => message.includes("Requires(reviewed)")));
+  const approved = await harness.main.approveObjective();
+  assert.equal(approved.changeSets.find((item) => item.projectSlug === "api")?.id, api.changeSets[0]?.id);
+  assert.equal(approved.changeSets.find((item) => item.projectSlug === "app")?.state, "Implementing");
+  await harness.main.runPass();
+  assert.equal(harness.launches.filter((launch) => launch.project.slug === "api" && launch.role === "implement").length, 1);
+  assert.equal(harness.launches.filter((launch) => launch.project.slug === "app" && launch.role === "implement").length, 2);
+});
+
+test("Worker discoveries preserve an unrelated pending approval plan", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "api", issueNumbers: [1, 3] }, { slug: "app", issueNumbers: [2] }],
+    result(input, _number, result) {
+      return input.project.slug === "app" && input.role === "implement" ? { ...result,
+        dependency_suggestions: [{ project_slug: "api", issue_number: 1, gate: "done", reason: "Required capability" }] } : result;
+    },
+  });
+  await harness.main.startObjective({ goal: "App support", projectSlugs: ["app"], issues: [{ projectSlug: "app", numbers: [2] }] });
+  const unrelated: NamedObjectiveStartInput = { goal: "Separate API cleanup", changeSets: [{ name: "cleanup", projectSlug: "api", issues: [3] }] };
+  await harness.main.proposeObjective(unrelated);
+  await harness.main.runPass();
+  await harness.main.runPass();
+  assert.ok(harness.notifications.some((message) => message.includes("current pending plan is unchanged")));
+  assert.equal(harness.launches.some((launch) => launch.project.slug === "app" && launch.role === "review"), false);
+  const approved = await harness.main.approveObjective("cleanup");
+  assert.deepEqual(approved.changeSets.map((item) => item.slug), ["cleanup"]);
+  await harness.main.runPass();
+  assert.ok(harness.notifications.some((message) => message.includes("Worker-reported dependencies for") && message.includes("Requires(done)")));
+  const app = (await harness.main.statusSnapshot()).changeSets.find((item) => item.projectSlug === "app");
+  assert.ok(app);
+  const dependencyPlan = await harness.main.approveObjective(app.slug);
+  assert.ok(dependencyPlan.changeSets.some((item) => item.projectSlug === "api" && item.issues.some((issue) => issue.number === 1)));
+});
+
+test("a new reviewed prerequisite commit reopens stale downstream work before merge", async (t) => {
+  const harness = await createHarness(t, {
+    projects: [{ slug: "api", issueNumbers: [1] }, { slug: "app", issueNumbers: [2] }, { slug: "web", issueNumbers: [3] }],
+  });
+  const started = await harness.main.startObjective({
+    goal: "Ship the API, app and web changes",
+    projectSlugs: ["api", "app", "web"],
+    issues: [{ projectSlug: "api", numbers: [1] }, { projectSlug: "app", numbers: [2] }, { projectSlug: "web", numbers: [3] }],
+  });
+  const api = started.changeSets.find((item) => item.projectSlug === "api");
+  const app = started.changeSets.find((item) => item.projectSlug === "app");
+  const web = started.changeSets.find((item) => item.projectSlug === "web");
+  assert.ok(api && app && web);
+  await harness.main.updateRelations([{
+    kind: "Requires", from: app.id, to: api.id, confidence: "explicit",
+    rationale: "The app requires the API change.", evidence: "The approved issues describe a dependency.", gate: "reviewed",
+  }, {
+    kind: "Requires", from: web.id, to: app.id, confidence: "explicit",
+    rationale: "The web consumes the app contract.", evidence: "Approved dependency.", gate: "reviewed",
+  }]);
+  const runUntil = async (predicate: () => Promise<boolean>, message: string) => {
+    for (let attempt = 0; attempt < 12; attempt++) {
+      if (await predicate()) return;
+      await harness.main.runPass();
+    }
+    assert.fail(message);
+  };
+  const snapshot = () => harness.main.statusSnapshot();
+  await runUntil(async () => (await snapshot()).changeSets.some((item) => item.id === web.id && item.state === "AwaitingMerge"),
+    "transitive downstream ChangeSet did not reach AwaitingMerge");
+  const originalTasks = (await snapshot()).tasks;
+  const oldWebDecision = (await snapshot()).decisions.find((decision) => decision.subjectId === web.id)!;
+  const oldDecision = (await snapshot()).decisions.find((decision) => decision.subjectId === app.id);
+  assert.ok(oldDecision);
+  const previousApiReview = (await snapshot()).tasks.filter((task) => task.changeSetId === api.id && task.role === "review").at(-1);
+  assert.equal(previousApiReview?.outcome, "pass");
+
+  await harness.main.restartChange(api.slug, "Revise the API contract after the app consumed its reviewed version.");
+  assert.equal((await snapshot()).decisions.some((decision) => decision.id === oldDecision.id || decision.id === oldWebDecision.id), false);
+  assert.equal(harness.launches.filter((launch) => launch.changeSetId === app.id && launch.role === "implement").length, 1);
+  await runUntil(async () => harness.launches.filter((launch) => launch.changeSetId === app.id && launch.role === "implement").length === 2,
+    "stale downstream ChangeSet was not reimplemented after the prerequisite review changed");
+
+  const after = await snapshot();
+  for (const original of originalTasks) assert.deepEqual(after.tasks.find((task) => task.id === original.id), original);
+  assert.equal(harness.launches.filter((launch) => launch.changeSetId === web.id && launch.role === "implement").length, 1);
+  assert.equal(after.tasks.find((task) => task.changeSetId === app.id && task.role === "implement")?.outcome, "success");
+  assert.equal(after.decisions.some((decision) => decision.id === oldDecision.id), false);
+  assert.equal(after.changeSets.find((item) => item.id === app.id)?.state, "Implementing");
+  assert.match(harness.launches.filter((launch) => launch.changeSetId === app.id && launch.role === "implement").at(-1)?.taskFile ?? "", /Previously implemented work is stale/);
+  const latestApiReview = after.tasks.filter((task) => task.changeSetId === api.id && task.role === "review").at(-1);
+  assert.equal(latestApiReview?.outcome, "pass");
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try {
+    assert.equal(store.listRelations().find((relation) => relation.from === app.id && relation.to === api.id)?.consumedReviewedCommit,
+      latestApiReview?.reviewedCommit);
+  } finally { store.close(); }
+  await assert.rejects(harness.main.resolveMergeDecision(oldDecision.id, true), /pending merge Decision not found/);
+  await runUntil(async () => (await snapshot()).changeSets.some((item) => item.id === web.id && item.state === "AwaitingMerge"),
+    "transitive dependent did not pass fresh review and return to merge approval");
+  assert.equal(harness.launches.filter((launch) => launch.changeSetId === web.id && launch.role === "implement").length, 2);
 });
 
 test("cross-Project dependency DAG gates work through implement, review, fix, and merge", async (t) => {

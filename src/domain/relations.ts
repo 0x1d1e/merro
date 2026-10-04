@@ -69,6 +69,9 @@ export function analyzeIssueRelations(
 }
 
 export function normalizeRelation(relation: Relation): Relation {
+  if (relation.gate !== undefined && (relation.kind !== "Requires" || relation.gate !== "reviewed" && relation.gate !== "done")) {
+    throw new Error("Only Requires relations can select a reviewed or done gate");
+  }
   if (relation.from === relation.to) {
     throw new Error("relation cannot target itself");
   }

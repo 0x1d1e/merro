@@ -9,7 +9,8 @@ const allowedTransitions: Readonly<Record<FlowChangeSetState, ReadonlySet<Change
   Reviewed: new Set(["AwaitingLocalMerge", "Publishing", "Implementing", "Reviewing", "Blocked", "Obsolete"]),
   AwaitingLocalMerge: new Set(["Done", "Implementing", "Blocked", "Obsolete"]),
   Publishing: new Set(["AwaitingMerge", "Implementing", "Reviewing", "PublishBlocked", "Blocked", "Obsolete"]),
-  AwaitingMerge: new Set(["Implementing", "Reviewing", "Done", "Blocked", "Obsolete"]),
+  AwaitingMerge: new Set(["AwaitingApproval", "Implementing", "Reviewing", "Done", "Blocked", "Obsolete"]),
+  AwaitingApproval: new Set(["AwaitingMerge", "Implementing", "Reviewing", "Done", "Blocked", "Obsolete"]),
 };
 
 function isFlowChangeSetState(state: ChangeSetState): state is FlowChangeSetState {
@@ -31,7 +32,7 @@ export function assertChangeSetTransition(
 ): void {
   if (from === to) return;
   if ((from === "Reviewed" && to === "Done")
-    || (delivery === "local" && ["Publishing", "PublishBlocked", "AwaitingMerge"].includes(to))
+    || (delivery === "local" && ["Publishing", "PublishBlocked", "AwaitingMerge", "AwaitingApproval"].includes(to))
     || (delivery === "pr" && to === "AwaitingLocalMerge")) {
     throw new InvalidChangeSetTransitionError(from, to);
   }

@@ -3,13 +3,14 @@ import { lstat, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { MerroConfig, WorkerSettings } from "../config.js";
-import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate } from "../domain/model.js";
+import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate, type RequiresGate } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../domain/relations.js";
 import { schedule } from "../domain/scheduler.js";
-import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult } from "../protocol/result.js";
+import { assertResultMatchesTask, parseImplementResult, parseReviewResult, type ImplementFailedResult, type ImplementSuccessResult, type ReviewFailedResult, type ReviewResult, type Verification, type WorkerResult, type DependencySuggestion } from "../protocol/result.js";
 import { GitHubClient, GitHubMergeError, isTransientGitHubFailure, supportsPullRequestRemote, type BranchPolicy, type GitHubIssue, type GitHubPullRequest } from "../github/client.js";
+import { requiredTeamReviewApplies, teamReviewGateSatisfied } from "../github/team-review.js";
 import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
@@ -82,6 +83,7 @@ export interface ObjectiveRelationInput {
   kind: "Requires" | "Conflicts";
   from: string;
   to: string;
+  gate?: RequiresGate;
 }
 
 interface ObjectiveInputOptions {
@@ -213,8 +215,8 @@ function proposalFingerprint(graph: ObjectiveGraph, projects: readonly Project[]
     projects: projects.map(({ slug, path, baseRemote, pushRemote, defaultBranch }) => ({ slug, path, baseRemote, pushRemote, defaultBranch })),
     changeSets: graph.changeSets.map((item) => ({ id: item.id, name: changeName(item), projectSlug: item.projectSlug,
       issues: item.issues, generation: item.generation, delivery: item.delivery, targetBranch: item.targetBranch })),
-    branches: graph.branches, relations: graph.relations, relationNames: graph.relationNames,
-    unresolved: graph.unresolved, planning: graph.planning, cycle: graph.cycle, runnableImmediately: graph.runnableImmediately,
+    branches: graph.branches, relations: graph.relations.map(({ consumedReviewedCommit: _consumed, ...relation }) => relation), relationNames: graph.relationNames,
+    unresolved: graph.unresolved, planning: graph.planning, cycle: graph.cycle,
   });
 }
 
@@ -392,6 +394,7 @@ async function satisfiesBranchPolicy(
   }
   const approvalsReady = eligibleApprovals >= policy.requiredApprovingReviewCount;
   const codeOwnersReady = !policy.requireCodeOwnerReviews || reviewDecision === "APPROVED";
+  if (!teamReviewGateSatisfied(pullRequest, policy)) return false;
   return pullRequest.state === "OPEN" && !pullRequest.isDraft
     && pullRequest.mergeable === "MERGEABLE" && checksReady && approvalsReady && codeOwnersReady;
 }
@@ -555,19 +558,21 @@ export class MainOrchestrator {
   proposeObjective(input: ObjectiveStartInput): Promise<ObjectiveProposal>;
   proposeObjective(input: NamedObjectiveStartInput | ObjectiveStartInput): Promise<ObjectiveProposal>;
   async proposeObjective(input: ObjectiveRequest): Promise<ObjectiveProposal> {
-    return this.#withStore(async (store) => {
-      const prepared = await this.#prepareObjective(store, input);
-      const id = randomUUID();
-      const workerSettings: WorkerSettings = {
-        implement: { ...this.#config.worker },
-        review: { ...this.#config.reviewer },
-      };
-      const proposal = { id, workerSettings, ...prepared.graph };
-      this.#proposals.clear();
-      this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph, prepared.projects),
-        names: prepared.graph.changeSets.map((item) => changeName(item)) });
-      return proposal;
-    });
+    return this.#withStore((store) => this.#recordObjectiveProposal(store, input));
+  }
+
+  async #recordObjectiveProposal(store: MerroStore, input: ObjectiveRequest): Promise<ObjectiveProposal> {
+    const prepared = await this.#prepareObjective(store, input);
+    const id = randomUUID();
+    const workerSettings: WorkerSettings = {
+      implement: { ...this.#config.worker },
+      review: { ...this.#config.reviewer },
+    };
+    const proposal = { id, workerSettings, ...prepared.graph };
+    this.#proposals.clear();
+    this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph, prepared.projects),
+      names: prepared.graph.changeSets.map((item) => changeName(item)) });
+    return proposal;
   }
 
   async #prepareObjective(store: MerroStore, input: ObjectiveRequest) {
@@ -706,8 +711,10 @@ export class MainOrchestrator {
       const from = namesToIds.get(fromName);
       const to = namesToIds.get(toName);
       if (!from || !to) throw new Error(`Relation must reference named ChangeSets in this Objective: '${fromName}' -> '${toName}'`);
+      if (edge.kind === "Conflicts" && edge.gate !== undefined) throw new Error("Only Requires relations can select a gate");
       const relation = normalizeRelation({ kind: edge.kind, from, to, confidence: "explicit",
-        rationale: "Approved in the Objective plan.", evidence: `${fromName} ${edge.kind} ${toName}` });
+        rationale: "Approved in the Objective plan.", evidence: `${fromName} ${edge.kind} ${toName}`,
+        ...(edge.kind === "Requires" ? { gate: edge.gate ?? "done" } : {}) });
       const key = `${relation.kind}\0${relation.from}\0${relation.to}`;
       if (!seenExplicitRelations.has(key)) explicitRelations.push(relation);
       seenExplicitRelations.add(key);
@@ -750,7 +757,7 @@ export class MainOrchestrator {
     const activeIds = store.listTasks().filter((task) => task.status === "active" && relatedIds.has(task.changeSetId)).map((task) => task.changeSetId);
     const unresolvedIds = new Set(unresolved.map((item) => item.changeSetId));
     const runnableImmediately = schedule({ changeSets: participants, relations: effective, activeTaskCount: 0,
-      maxConcurrentTasks: "unlimited", activeChangeSetIds: activeIds }).selected
+      maxConcurrentTasks: "unlimited", activeChangeSetIds: activeIds, reviewedChangeSetIds: [...this.#reviewedChangeSetIds(store)] }).selected
       .filter((item) => ids.has(item.id) && !unresolvedIds.has(item.id)).length;
     return { projects, issueScopes, approvedIssueScopes, issueRows, automaticRelations, explicitRelations,
       graph: { changeSets, branches: Object.fromEntries(changeSets.map((item) => [item.id,
@@ -799,7 +806,21 @@ export class MainOrchestrator {
         items.push(store.getChangeSet(item.id)!);
       }
       store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations, [], explicitRelations);
-      return { objective, changeSets: items };
+      for (const item of items) {
+        if (item.state !== "Blocked" || item.blockedReason !== "task_failed" || item.blockedResumeState !== "Implementing") continue;
+        const latest = store.listTasks(item.id).at(-1);
+        if (latest?.role !== "implement" || latest.outcome !== "failed" || !latest.resultJson) continue;
+        let suggestions: DependencySuggestion[] | undefined;
+        try { suggestions = parseImplementResult(JSON.parse(latest.resultJson)).dependency_suggestions; } catch { continue; }
+        if (!suggestions?.length) continue;
+        const approved = suggestions.every((suggestion) => store.listRelations().some((relation) => {
+          const prerequisite = store.getChangeSet(relation.to);
+          return relation.kind === "Requires" && relation.from === item.id && (relation.gate ?? "done") === suggestion.gate
+            && prerequisite?.projectSlug === suggestion.project_slug && issueNumbers(prerequisite).includes(suggestion.issue_number);
+        }));
+        if (approved) store.transitionChangeSet(item.id, "Implementing");
+      }
+      return { objective, changeSets: items.map((item) => store.getChangeSet(item.id)!) };
     });
   }
 
@@ -839,13 +860,18 @@ export class MainOrchestrator {
         try { await this.#git.discardAttempt(runtime.clonePath, runtime.expectedCommit); }
         catch (error) { this.#block(store, item, "task_failed", `Stopped worker, but could not restore the attempt base: ${errorText(error)}`); throw error; }
       }
+      const implementation = store.listTasks(item.id).filter((candidate) => candidate.role === "implement").at(-1);
+      if (implementation) store.appendEvent("Task", implementation.id, "dependency_discovery_superseded", {});
+      for (const [id, proposal] of this.#proposals) {
+        if (proposal.names.includes(item.slug)) this.#proposals.delete(id);
+      }
       store.saveChangeSetGuidance(item.id, `${item.guidance ?? ""}\n\nChanged requirements:\n${requirements}`.trim());
       this.#resolvePullRequestDecisions(store, item.id);
       if (item.state === "Blocked" || item.state === "PublishBlocked") {
         store.transitionChangeSet(item.id, item.blockedResumeState!);
         item = store.getChangeSet(item.id)!;
       }
-      if (["Reviewing", "Reviewed", "AwaitingLocalMerge", "Publishing", "AwaitingMerge"].includes(item.state)) store.transitionChangeSet(item.id, "Implementing");
+      if (["Reviewing", "Reviewed", "AwaitingLocalMerge", "Publishing", "AwaitingMerge", "AwaitingApproval"].includes(item.state)) store.transitionChangeSet(item.id, "Implementing");
       const workRuntime = store.getChangeSetRuntime(item.id);
       if (workRuntime) {
         workRuntime.infrastructureRetries = 0;
@@ -977,6 +1003,8 @@ export class MainOrchestrator {
       if (!normalized && candidates.length > 1) return { message: `Choose a change to retry: ${candidates.map(changeName).join(", ")}.` };
       const item = candidates[0];
       if (!item) {
+        const teamWaiting = (selected ? [selected] : changes).filter((candidate) => candidate.state === "AwaitingApproval");
+        if (teamWaiting.length) return { message: `${teamWaiting.map(changeName).join(", ")} · GitHub requires review from a configured team for files changed by this PR. Merro will continue automatically once GitHub reports the merge requirement satisfied.` };
         if (selected?.state === "AwaitingMerge" && store.getChangeSetRuntime(selected.id)?.githubReviewDecision?.toUpperCase() === "REVIEW_REQUIRED") {
           return { message: `Nothing to retry. ${changeName(selected)} needs GitHub reviewer approval.` };
         }
@@ -1043,6 +1071,9 @@ export class MainOrchestrator {
       }
 
       const { unsafeProjects } = await this.#workerSafetyPreflight(store);
+      if ((await this.#unapprovedDiscoveredDependencies(store, item)).length || this.#reconcileReviewedDependencies(store, unsafeProjects).has(item.id)) {
+        throw new Error("Merge approval expired because prerequisites changed or a discovery still needs approval; reconcile before approving again.");
+      }
       if (approved && unsafeProjects.has(project.slug)) {
         throw new Error(`Worker safety prevents merge approval in Project ${project.slug}; retry after live workers exit and inventory succeeds. Decision remains pending.`);
       }
@@ -1101,6 +1132,10 @@ export class MainOrchestrator {
         if (!currentDiff || (expectedDiff ? currentDiff !== expectedDiff : payload.headRefOid !== pullRequest.headRefOid)
           || remoteHead !== pullRequest.headRefOid || !latestReview || reviewHash !== currentDiff
           || !await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
+          if (requiredTeamReviewApplies(pullRequest, policy) && !teamReviewGateSatisfied(pullRequest, policy)) {
+            this.#waitForRequiredTeamReview(store, item, runtime, pullRequest);
+            return;
+          }
           store.resolveDecision(decisionId, "resolved");
           runtime.reviewedDiffHash = null;
           store.saveChangeSetRuntime(runtime);
@@ -1151,6 +1186,7 @@ export class MainOrchestrator {
         return "declined";
       }
       const { unsafeProjects } = await this.#workerSafetyPreflight(store);
+      if ((await this.#unapprovedDiscoveredDependencies(store, item)).length || this.#reconcileReviewedDependencies(store, unsafeProjects).has(item.id)) return "blocked";
       if (unsafeProjects.has(project.slug) || store.activeTask(item.id)) {
         throw new Error(`Worker safety prevents local merge in Project ${project.slug}; retry after workers exit and inventory succeeds. Decision remains pending.`);
       }
@@ -1212,9 +1248,9 @@ export class MainOrchestrator {
       const item = store.getChangeSet(decision.subjectId);
       const runtime = item && store.getChangeSetRuntime(item.id);
       const project = item && store.getProject(item.projectSlug);
-      if (!item || item.state !== "AwaitingMerge" || !runtime?.clonePath || !runtime.branchName
+      if (!item || item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval" || !runtime?.clonePath || !runtime.branchName
         || !runtime.pullRequestNumber || !project) {
-        throw new Error(`merge_conflict Decision ${decisionId} no longer matches an AwaitingMerge ChangeSet`);
+        throw new Error(`merge_conflict Decision ${decisionId} no longer matches an open pull request ChangeSet`);
       }
       const { unsafeProjects } = await this.#workerSafetyPreflight(store);
       if (resolution === "resolved" && unsafeProjects.has(project.slug)) {
@@ -1286,19 +1322,34 @@ export class MainOrchestrator {
         for (const item of store.listChangeSets()) {
           if (!unsafeProjects.has(item.projectSlug)) this.#obsoleteIfUnowned(store, item);
         }
-        publicationDeferred = await this.#reconcileLocalDelivery(store, unavailableProjects, unsafeProjects);
-        publicationDeferred = await this.#reconcilePublication(store, unavailableProjects, unsafeProjects) || publicationDeferred;
+        const discoveredGates = await this.#reconcileDiscoveredDependencies(store);
+        const staleDependencies = this.#reconcileReviewedDependencies(store, unsafeProjects);
+        for (const id of discoveredGates) staleDependencies.add(id);
+        publicationDeferred = await this.#reconcileLocalDelivery(store, unavailableProjects, unsafeProjects, staleDependencies);
+        publicationDeferred = await this.#reconcilePublication(store, unavailableProjects, unsafeProjects, staleDependencies) || publicationDeferred;
         await this.#reconcilePullRequests(store, unavailableProjects, unsafeProjects);
+        this.#reconcileReviewedDependencies(store, unsafeProjects);
         const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds, issueCache);
         for (const id of scopeGates) relationGates.add(id);
-        this.#deriveReady(store, unavailableProjects, relationGates, unsafeProjects, orphans.changeSetIds);
+        for (const id of discoveredGates) relationGates.add(id);
+        for (const relation of store.listRelations()) {
+          if (relation.kind !== "Requires") continue;
+          const prerequisite = store.getChangeSet(relation.to);
+          if (prerequisite && (unsafeProjects.has(prerequisite.projectSlug) || unavailableProjects.has(prerequisite.projectSlug))) {
+            relationGates.add(relation.from);
+          }
+        }
+        const reviewedChangeSetIds = this.#reviewedChangeSetIds(store);
+        this.#deriveReady(store, unavailableProjects, relationGates, unsafeProjects, orphans.changeSetIds, reviewedChangeSetIds);
         const tasks = store.listTasks();
         const active = tasks.filter((task) => task.status === "active");
         const items = store.listChangeSets();
         const result = schedule({
-          changeSets: items.filter((item) => store.hasActiveObjectiveForChangeSet(item.id)
-            && !unavailableProjects.has(item.projectSlug) && !unsafeProjects.has(item.projectSlug) && !relationGates.has(item.id)),
+          changeSets: items.filter((item) => item.state === "Done" || reviewedChangeSetIds.has(item.id)
+            || store.hasActiveObjectiveForChangeSet(item.id)
+              && !unavailableProjects.has(item.projectSlug) && !unsafeProjects.has(item.projectSlug) && !relationGates.has(item.id)),
           relations: store.listRelations(),
+          reviewedChangeSetIds: [...reviewedChangeSetIds],
           activeTaskCount: active.length + orphans.count,
           activeChangeSetIds: [...active.map((task) => task.changeSetId), ...orphans.changeSetIds],
           maxConcurrentTasks: this.#config.max_concurrent_tasks,
@@ -1423,19 +1474,31 @@ export class MainOrchestrator {
         ? parseImplementResult(JSON.parse(implementationTask.resultJson))
         : null;
       const instructions = role === "implement" ? await this.#repositoryInstructions(clonePath) : [];
+      const reviewedChangeSetIds = this.#reviewedChangeSetIds(store);
       const directDependencies = store.listRelations().filter((relation) => relation.kind === "Requires" && relation.from === item.id)
         .flatMap((relation) => {
           const dependency = store.getChangeSet(relation.to);
-          if (!dependency || dependency.state !== "Done") return [];
+          const isDone = dependency?.state === "Done";
+          if (!dependency || !isDone && ((relation.gate ?? "done") !== "reviewed" || !reviewedChangeSetIds.has(dependency.id))) return [];
           const depRuntime = store.getChangeSetRuntime(dependency.id);
           const sourceProject = store.getProject(dependency.projectSlug);
-          const summary = store.listTasks(dependency.id).reverse().find((task) => task.role === "review" && task.summary)?.summary ?? null;
+          const latestReview = store.listTasks(dependency.id).filter((task) => task.role === "review").at(-1);
+          const reviewedCommit = latestReview?.outcome === "pass" ? latestReview.reviewedCommit : null;
+          const consumesReview = (relation.gate ?? "done") === "reviewed";
+          const commit = consumesReview ? reviewedCommit : depRuntime?.mergedCommitSha ?? null;
+          const project = sourceProject && consumesReview && depRuntime?.clonePath
+            ? { ...sourceProject, path: depRuntime.clonePath, baseRemote: "", pushRemote: "" }
+            : sourceProject && dependency.delivery === "local"
+              ? { ...sourceProject, baseRemote: "", pushRemote: "" }
+              : sourceProject;
+          const summary = latestReview?.summary ?? null;
           return [{
+            relation,
             changeSetId: dependency.id,
             projectSlug: dependency.projectSlug,
-            project: sourceProject && dependency.delivery === "local" ? { ...sourceProject, baseRemote: "", pushRemote: "" } : sourceProject,
+            project,
             pullRequestUrl: depRuntime?.pullRequestUrl ?? null,
-            commit: depRuntime?.mergedCommitSha ?? null,
+            commit,
             summary,
           }];
         });
@@ -1450,10 +1513,10 @@ export class MainOrchestrator {
         ])
         : "";
       const useDocker = (projectSettings?.sandbox ?? this.#config.sandbox) === "docker";
-      const dependencyMounts = role === "review" ? directDependencies.map((dependency, index) => {
+      const dependencyMounts = directDependencies.map((dependency, index) => {
         if (!dependency.project) throw new Error(`dependency Project ${dependency.projectSlug} is not registered`);
         if (!dependency.commit || !/^[0-9a-f]{40,64}$/i.test(dependency.commit)) {
-          throw new Error(`dependency ChangeSet ${dependency.changeSetId} has no exact merged commit`);
+          throw new Error(`dependency ChangeSet ${dependency.changeSetId} has no exact prerequisite commit`);
         }
         const mountNumber = index + 1;
         return {
@@ -1465,24 +1528,27 @@ export class MainOrchestrator {
             mountPath: `/merro-dependencies/${mountNumber}`,
           },
         };
-      }) : [];
+      });
       const dependencyContext = directDependencies.map((dependency, index) => ({
         change: this.#names.get(dependency.changeSetId) ?? "dependency",
         projectSlug: dependency.projectSlug,
         pullRequestUrl: dependency.pullRequestUrl,
         commit: dependency.commit,
         summary: dependency.summary,
+        ...(dependency.relation.gate ? { gate: dependency.relation.gate } : {}),
         ...(dependencyMounts[index] ? {
           checkoutPath: useDocker ? dependencyMounts[index]!.mount.mountPath : dependencyMounts[index]!.mount.checkoutPath,
         } : {}),
       }));
       const taskFile = renderTaskFile({
         role, change: slug, projectSlug: item.projectSlug,
+        ...(role === "implement" ? { registeredProjects: store.listProjects().map((registered) => registered.slug) } : {}),
         issues: issueNumbers(item),
         title: slug, scope: issues.length ? issues.map((issue) => `### #${issue.number}: ${issue.title}\n\n${issue.body}`).join("\n\n") : item.guidance ?? objective.goal,
         implementation: implementationResult?.status === "success" ? implementationResult : null,
         objective: objective.goal,
-        userGuidance: item.guidance ?? "",
+        userGuidance: [item.guidance ?? "", ...(role === "implement" && store.hasEvent("ChangeSet", item.id, "dependency_stale")
+          ? ["Previously implemented work is stale against the approved prerequisites. Revalidate the complete change against the exact dependency checkouts below, update code as needed, and rerun verification before committing. Preserve prior finalized commits."] : [])].filter(Boolean).join("\n\n"),
         projectGuidance: projectSettings?.guidance ?? "",
         markdownGuidance: role === "implement" ? markdownGuidance : [],
         repositoryInstructions: instructions,
@@ -1516,8 +1582,14 @@ export class MainOrchestrator {
         store.saveChangeSetRuntime(runtime);
       }
       for (const dependency of dependencyMounts) {
-        if (!this.#git.createReadOnlyCheckout) throw new Error("Git adapter cannot create dependency review checkouts");
+        if (!this.#git.createReadOnlyCheckout) throw new Error("Git adapter cannot create dependency checkouts");
         await this.#git.createReadOnlyCheckout(dependency.project, dependency.mount.checkoutPath, dependency.commit);
+      }
+      for (const dependency of directDependencies) {
+        if (role === "implement" && (dependency.relation.gate ?? "done") === "reviewed" && dependency.commit) {
+          store.recordReviewedDependencyConsumption(item.id, dependency.changeSetId, dependency.commit);
+          store.appendEvent("Task", taskId, "reviewed_dependency_consumed", { prerequisite: dependency.changeSetId, commit: dependency.commit });
+        }
       }
       workerLaunchStarted = true;
       const record = await this.#workers.launch(launchInput, runtimeIntent);
@@ -1717,9 +1789,10 @@ export class MainOrchestrator {
     effective: readonly Relation[],
     explicit: readonly Relation[],
   ): Promise<void> {
-    const existing = new Set(store.listRelations().map(relationKey));
+    const existing = new Map(store.listRelations().map((relation) => [relationKey(relation), relation]));
     const explicitKeys = new Set(explicit.map(relationKey));
-    const additions = effective.filter((relation) => explicitKeys.has(relationKey(relation)) && !existing.has(relationKey(relation)));
+    const additions = effective.filter((relation) => explicitKeys.has(relationKey(relation))
+      && (!existing.has(relationKey(relation)) || existing.get(relationKey(relation))?.gate !== relation.gate));
     if (!additions.length) return;
 
     const { unsafeProjects, changeSetIds } = await this.#workerSafetyPreflight(store);
@@ -1908,6 +1981,23 @@ export class MainOrchestrator {
   }
 
   async #reconcileFinalizedTasks(store: MerroStore, unsafeProjects: ReadonlySet<string>): Promise<void> {
+    if (this.#git.deleteClone) {
+      for (const item of store.listChangeSets()) {
+        if (item.state !== "Done" || unsafeProjects.has(item.projectSlug)
+          || !store.hasEvent("ChangeSet", item.id, "dependency_clone_retained")
+          || store.hasEvent("ChangeSet", item.id, "dependency_clone_cleanup_complete")) continue;
+        const needed = store.listRelations().some((relation) => relation.kind === "Requires" && relation.to === item.id
+          && relation.gate === "reviewed" && !terminal(store.getChangeSet(relation.from)!));
+        const clonePath = store.getChangeSetRuntime(item.id)?.clonePath;
+        if (needed || !clonePath) continue;
+        try {
+          await this.#git.deleteClone(join(this.#workspacePath, this.#config.worktreesDir), clonePath);
+          store.appendEvent("ChangeSet", item.id, "dependency_clone_cleanup_complete", {});
+        } catch (error) {
+          this.#notify(`${changeName(item)} · Dependency clone cleanup failed: ${errorText(error)}. Merro will retry automatically.`, "warning");
+        }
+      }
+    }
     const pending = store.listTasksPendingCleanup();
     if (pending.length === 0) return;
     const activeInputs = new Set(store.listActiveTaskInputPaths());
@@ -1947,6 +2037,9 @@ export class MainOrchestrator {
         store.finalizeTask({ id: task.id, outcome: "failed", summary: implementResult.summary, resultJson: JSON.stringify(implementResult) });
         if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) {
           this.#block(store, item, "task_failed", `${implementResult.reason}${implementResult.diagnostics ? `: ${implementResult.diagnostics}` : ""}`);
+          if (implementResult.dependency_suggestions?.length) {
+            await this.#reportDiscoveredDependencies(store, item, implementResult.dependency_suggestions);
+          }
         }
         return;
       }
@@ -1962,7 +2055,9 @@ export class MainOrchestrator {
         workRuntime.baseUpdate = null;
         store.saveChangeSetRuntime(workRuntime);
       }
-      const message = `${changeName(item)} · Local verification passed; reviewing the change.`;
+      if (typed.dependency_suggestions?.length) await this.#reportDiscoveredDependencies(store, item, typed.dependency_suggestions);
+      const awaitingDependencies = (await this.#unapprovedDiscoveredDependencies(store, item)).length > 0;
+      const message = `${changeName(item)} · Local verification passed; ${awaitingDependencies ? "awaiting dependency plan approval" : "reviewing the change"}.`;
       this.#progress(message);
       this.#queueNotification("implementation_complete", item.id, message);
       if (!this.#obsoleteIfUnowned(store, item, unsafeProjects)) store.transitionChangeSet(item.id, "Reviewing");
@@ -2001,6 +2096,175 @@ export class MainOrchestrator {
     this.#notifyReviewComplete(store, item, task);
   }
 
+  async #unapprovedDiscoveredDependencies(store: MerroStore, item: ChangeSet): Promise<DependencySuggestion[]> {
+    const implementation = store.listTasks(item.id).filter((task) => task.role === "implement").at(-1);
+    if (!implementation?.resultJson || implementation.status !== "finalized"
+      || store.hasEvent("Task", implementation.id, "dependency_discovery_superseded")) return [];
+    let suggestions: DependencySuggestion[] | undefined;
+    try { suggestions = parseImplementResult(JSON.parse(implementation.resultJson)).dependency_suggestions; } catch { return []; }
+    const unapproved: DependencySuggestion[] = [];
+    const changeSets = store.listChangeSets();
+    const relations = store.listRelations();
+    for (const suggestion of suggestions ?? []) {
+      const candidates = changeSets.filter((candidate) => candidate.projectSlug === suggestion.project_slug
+        && issueNumbers(candidate).includes(suggestion.issue_number));
+      if (!candidates.some((candidate) => !terminal(candidate))) {
+        if (candidates.some((candidate) => candidate.state === "Done")) continue;
+        const project = store.getProject(suggestion.project_slug);
+        if (project && project.slug !== item.projectSlug) {
+          try { if ((await this.#github.issue(project, suggestion.issue_number)).state.toUpperCase() === "CLOSED") continue; }
+          catch { /* Unknown prerequisite state remains approval-gated. */ }
+        }
+      }
+      const approved = relations.some((relation) => relation.kind === "Requires" && relation.from === item.id
+        && (relation.gate ?? "done") === suggestion.gate && candidates.some((candidate) => candidate.id === relation.to));
+      if (!approved) unapproved.push(suggestion);
+    }
+    return unapproved;
+  }
+
+  async #reconcileDiscoveredDependencies(store: MerroStore): Promise<Set<string>> {
+    const gated = new Set<string>();
+    for (const item of store.listChangeSets()) {
+      if (terminal(item) || !store.hasActiveObjectiveForChangeSet(item.id)) continue;
+      const suggestions = await this.#unapprovedDiscoveredDependencies(store, item);
+      if (!suggestions.length) continue;
+      gated.add(item.id);
+      this.#resolvePullRequestDecisions(store, item.id);
+      if (!this.#proposals.size) await this.#reportDiscoveredDependencies(store, item, suggestions);
+    }
+    return gated;
+  }
+
+  async #reportDiscoveredDependencies(store: MerroStore, item: ChangeSet, suggestions: readonly DependencySuggestion[]): Promise<void> {
+    try {
+      await this.#proposeDiscoveredDependencies(store, item, suggestions);
+    } catch (error) {
+      const task = store.listTasks(item.id).filter((candidate) => candidate.role === "implement").at(-1);
+      if (task && store.hasEvent("Task", task.id, "dependency_proposal_failed")) return;
+      this.#notify(`${changeName(item)} · Could not prepare the Worker-reported dependency proposal: ${errorText(error)}. No companion work was started. Suggestions remain in Task history.`, "warning");
+      if (task) store.appendEvent("Task", task.id, "dependency_proposal_failed", { detail: errorText(error) });
+    }
+  }
+
+  async #proposeDiscoveredDependencies(
+    store: MerroStore,
+    dependent: ChangeSet,
+    suggestions: readonly DependencySuggestion[],
+  ): Promise<void> {
+    const allChangeSets = store.listChangeSets();
+    const requested = new Map<string, { projectSlug: string; issueNumber: number; gate: RequiresGate; reason: string; existing: ChangeSet | null; issueTitle: string | null }>();
+    const proposalsByPair = new Map<string, { gate: RequiresGate; reason: string }>();
+    const skipped: string[] = [];
+    for (const suggestion of suggestions) {
+      const project = store.getProject(suggestion.project_slug);
+      if (!project) throw new Error(`unknown suggested Project '${suggestion.project_slug}'`);
+      if (project.slug === dependent.projectSlug) throw new Error(`suggested issue #${suggestion.issue_number} is not cross-Project`);
+      const key = `${project.slug}\0${suggestion.issue_number}`;
+      const matches = allChangeSets.filter((candidate) => candidate.projectSlug === project.slug
+        && issueNumbers(candidate).includes(suggestion.issue_number));
+      const existing = matches.filter((candidate) => !terminal(candidate))
+        .sort((left, right) => right.generation - left.generation)[0] ?? null;
+      if (!existing && matches.some((candidate) => candidate.state === "Done")) {
+        skipped.push(`${project.slug} #${suggestion.issue_number} is already Done`);
+        continue;
+      }
+      let issueTitle: string | null = null;
+      if (!existing) {
+        const issue = await this.#github.issue(project, suggestion.issue_number);
+        if (issue.state.toUpperCase() !== "OPEN") {
+          skipped.push(`${project.slug} #${suggestion.issue_number} is not open`);
+          continue;
+        }
+        issueTitle = issue.title;
+      }
+      const previous = requested.get(key);
+      if (previous && previous.gate !== suggestion.gate) {
+        throw new Error(`suggested issues grouped in '${existing ? changeName(existing) : `${project.slug} #${suggestion.issue_number}`}' have conflicting gates`);
+      }
+      requested.set(key, { projectSlug: project.slug, issueNumber: suggestion.issue_number, gate: suggestion.gate,
+        reason: suggestion.reason, existing, issueTitle });
+      const prerequisiteId = existing?.id ?? key;
+      const pair = `${dependent.id}\0${prerequisiteId}`;
+      const previousPair = proposalsByPair.get(pair);
+      if (previousPair && previousPair.gate !== suggestion.gate) {
+        throw new Error(`Worker suggested conflicting gates for prerequisite ${existing ? changeName(existing) : `${project.slug} #${suggestion.issue_number}`}`);
+      }
+      proposalsByPair.set(pair, { gate: suggestion.gate, reason: suggestion.reason });
+    }
+
+    const prerequisites = new Map<string, { name: string; projectSlug: string; issues: number[]; existing: ChangeSet | null }>();
+    const relations: ObjectiveRelationInput[] = [];
+    let missingRelation = false;
+    for (const suggestion of requested.values()) {
+      const key = `${suggestion.projectSlug}\0${suggestion.issueNumber}`;
+      const name = suggestion.existing?.slug ?? semanticSlug(`issue-${suggestion.issueNumber}-${suggestion.projectSlug.slice(0, 32)}`);
+      const prerequisiteKey = suggestion.existing?.id ?? key;
+      prerequisites.set(prerequisiteKey, {
+        name, projectSlug: suggestion.projectSlug,
+        issues: suggestion.existing ? issueNumbers(suggestion.existing) : [suggestion.issueNumber], existing: suggestion.existing,
+      });
+      const existingRelation = store.listRelations().find((relation) => relation.kind === "Requires"
+        && relation.from === dependent.id && relation.to === suggestion.existing?.id);
+      if (suggestion.existing && existingRelation?.gate === suggestion.gate) continue;
+      missingRelation = true;
+      relations.push({ kind: "Requires", from: dependent.slug, to: name, gate: suggestion.gate });
+    }
+    if (!missingRelation) {
+      const detail = skipped.length ? ` ${skipped.join("; ")}.` : "";
+      this.#notify(`${changeName(dependent)} · Worker-reported dependencies are already approved or complete; no new proposal is needed.${detail}`);
+      return;
+    }
+
+    const changeSets: ObjectiveChangeSetInput[] = [
+      { name: dependent.slug, projectSlug: dependent.projectSlug, issues: issueNumbers(dependent) },
+      ...[...prerequisites.values()].map(({ name, projectSlug, issues }) => ({ name, projectSlug, issues })),
+    ];
+    const input: NamedObjectiveStartInput = {
+      goal: `Add discovered prerequisites for ${changeName(dependent)}`,
+      priority: dependent.priority,
+      changeSets,
+      relations,
+    };
+    if (this.#proposals.size > 0) {
+      this.#notify(`${changeName(dependent)} · Worker-reported dependencies need a separate approval proposal. The current pending plan is unchanged. After handling it, propose these prerequisites: ${[...requested.values()].map((suggestion) => `${suggestion.projectSlug} #${suggestion.issueNumber} Requires(${suggestion.gate}): ${suggestion.reason}`).join("; ")}. Suggestions remain in Task history. No companion work was started.`, "warning");
+      return;
+    }
+    const proposal = await this.#recordObjectiveProposal(store, input);
+    const names = new Map(proposal.changeSets.map((item) => [item.id, changeName(item)]));
+    for (const [id, name] of Object.entries(proposal.relationNames)) names.set(id, name);
+    const plan = proposal.changeSets.map((item) => {
+      const scope = issueNumbers(item).map((number) => `#${number}`).join(" ") || "existing approved scope";
+      const delivery = item.delivery === "local" ? `local delivery to ${item.targetBranch}` : "PR delivery";
+      return `- ${changeName(item)} · ${item.projectSlug} · ${scope} · ${delivery} · ${proposal.branches[item.id]}`;
+    });
+    const edges = proposal.relations.filter((relation) => relation.kind === "Requires").map((relation) =>
+      `- ${names.get(relation.from) ?? "change"} Requires(${relation.gate ?? "done"}) ${names.get(relation.to) ?? "prerequisite"}`);
+    const reasonLines = [...requested.values()].map((suggestion) => {
+      const target = suggestion.existing?.slug ?? [...prerequisites.values()].find((candidate) => candidate.projectSlug === suggestion.projectSlug
+        && candidate.issues.includes(suggestion.issueNumber))?.name ?? `#${suggestion.issueNumber}`;
+      return `- ${suggestion.projectSlug} #${suggestion.issueNumber} → ${target}: ${suggestion.reason}`;
+    });
+    const message = [
+      `Worker-reported dependencies for ${changeName(dependent)} need a fresh plan approval. No companion work will start before approval.`,
+      "",
+      "Plan",
+      ...plan,
+      "",
+      "Requires relations",
+      ...edges,
+      "",
+      `${proposal.changeSets.length} changes · ${proposal.changeSets.filter((item) => item.delivery === "pr").length} PRs · ${proposal.runnableImmediately} runnable immediately`,
+      "",
+      "Worker suggestions (untrusted context)",
+      ...reasonLines,
+      ...(skipped.length ? ["", "Already satisfied / omitted", ...skipped.map((entry) => `- ${entry}`)] : []),
+      "",
+      `Approve? Use merro_start_objective after explicit user approval (change: ${changeName(dependent)}).`,
+    ].join("\n");
+    this.#notify(message, "warning");
+  }
+
   #notifyReviewComplete(store: MerroStore, item: ChangeSet, task: Task): void {
     if (store.hasEvent("Task", task.id, "review_complete_notified")) return;
     const message = `${changeName(item)} · Review passed; ${item.delivery === "local" ? "requesting local merge approval" : "opening PR"}.`;
@@ -2020,10 +2284,10 @@ export class MainOrchestrator {
     }
   }
 
-  async #reconcileLocalDelivery(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<boolean> {
+  async #reconcileLocalDelivery(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>, staleDependencies: ReadonlySet<string>): Promise<boolean> {
     let deferred = false;
     for (let item of store.listChangeSets()) {
-      if (item.delivery !== "local" || !["Reviewed", "AwaitingLocalMerge"].includes(item.state)
+      if (item.delivery !== "local" || !["Reviewed", "AwaitingLocalMerge"].includes(item.state) || staleDependencies.has(item.id)
         || unavailableProjects.has(item.projectSlug) || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
       if (item.state === "Reviewed" && this.#reviewNotificationsInFlight.has(item.id)) { deferred = true; continue; }
       try {
@@ -2084,10 +2348,10 @@ export class MainOrchestrator {
     this.#progress(`${changeName(item)} · Local base changed; implementing, verifying, and reviewing again.`);
   }
 
-  async #reconcilePublication(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>): Promise<boolean> {
+  async #reconcilePublication(store: MerroStore, unavailableProjects: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>, staleDependencies: ReadonlySet<string>): Promise<boolean> {
     let deferred = false;
     for (let item of store.listChangeSets()) {
-      if (unavailableProjects.has(item.projectSlug) || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
+      if (staleDependencies.has(item.id) || unavailableProjects.has(item.projectSlug) || unsafeProjects.has(item.projectSlug) || store.activeTask(item.id)) continue;
       if (item.delivery === "local") continue;
       const retrying = item.state === "PublishBlocked" && item.blockedReason === "github_unavailable";
       if (item.state !== "Reviewed" && item.state !== "Publishing" && !retrying) continue;
@@ -2175,7 +2439,7 @@ export class MainOrchestrator {
     for (let item of store.listChangeSets()) {
       if (unavailableProjects.has(item.projectSlug) || item.delivery === "local") continue;
       const recovering = item.state === "Blocked"
-        && item.blockedResumeState === "AwaitingMerge"
+        && (item.blockedResumeState === "AwaitingMerge" || item.blockedResumeState === "AwaitingApproval")
         && (item.blockedReason === "github_unavailable" || item.blockedReason === "policy_unknown");
       const runtime = store.getChangeSetRuntime(item.id);
       const project = store.getProject(item.projectSlug);
@@ -2201,7 +2465,7 @@ export class MainOrchestrator {
         }
         const hasPullRequestIdentity = runtime.pullRequestNumber !== null || runtime.branchName !== null;
         const terminalOnly = (item.state === "Blocked" || item.state === "PublishBlocked") && !recovering && hasPullRequestIdentity;
-        if (item.state !== "AwaitingMerge" && !recovering && !terminalOnly) continue;
+        if (item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval" && !recovering && !terminalOnly) continue;
         let pullRequest: GitHubPullRequest | null = null;
         if (runtime.pullRequestNumber) {
           pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
@@ -2354,6 +2618,20 @@ export class MainOrchestrator {
           runtime.reviewedDiffHash = currentDiffHash;
           store.saveChangeSetRuntime(runtime);
         }
+        const teamReviewPending = requiredTeamReviewApplies(pullRequest, policy)
+          && !teamReviewGateSatisfied(pullRequest, policy);
+        if (teamReviewPending) {
+          this.#waitForRequiredTeamReview(store, item, runtime, pullRequest);
+          continue;
+        }
+        if (runtime.githubTeamReviewPending || item.state === "AwaitingApproval") {
+          runtime.githubTeamReviewPending = false;
+          store.saveChangeSetRuntime(runtime);
+          if (item.state === "AwaitingApproval") {
+            store.transitionChangeSet(item.id, "AwaitingMerge");
+            item = store.getChangeSet(item.id) ?? item;
+          }
+        }
         if (!await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
           this.#resolveMergeDecisions(store, item.id);
           continue;
@@ -2410,6 +2688,19 @@ export class MainOrchestrator {
     }
   }
 
+  #waitForRequiredTeamReview(store: MerroStore, item: ChangeSet, runtime: ChangeSetRuntimeRecord, pullRequest: GitHubPullRequest): void {
+    const shouldNotify = !runtime.githubTeamReviewPending || item.state !== "AwaitingApproval";
+    runtime.githubTeamReviewPending = true;
+    store.saveChangeSetRuntime(runtime);
+    this.#resolveMergeDecisions(store, item.id);
+    if (item.state !== "AwaitingApproval") store.transitionChangeSet(item.id, "AwaitingApproval");
+    if (shouldNotify) {
+      const message = `${changeName(item)} · Awaiting required team review for PR #${pullRequest.number}. GitHub requires review from a configured team for files changed by this PR. Merro will continue automatically once GitHub reports the merge requirement satisfied.`;
+      this.#notify(message, "warning");
+      this.#queueNotification("team_review_pending", item.id, message);
+    }
+  }
+
   #resolvePullRequestDecisions(store: MerroStore, changeSetId: string): void {
     for (const decision of store.pendingDecisions()) {
       if (decision.subjectId === changeSetId) store.resolveDecision(decision.id, "resolved");
@@ -2449,7 +2740,10 @@ export class MainOrchestrator {
       }
     }
 
-    if (runtime.clonePath && this.#git.deleteClone && !unsafeProjects.has(item.projectSlug)) {
+    const neededReviewedCheckout = store.listRelations().some((relation) => relation.kind === "Requires"
+      && relation.to === item.id && relation.gate === "reviewed" && !terminal(store.getChangeSet(relation.from)!));
+    if (runtime.clonePath && neededReviewedCheckout) store.appendEvent("ChangeSet", item.id, "dependency_clone_retained", {});
+    if (runtime.clonePath && this.#git.deleteClone && !unsafeProjects.has(item.projectSlug) && !neededReviewedCheckout) {
       try {
         await this.#git.deleteClone(this.#workRoot, runtime.clonePath);
       } catch (error) {
@@ -2459,6 +2753,9 @@ export class MainOrchestrator {
   }
 
   #savePullRequest(store: MerroStore, runtime: ChangeSetRuntimeRecord, pr: GitHubPullRequest): void {
+    if (runtime.pullRequestHeadSha !== pr.headRefOid || runtime.pullRequestBaseSha !== pr.baseRefOid) {
+      runtime.githubTeamReviewPending = false;
+    }
     runtime.pullRequestNumber = pr.number;
     runtime.pullRequestUrl = pr.url;
     runtime.pullRequestState = pr.mergedAt ? "MERGED" : pr.state;
@@ -2537,7 +2834,72 @@ export class MainOrchestrator {
     return gated;
   }
 
-  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>, relationGates: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>, occupiedChangeSetIds: ReadonlySet<string>): void {
+  #reviewedChangeSetIds(store: MerroStore): Set<string> {
+    const reviewedStates = new Set(["Reviewed", "Publishing", "AwaitingMerge", "AwaitingApproval", "AwaitingLocalMerge", "PublishBlocked", "Done"]);
+    const ids = new Set<string>();
+    for (const item of store.listChangeSets()) {
+      const blockedAfterReview = item.state === "Blocked" && item.blockedResumeState !== null
+        && reviewedStates.has(item.blockedResumeState);
+      if (!reviewedStates.has(item.state) && !blockedAfterReview) continue;
+      const latestReview = store.listTasks(item.id).filter((task) => task.role === "review").at(-1);
+      if (latestReview?.outcome === "pass" && latestReview.reviewedCommit) ids.add(item.id);
+    }
+    // A passing review based on stale prerequisites cannot unlock further work.
+    const relations = store.listRelations();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const relation of relations) {
+        if (relation.kind !== "Requires" || relation.gate !== "reviewed" || !ids.has(relation.from)
+          || store.getChangeSet(relation.from)?.state === "Done") continue;
+        const review = store.listTasks(relation.to).filter((task) => task.role === "review").at(-1);
+        if (!ids.has(relation.to) || !relation.consumedReviewedCommit || relation.consumedReviewedCommit !== review?.reviewedCommit) {
+          ids.delete(relation.from);
+          changed = true;
+        }
+      }
+    }
+    return ids;
+  }
+
+  #reconcileReviewedDependencies(store: MerroStore, unsafeProjects: ReadonlySet<string>): Set<string> {
+    const eligible = this.#reviewedChangeSetIds(store);
+    const stale = new Set<string>();
+    for (const relation of store.listRelations()) {
+      if (relation.kind !== "Requires") continue;
+      const item = store.getChangeSet(relation.from);
+      if (!item || terminal(item) || item.state === "Planned" || item.state === "Ready") continue;
+      if ((relation.gate ?? "done") === "done") {
+        if (store.getChangeSet(relation.to)?.state !== "Done") {
+          stale.add(item.id);
+          this.#resolvePullRequestDecisions(store, item.id);
+        }
+        continue;
+      }
+      const review = store.listTasks(relation.to).filter((task) => task.role === "review").at(-1);
+      if (eligible.has(relation.to) && relation.consumedReviewedCommit === review?.reviewedCommit) continue;
+      stale.add(item.id);
+      this.#resolvePullRequestDecisions(store, item.id);
+      if (store.activeTask(item.id) || unsafeProjects.has(item.projectSlug)
+        || item.state === "Blocked" || item.state === "PublishBlocked") continue;
+      const runtime = store.getChangeSetRuntime(item.id);
+      if (runtime) {
+        runtime.reviewedDiffHash = null;
+        store.saveChangeSetRuntime(runtime);
+      }
+      if (item.state !== "Implementing") {
+        store.transitionChangeSet(item.id, "Implementing");
+        store.appendEvent("ChangeSet", item.id, "dependency_stale", {
+          prerequisite: relation.to, consumedCommit: relation.consumedReviewedCommit ?? null,
+          currentReviewedCommit: review?.reviewedCommit ?? null,
+        });
+        this.#notify(`${changeName(item)} · Approved prerequisite changed; waiting for its passing review, then revalidating with a fresh implementation and review.`, "warning");
+      }
+    }
+    return stale;
+  }
+
+  #deriveReady(store: MerroStore, unavailableProjects: ReadonlySet<string>, relationGates: ReadonlySet<string>, unsafeProjects: ReadonlySet<string>, occupiedChangeSetIds: ReadonlySet<string>, reviewedChangeSetIds: ReadonlySet<string>): void {
     const items = store.listChangeSets();
     const byId = new Map(items.map((item) => [item.id, item]));
     const relations = store.listRelations();
@@ -2557,7 +2919,11 @@ export class MainOrchestrator {
         continue;
       }
       const requirements = relations.filter((relation) => relation.kind === "Requires" && relation.from === item.id);
-      const ready = !relationGates.has(item.id) && requirements.every((relation) => byId.get(relation.to)?.state === "Done");
+      const ready = !relationGates.has(item.id) && requirements.every((relation) => {
+        const prerequisite = byId.get(relation.to);
+        return (relation.gate ?? "done") === "reviewed"
+          ? reviewedChangeSetIds.has(relation.to) : prerequisite?.state === "Done";
+      });
       if (item.state === "Planned" && ready) store.transitionChangeSet(item.id, "Ready");
       else if (item.state === "Ready" && !ready) store.transitionChangeSet(item.id, "Planned");
     }

@@ -6,6 +6,7 @@ export interface TaskFileInput {
   role: TaskRole;
   change: string;
   projectSlug: string;
+  registeredProjects?: readonly string[];
   issues: readonly number[];
   title: string;
   scope: string;
@@ -20,6 +21,7 @@ export interface TaskFileInput {
     pullRequestUrl: string | null;
     commit: string | null;
     summary: string | null;
+    gate?: "reviewed" | "done";
     checkoutPath?: string | null;
   }[];
   latestReview: string | null;
@@ -80,6 +82,10 @@ export function renderTaskFile(input: TaskFileInput): string {
         `Create exactly one final merge commit with first parent ${input.expectedCommit} and second parent ${input.baseUpdate.baseCommit}, using the configured Git identity. If the base is already an ancestor, create one ordinary commit directly on ${input.expectedCommit} instead; use --allow-empty when no changes remain after verification. Do not amend or rewrite prior commits.`,
       ] : [`Create exactly one new commit directly on ${input.expectedCommit}, with the configured Git identity. Do not amend or rewrite prior commits.`]),
       "Do not push branches, create pull requests, or merge pull requests. Main owns those operations.",
+      ...(input.registeredProjects?.length ? [
+        `Registered Projects: ${input.registeredProjects.join(", ")}.`,
+        "If approved scope reveals a concrete prerequisite issue in another registered Project, report up to 10 dependency_suggestions in merro_submit_result. Each suggestion needs project_slug, issue_number, an explicit gate (reviewed or done), and a concise reason. Use reviewed only when a passing review is sufficient; use done when actual completion/merge is required. Report evidence-backed prerequisites only, not follow-up ideas or same-Project references. These are suggestions for user approval: do not create ChangeSets, Relations, or start cross-Project work.",
+      ] : []),
       "Run repository CI and report at least one verification command with its actual exit code. Call merro_submit_result exactly once with status success or failed. On success include the final commit SHA, passing verification and changes: concise product-facing bullets describing the actual changes and regression coverage. Keep activity/status in summary; omit commit ancestry, working paths, Merro state and publication commentary from changes. Main generates PR title/body from task intent, these reviewed changes and verification commands; do not supply PR prose. On failure include a reason and diagnostics. Stop after submission.",
     ]
     : [
@@ -106,6 +112,10 @@ export function renderTaskFile(input: TaskFileInput): string {
         : section("Direct dependency commits", input.dependencies.map((dependency) => [
           `### ${dependency.change} (${dependency.projectSlug})`,
           `Commit: ${dependency.commit ?? "unavailable"}`,
+          ...(dependency.gate === "reviewed" ? [
+            `PR: ${dependency.pullRequestUrl ?? "none recorded"}`,
+            `Summary: ${clip(dependency.summary ?? "Review summary unavailable.", 500)}`,
+          ] : []),
           ...(dependency.checkoutPath ? [`Read-only checkout: ${dependency.checkoutPath}`] : []),
         ].join("\n")).join("\n\n")),
       section("Implementation and CI summary", input.implementation ? implementationSummary(input.implementation) : "Implementation summary unavailable."),
@@ -118,6 +128,7 @@ export function renderTaskFile(input: TaskFileInput): string {
       `Objective: ${input.objective}`,
       section("Scope", `${input.title}\n\n${input.scope}`),
       section("User guidance", input.userGuidance),
+      input.registeredProjects?.length ? section("Registered Projects", input.registeredProjects.join(", ")) : "",
       section("Project guidance", input.projectGuidance),
       section("Markdown guidance", renderMarkdownGuidance(input.markdownGuidance ?? [])),
       input.repositoryInstructions.length === 0

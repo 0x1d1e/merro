@@ -100,6 +100,7 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
 
 function userState(item: ChangeSet, reviewDecision: string | null, decisionAction: string | undefined): UserChangeState {
   if (item.state === "Done") return "Done";
+  if (item.state === "AwaitingApproval") return "Working";
   if (item.state === "Blocked" || item.state === "PublishBlocked") return "Blocked";
   if (decisionAction === "approve_merge" || decisionAction === "approve_local_merge") return "Ready to merge";
   if (decisionAction === "approve_fresh_attempt" || reviewDecision?.toUpperCase() === "REVIEW_REQUIRED") return "Needs you";
@@ -164,6 +165,7 @@ export function presentWorkspace(store: MerroStore) {
       else if (item.state === "Publishing") summary = "Opening PR...";
       else if (active?.role === "review") summary = "Checking the latest changes";
       else if (active) summary = "Working on the change";
+      else if (item.state === "AwaitingApproval") summary = `PR #${runtime?.pullRequestNumber} · Awaiting required team review`;
       else if (item.state === "AwaitingMerge" && checks.state === "waiting") summary = `PR #${runtime?.pullRequestNumber} · GitHub checks running`;
       else if (item.state === "AwaitingMerge") summary = `PR #${runtime?.pullRequestNumber} · Waiting for GitHub review and checks`;
       else if (item.state === "Ready" || item.state === "Planned") summary = "Waiting to start";

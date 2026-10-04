@@ -107,10 +107,11 @@ Add a settings screen to my local app.
 Do these two objectives in parallel.
 Show me current status.
 Open a PR for this change instead of delivering locally.
+Queue the app behind the API; let it start once the API passes review.
 Use ROADMAP.md to propose the next implementation stage.
 ```
 
-Issue-based work needs authenticated GitHub CLI (`gh auth login`). Plain local goals do not need GitHub issues or a remote. Main handles scheduling; normal use needs no graph language or internal identifiers.
+Issue-based work needs authenticated GitHub CLI (`gh auth login`). Plain local goals do not need GitHub issues or a remote. Main handles scheduling; normal use needs no graph language or internal identifiers. Cross-Project dependencies require plan approval, then queued work starts automatically when its approved gate opens. Worker discoveries are proposals, not permission to start companion work. Required GitHub team reviews wait and resume automatically.
 
 ### Plan from Markdown
 

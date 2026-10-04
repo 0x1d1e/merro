@@ -7,7 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { Project } from "../src/domain/model.js";
-import { CommandError, type CommandRunner } from "../src/runtime/commands.js";
+import { CommandError, systemCommandRunner, type CommandRunner } from "../src/runtime/commands.js";
 import { taskWindowName, WorkerRuntime } from "../src/runtime/worker-runtime.js";
 
 const exists = async (path: string): Promise<boolean> => access(path).then(() => true, () => false);
@@ -17,6 +17,39 @@ test("Task tmux names use readable ChangeSet references", () => {
   assert.equal(taskWindowName("implement", "plugin-lifecycle-safety"), "impl-plugin-lifecycle-safety");
   assert.equal(taskWindowName("review", "refresh-cli"), "rev-refresh-cli");
   assert.equal(taskWindowName("implement", "legacy-work"), "impl-legacy-work");
+});
+
+test("real tmux does not confuse semantic sessions with prefix neighbours", async (t) => {
+  try { await execFileAsync("tmux", ["-V"]); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") { t.skip("tmux is not installed"); return; }
+    throw error;
+  }
+  const root = await mkdtemp(join(tmpdir(), "merro-exact-tmux-"));
+  const socket = join(root, "tmux.sock");
+  const commands: CommandRunner = { async run(file, args, options) {
+    if (file === "docker") return { stdout: "", stderr: "" };
+    assert.equal(file, "tmux");
+    const target = args[args.indexOf("-t") + 1];
+    if (args.includes("-t")) assert.ok(target?.startsWith("=") || /^[%$@]\d+$/.test(target ?? ""), `non-exact target ${target}`);
+    return systemCommandRunner.run(file, ["-S", socket, "-f", "/dev/null", ...args], options);
+  } };
+  const tmux = (...args: string[]) => systemCommandRunner.run("tmux", ["-S", socket, "-f", "/dev/null", ...args]);
+  t.after(async () => { await tmux("kill-server").catch(() => {}); await rm(root, { recursive: true, force: true }); });
+  await tmux("new-session", "-d", "-s", "merro-kinetix-plugins", "-n", "impl-contract-extra", "sleep 60");
+  const runtime = new WorkerRuntime({ workspacePath: root, config: { ...DEFAULT_CONFIG, sandbox: "none" }, commands });
+  const project: Project = { slug: "kinetix", path: root, baseRemote: "", pushRemote: "", defaultBranch: "main" };
+  assert.deepEqual(await runtime.listOwnedWorkers(project), []);
+  const owner = (await readFile(join(root, "workspace-owner"), "utf8")).trim();
+  await tmux("new-session", "-d", "-s", "merro-kinetix", "-n", "impl-contract", "sleep 60");
+  for (const slug of ["kinetix", "kinetix-plugins"]) {
+    await tmux("set-option", "-t", `=merro-${slug}:`, "@merro_owner", owner);
+    await tmux("set-option", "-t", `=merro-${slug}:`, "@merro_project", slug);
+    const workers = await runtime.listOwnedWorkers({ ...project, slug });
+    assert.equal(workers.length, 1);
+    assert.equal(workers[0]?.tmuxSession, `merro-${slug}`);
+  }
+  assert.notEqual((await runtime.listOwnedWorkers(project))[0]?.paneId,
+    (await runtime.listOwnedWorkers({ ...project, slug: "kinetix-plugins" }))[0]?.paneId);
 });
 
 test("Docker worker uses the built Merro image, owns its tmux session, and isolates a read-only review", async (t) => {
