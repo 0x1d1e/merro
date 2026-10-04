@@ -654,6 +654,30 @@ test("branch rulesets remain authoritative when classic protection returns 404",
   });
 });
 
+test("ruleset pull_request dismissal restrictions are supported without affecting merge readiness", async () => {
+  for (const name of ["dismissal_restriction", "dismissal_restrictions"]) {
+    const commands = new FakeCommands([
+      { stdout: repository("acme/widget"), stderr: "" },
+      new Error("HTTP 404: Branch not protected"),
+      { stdout: JSON.stringify([{
+        type: "pull_request",
+        parameters: { required_approving_review_count: 1, [name]: { users: [], teams: [] } },
+      }]), stderr: "" },
+    ]);
+
+    const policy = await new GitHubClient(commands).branchProtection(project);
+
+    assert.deepEqual(policy, {
+      known: true,
+      requiredStatusChecks: [],
+      requiredApprovingReviewCount: 1,
+      requireCodeOwnerReviews: false,
+      dismissStaleApprovals: false,
+      requiredTeamReviews: [],
+    });
+  }
+});
+
 test("non_fast_forward ruleset policy is supported without affecting merge readiness", async () => {
   const commands = new FakeCommands([
     { stdout: repository("acme/widget"), stderr: "" },

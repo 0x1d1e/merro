@@ -658,6 +658,8 @@ export class GitHubClient {
           rejectUnknownRuleParameters(parameters, new Set([
             "dismiss_stale_reviews_on_push", "require_code_owner_review", "require_last_push_approval",
             "required_approving_review_count", "required_review_thread_resolution", "required_reviewers",
+            // Restricts who may dismiss reviews; does not gate merge readiness.
+            "dismissal_restriction", "dismissal_restrictions",
           ]));
           if (ruleParameterEnabled(parameters, "require_last_push_approval")) throw new Error("ruleset requires unsupported last-push approval");
           if (ruleParameterEnabled(parameters, "required_review_thread_resolution")) throw new Error("ruleset requires unsupported review-thread resolution");
