@@ -22,6 +22,12 @@ const parameters = Type.Object({
   verification: verificationSchema,
   findings: Type.Optional(Type.Array(Type.Any())),
   changes: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 20 })),
+  dependency_suggestions: Type.Optional(Type.Array(Type.Object({
+    project_slug: Type.String({ maxLength: 63 }),
+    issue_number: Type.Integer({ minimum: 1 }),
+    gate: Type.Union([Type.Literal("reviewed"), Type.Literal("done")]),
+    reason: Type.String({ maxLength: 300 }),
+  }, { additionalProperties: false }), { minItems: 1, maxItems: 10 })),
   pr: Type.Optional(Type.Any()),
 }, { additionalProperties: false });
 

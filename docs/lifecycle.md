@@ -6,7 +6,7 @@ Read before changing ChangeSet states, relations, scheduling, PR/merge flow or r
 
 Only `cwd/.merro` is authoritative. `/merro init` creates state explicitly in any writable directory, without requiring a Git repository, remote or GitHub access. First init writes all editable config defaults, short workspace/role Markdown templates, the Project-guidance directory, and default checkout directories. Existing `.merro` makes init a no-op, not a repair. Projects register separately: remote URLs clone into `<root>/projects/<project>`; supplied local paths register directly. No home scanning or destination adoption. Startup opens and reconciles state without replacing config or data. Missing/incomplete state refuses operations with initialization guidance.
 
-Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; replacement or restart expires it. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch, delivery mode, target branch, or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
+Main proposes the user's Objective and waits for approval. One plan is pending per Main/workspace; user replacement or restart expires it. Worker discoveries never replace an unrelated pending plan. Approval may be unqualified or use the semantic change name, never a database key. Changed issue scope, generation, branch, delivery mode, target branch, or relation graph requires fresh approval. A plan displays change names, issues, branches, delivery, PR count and worker counts.
 
 Default grouping combines the selected issues within each Project into one ChangeSet. Issue-free Objectives select named changes with no GitHub scope. Delivery follows each Project checkout by default: supported remotes select PR delivery; without them, delivery is local. Explicit local or PR settings may override the default. Cross-Project Objectives have separate changes. An issue already owned by another active selection cannot be silently regrouped. Separate delivery is explicit, not a second execution model: each delivery unit is still a ChangeSet.
 
@@ -22,6 +22,7 @@ Planned -> Ready -> Implementing -> Reviewing -> Reviewed -> Publishing -> Await
                          +-------------+                         v
                                                         PublishBlocked -> Publishing
 Reviewed -> AwaitingLocalMerge -> Done (local delivery approval)
+AwaitingMerge -> AwaitingApproval -> AwaitingMerge (required team review)
 any non-terminal state -> Blocked -> prior flow after resolution
 idle unfinished work -> Obsolete | Cancelled
 ```
@@ -34,11 +35,13 @@ Changed requirements require stopping the exact owned Worker, confirming exit, c
 
 ## Relations and scheduling
 
-- `Requires` waits for actual completion, normally merge. Internal references among issues in one ChangeSet are satisfied within its implementation scope.
+- `Requires` defaults to `done`: actual completion, normally merge. Explicit user approval may select `reviewed`: a passing independent review of the exact prerequisite commit, even while its PR awaits merge. Approved dependents start automatically when their gate opens, without another plan approval. Internal references among issues in one ChangeSet are satisfied within its implementation scope.
 - `Conflicts` serializes execution. A follower may run after predecessor implementation/review finishes, before merge. Rework does not interrupt a follower already running.
 - Requires takes precedence; cycles block involved changes until user resolution.
 - Relations need explicit or high-confidence evidence. Automatic analysis recognizes affirmative issue references; quoted, negated and speculative text is not evidence. Unresolved references gate scheduling, never expand scope.
 - Automatic rebuilds preserve explicit relations and conflict occupancy held by active or orphan Workers.
+- Worker-reported cross-Project prerequisites are untrusted proposals, including reports from failed implementations. Main requests approval for separate companion ChangeSets and Relations, reusing existing approved work. Discoveries hold the reporting implementation before review/delivery; they never expand scope automatically.
+- Reviewed gates persist the consumed prerequisite commit. If it changes or loses review eligibility, expire dependent merge approvals immediately, wait for active Workers to exit, then reimplement and review unfinished dependent work against the new passing snapshot. Finalized Tasks remain unchanged. This also gates transitive dependents. See [ADR-0012](adr/0012-approved-reviewed-dependencies.md).
 
 A slot is one active Task, implementation or review. Default global capacity is 3; at most one Task per ChangeSet regardless of its issue count. Order: highest active-owner priority, downstream unblock count, oldest Ready, stable private tie-breaker. Ready changes without a slot remain Ready.
 
@@ -66,7 +69,7 @@ For PR delivery, Publishing fetches the push remote branch first and publishes t
 
 Main generates a concise conventional title from task intent and branch kind. Summary uses reviewed product-facing changes, Verification uses deduplicated passing commands, and Issues includes every `Closes #n`. Activity summaries and legacy worker PR suggestions remain history, never PR content. Generated title/body omit internal ancestry, working paths and lifecycle commentary. User edits stop wholesale body regeneration; required verification/closures are repaired. One canonical `<!-- merro:review-notes -->` comment holds passing review, verification and non-blocking findings. Private IDs are removed from titles, bodies, comments, notifications and merge prompts.
 
-External requested changes or required-check failure schedule fresh implementation and review. Optional failures warn. Unknown GitHub policy blocks rather than assuming no requirements. Effective diff changes invalidate review; unchanged rewrites may preserve it.
+External requested changes or required-check failure schedule fresh implementation and review. Optional failures warn. Applicable required team reviews enter AwaitingApproval until GitHub confirms the review gate is satisfied, then resume automatically without `/merro retry`. Zero required approvals do not block. Unknown GitHub policy blocks rather than assuming no requirements. Effective diff changes invalidate review; unchanged rewrites may preserve it.
 
 ## Merge and external authority
 

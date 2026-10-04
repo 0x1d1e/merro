@@ -51,6 +51,7 @@ const namedObjectiveParameters = Type.Object({
     kind: Type.Union([Type.Literal("Requires"), Type.Literal("Conflicts")]),
     from: Type.String({ description: "Dependent ChangeSet for Requires; either name for Conflicts." }),
     to: Type.String({ description: "Prerequisite ChangeSet for Requires; other name for Conflicts." }),
+    gate: Type.Optional(Type.Union([Type.Literal("reviewed"), Type.Literal("done")], { description: "Requires only. Start when the prerequisite passes review or when it is actually complete. Defaults to done." })),
   }, { additionalProperties: false }), { description: "Explicit Requires edges only. Leave parallel siblings unconnected. Add one dependent-to-prerequisite edge per prerequisite for fan-in or barriers, including across Projects. Never infer an edge from ambiguous prose." })),
   planning: planningContext,
   priority,
@@ -173,7 +174,8 @@ function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | Na
         if (!value || typeof value !== "object") throw new Error("Relation must be an object");
         const row = value as Record<string, unknown>;
         if (row.kind !== "Requires" && row.kind !== "Conflicts") throw new Error("Relation kind must be Requires or Conflicts");
-        return { kind: row.kind, from: text(row, "from"), to: text(row, "to") };
+        if (row.gate !== undefined && row.gate !== "reviewed" && row.gate !== "done") throw new Error("Relation gate must be reviewed or done");
+        return { kind: row.kind, from: text(row, "from"), to: text(row, "to"), ...(row.gate === undefined ? {} : { gate: row.gate }) };
       }),
       ...(args.priority ? { priority: args.priority as NonNullable<ObjectiveStartInput["priority"]> } : {}),
       ...(args.planning === undefined ? {} : { planning: planningInput(args.planning) }),
@@ -244,11 +246,12 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
         const externalDependent = !plannedIds.has(edge.from) && plannedIds.has(edge.to);
         const owner = externalDependent ? to : from;
         const line = edge.kind === "Requires"
-          ? `${externalDependent ? "required by" : "after"} ${externalDependent ? from : to}`
+          ? `${externalDependent ? "required by" : "after"} ${externalDependent ? from : to} (${edge.gate ?? "done"})`
           : `conflicts with ${externalDependent ? from : to}`;
         relationLines.set(owner, [...(relationLines.get(owner) ?? []), line]);
       }
-      const relations = proposal.relations.map((edge) => ({ kind: edge.kind, from: names.get(edge.from) ?? "dependency", to: names.get(edge.to) ?? "dependency" }));
+      const relations = proposal.relations.map((edge) => ({ kind: edge.kind, from: names.get(edge.from) ?? "dependency", to: names.get(edge.to) ?? "dependency",
+        ...(edge.kind === "Requires" ? { gate: edge.gate ?? "done" } : {}) }));
       const warning = proposal.cycle ? "\nCannot start: dependencies form a cycle." : proposal.unresolved.length ? "\nCannot start: some issue dependencies are unresolved." : "";
       const named = "changeSets" in input;
       const planText = plans.map((plan) => {

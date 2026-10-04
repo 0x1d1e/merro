@@ -159,8 +159,18 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       confidence: "explicit",
       rationale: "dependency",
       evidence: "user approved",
+      gate: "reviewed",
+      consumedReviewedCommit: "a".repeat(40),
     }]);
-    assert.equal(store.listRelations()[0]?.from, "a");
+    assert.deepEqual(store.listRelations()[0], {
+      kind: "Requires", from: "a", to: "b", confidence: "explicit", rationale: "dependency", evidence: "user approved",
+      gate: "reviewed", consumedReviewedCommit: "a".repeat(40),
+    });
+    const { consumedReviewedCommit: _consumed, ...approval } = store.listRelations()[0]!;
+    store.rebuildAutomaticRelations(["a", "b"], [], [], [approval]);
+    assert.equal(store.listRelations()[0]?.consumedReviewedCommit, "a".repeat(40));
+    store.replaceRelations([approval]);
+    assert.equal(store.listRelations()[0]?.consumedReviewedCommit, "a".repeat(40));
     store.replaceRelations([]);
     assert.equal(store.listRelations().length, 0);
     assert.equal(store.listRelations(true).length, 1);
@@ -182,10 +192,12 @@ test("runtime metadata, relation history, and Decisions survive store round trip
       reviewRound: 1,
       infrastructureRetries: 0,
       implementationAttempt: 2,
+      githubTeamReviewPending: true,
       lastReworkTrigger: null,
       lastReconciledAt: null,
     });
     assert.equal(store.getChangeSetRuntime("a")?.implementationAttempt, 2);
+    assert.equal(store.getChangeSetRuntime("a")?.githubTeamReviewPending, true);
     assert.deepEqual(store.getChangeSetRuntime("a")?.baseUpdate, { baseRefName: "release", baseCommit: "d".repeat(40) });
 
     store.createTask({ id: "t1", changeSetId: "a", role: "implement", attempt: 1 });

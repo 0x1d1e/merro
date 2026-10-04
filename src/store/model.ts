@@ -29,6 +29,7 @@ export interface ChangeSetRuntimeRecord {
   githubChecks?: "pending" | "green" | "failed" | "none" | null;
   githubChecksAt?: string | null;
   githubReviewDecision?: string | null;
+  githubTeamReviewPending?: boolean;
   pullRequestHeadSha: string | null;
   pullRequestBaseSha: string | null;
   mergedCommitSha: string | null;

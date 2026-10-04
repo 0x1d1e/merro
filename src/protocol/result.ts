@@ -10,6 +10,13 @@ export interface ReviewFinding {
   line_end?: number;
 }
 
+export interface DependencySuggestion {
+  project_slug: string;
+  issue_number: number;
+  gate: "reviewed" | "done";
+  reason: string;
+}
+
 export interface ImplementSuccessResult {
   task_id: string;
   status: "success";
@@ -17,6 +24,7 @@ export interface ImplementSuccessResult {
   commit: string;
   verification: Verification[];
   changes?: string[];
+  dependency_suggestions?: DependencySuggestion[];
   /** Legacy worker suggestions are retained in history, never used for PR publication. */
   pr?: { title: string; body: string };
 }
@@ -29,6 +37,7 @@ export interface ImplementFailedResult {
   reason: string;
   diagnostics?: string;
   verification: Verification[];
+  dependency_suggestions?: DependencySuggestion[];
 }
 
 export interface ReviewResult {
@@ -138,6 +147,34 @@ function findings(value: unknown): ReviewFinding[] {
   });
 }
 
+function dependencySuggestions(value: unknown): DependencySuggestion[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) {
+    throw new ResultValidationError("dependency_suggestions must contain 1-10 cross-Project issue references");
+  }
+  const references = new Set<string>();
+  return value.map((value, index) => {
+    const suggestion = object(value, `dependency_suggestions[${index}]`);
+    const project_slug = text(suggestion.project_slug, `dependency_suggestions[${index}].project_slug`).trim();
+    if (project_slug.length > 63 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(project_slug)) {
+      throw new ResultValidationError(`dependency_suggestions[${index}].project_slug is invalid`);
+    }
+    if (!Number.isSafeInteger(suggestion.issue_number) || Number(suggestion.issue_number) < 1) {
+      throw new ResultValidationError(`dependency_suggestions[${index}].issue_number must be a positive safe integer`);
+    }
+    if (suggestion.gate !== "reviewed" && suggestion.gate !== "done") {
+      throw new ResultValidationError(`dependency_suggestions[${index}].gate must be reviewed or done`);
+    }
+    const reason = text(suggestion.reason, `dependency_suggestions[${index}].reason`).trim();
+    if (reason.length > 300 || /[\r\n]/.test(reason)) {
+      throw new ResultValidationError(`dependency_suggestions[${index}].reason must be a single line of at most 300 characters`);
+    }
+    const key = `${project_slug.toLowerCase()}\0${suggestion.issue_number}`;
+    if (references.has(key)) throw new ResultValidationError(`dependency_suggestions[${index}] duplicates a Project issue reference`);
+    references.add(key);
+    return { project_slug, issue_number: Number(suggestion.issue_number), gate: suggestion.gate, reason };
+  });
+}
+
 export function parseImplementResult(value: unknown): ImplementSuccessResult | ImplementFailedResult {
   const row = object(value, "result");
   const task_id = text(row.task_id, "task_id");
@@ -163,6 +200,7 @@ export function parseImplementResult(value: unknown): ImplementSuccessResult | I
         return change;
       });
     }
+    if (row.dependency_suggestions !== undefined) result.dependency_suggestions = dependencySuggestions(row.dependency_suggestions);
     if (row.pr !== undefined) {
       const pr = object(row.pr, "pr");
       result.pr = { title: text(pr.title, "pr.title"), body: text(pr.body, "pr.body") };
@@ -180,6 +218,7 @@ export function parseImplementResult(value: unknown): ImplementSuccessResult | I
       verification,
     };
     if (row.diagnostics !== undefined) result.diagnostics = text(row.diagnostics, "diagnostics");
+    if (row.dependency_suggestions !== undefined) result.dependency_suggestions = dependencySuggestions(row.dependency_suggestions);
     return result;
   }
 

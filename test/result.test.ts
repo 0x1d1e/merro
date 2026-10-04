@@ -14,6 +14,44 @@ test("implement result requires commit and structured verification", () => {
   assert.doesNotThrow(() => assertResultMatchesTask({ expectedTaskId: "t1", expectedCommit: "abc", result }));
 });
 
+test("implement result accepts bounded explicit cross-Project dependency suggestions", () => {
+  const result = parseImplementResult({
+    task_id: "t1",
+    status: "success",
+    summary: "implemented",
+    commit: "abc",
+    verification: [{ kind: "command", project: "p", cwd: ".", command: "npm test", exit_code: 0 }],
+    dependency_suggestions: [{ project_slug: "other", issue_number: 42, gate: "reviewed", reason: "The API must expose this capability first." }],
+  });
+  assert.equal(result.status, "success");
+  if (result.status === "success") assert.deepEqual(result.dependency_suggestions, [
+    { project_slug: "other", issue_number: 42, gate: "reviewed", reason: "The API must expose this capability first." },
+  ]);
+});
+
+test("failed implementation retains discoveries that prevent completion", () => {
+  const suggestions = [{ project_slug: "api", issue_number: 1, gate: "done", reason: "Missing prerequisite" }];
+  const result = parseImplementResult({ task_id: "t1", status: "failed", summary: "Cannot verify", reason: "Missing API", commit: "abc", verification: [], dependency_suggestions: suggestions });
+  assert.deepEqual(result.dependency_suggestions, suggestions);
+  assert.throws(() => parseImplementResult({ ...result, dependency_suggestions: [{ ...suggestions[0], gate: "unknown" }] }), /gate/);
+});
+
+test("implement result rejects invalid dependency suggestions", () => {
+  const base = {
+    task_id: "t1", status: "success", summary: "implemented", commit: "abc",
+    verification: [{ kind: "command", project: "p", cwd: ".", command: "npm test", exit_code: 0 }],
+  };
+  for (const dependency_suggestions of [
+    Array.from({ length: 11 }, (_, issue_number) => ({ project_slug: "other", issue_number: issue_number + 1, gate: "done", reason: "needed" })),
+    [{ project_slug: "bad slug", issue_number: 1, gate: "done", reason: "needed" }],
+    [{ project_slug: "other", issue_number: 0, gate: "done", reason: "needed" }],
+    [{ project_slug: "other", issue_number: 1, gate: "unknown", reason: "needed" }],
+    [{ project_slug: "other", issue_number: 1, gate: "done", reason: "bad\nline" }],
+  ]) {
+    assert.throws(() => parseImplementResult({ ...base, dependency_suggestions }));
+  }
+});
+
 test("successful implement result rejects failing command verification", () => {
   assert.throws(() => parseImplementResult({
     task_id: "t1",

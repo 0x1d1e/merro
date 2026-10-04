@@ -135,6 +135,15 @@ test("Requires cycles are detected", () => {
   assert.deepEqual(findRequiresCycle([requires("a", "b"), requires("b", "c"), requires("c", "a")]), ["a", "b", "c", "a"]);
 });
 
+test("reviewed gates require full review evidence while done gates still require completion", () => {
+  const input = { changeSets: [item("dependent", "Ready"), item("base", "AwaitingApproval")],
+    relations: [{ ...requires("dependent", "base"), gate: "reviewed" as const }], activeTaskCount: 0, maxConcurrentTasks: 3 };
+  assert.deepEqual(schedule(input).selected, []);
+  assert.deepEqual(schedule({ ...input, reviewedChangeSetIds: ["base"] }).selected.map((entry) => entry.id), ["dependent"]);
+  assert.deepEqual(schedule({ ...input, relations: [{ ...requires("dependent", "base"), gate: "done" }], reviewedChangeSetIds: ["base"] }).selected, []);
+  assert.throws(() => normalizeRelation({ ...conflicts("a", "b"), gate: "reviewed" }), /Only Requires/);
+});
+
 test("scheduler blocks dependents until prerequisite is Done", () => {
   const result = schedule({
     changeSets: [item("dependent", "Ready"), item("base", "AwaitingMerge")],

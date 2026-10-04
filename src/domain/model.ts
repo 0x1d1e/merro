@@ -1,7 +1,7 @@
 export type DeliveryMode = "local" | "pr";
 export type Priority = "high" | "normal" | "low";
 export type ObjectiveState = "Active" | "Done" | "Stopped";
-export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "Reviewed" | "AwaitingLocalMerge" | "Publishing" | "AwaitingMerge";
+export type FlowChangeSetState = "Planned" | "Ready" | "Implementing" | "Reviewing" | "Reviewed" | "AwaitingLocalMerge" | "Publishing" | "AwaitingMerge" | "AwaitingApproval";
 export type ChangeSetState =
   | FlowChangeSetState
   | "Blocked"
@@ -27,6 +27,7 @@ export type TaskRole = "implement" | "review";
 export type TaskOutcome = "success" | "failed" | "cancelled" | "pass" | "reject";
 export type RelationKind = "Requires" | "Conflicts";
 export type RelationConfidence = "explicit" | "high";
+export type RequiresGate = "reviewed" | "done";
 export type ReviewRoundLimit = number | "unlimited";
 export type DecisionState = "pending" | "approved" | "rejected" | "resolved";
 
@@ -116,11 +117,14 @@ export interface Relation {
   confidence: RelationConfidence;
   rationale: string;
   evidence: string;
+  gate?: RequiresGate;
+  consumedReviewedCommit?: string | null;
 }
 
 export interface SchedulingInput {
   changeSets: readonly ChangeSet[];
   relations: readonly Relation[];
+  reviewedChangeSetIds?: readonly string[];
   activeTaskCount: number;
   maxConcurrentTasks: number | "unlimited";
   activeChangeSetIds?: readonly string[];
@@ -135,6 +139,7 @@ export const FLOW_CHANGE_SET_STATES = new Set<FlowChangeSetState>([
   "AwaitingLocalMerge",
   "Publishing",
   "AwaitingMerge",
+  "AwaitingApproval",
 ]);
 
 export const TERMINAL_CHANGE_SET_STATES = new Set<ChangeSetState>([

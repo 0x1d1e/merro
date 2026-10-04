@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { CommandError, type CommandOptions, type CommandOutput, type CommandRunner } from "../src/runtime/commands.js";
-import { GitHubClient, GitHubMergeError } from "../src/github/client.js";
+import { GitHubClient, GitHubMergeError, type GitHubPullRequest } from "../src/github/client.js";
+import { requiredTeamReviewApplies, teamReviewGateSatisfied } from "../src/github/team-review.js";
 
 class FakeCommands implements CommandRunner {
   readonly calls: Array<{ file: string; args: readonly string[]; options?: CommandOptions }> = [];
@@ -203,6 +204,8 @@ test("pull request parsing reads review commit OIDs from gh's object shape", asy
         baseRefOid: "c".repeat(40),
         author: { login: "issue-author" },
         reviewDecision: "APPROVED",
+        mergeStateStatus: "CLEAN",
+        files: [{ path: "src/index.ts" }],
         reviews: [{
           author: { login: "maintainer" },
           state: "APPROVED",
@@ -219,6 +222,26 @@ test("pull request parsing reads review commit OIDs from gh's object shape", asy
   assert.equal(pullRequest.reviews[0]?.commitId, head);
   assert.equal(pullRequest.reviews[0]?.author, "maintainer");
   assert.equal(pullRequest.authorLogin, "issue-author");
+  assert.equal(pullRequest.mergeStateStatus, "CLEAN");
+  assert.deepEqual(pullRequest.changedFiles, ["src/index.ts"]);
+  assert.ok(commands.calls[1]?.args.some((argument) => argument.split(",").includes("mergeStateStatus")));
+  assert.ok(commands.calls[1]?.args.some((argument) => argument.split(",").includes("files")));
+});
+
+test("truncated or malformed changed files keep team-review applicability unknown", async () => {
+  for (const files of [[{ path: "README.md" }], [{ path: "README.md" }, { filename: "src/index.ts" }]]) {
+    const commands = new FakeCommands([{ stdout: repository("acme/widget"), stderr: "" }, {
+      stdout: JSON.stringify({ number: 22, title: "Large PR", body: "", url: "https://github.com/acme/widget/pull/22",
+        state: "OPEN", isDraft: false, mergedAt: null, mergeable: "MERGEABLE", headRefName: "feature", baseRefName: "main",
+        headRefOid: "a".repeat(40), baseRefOid: "b".repeat(40), reviewDecision: null, reviews: [], statusCheckRollup: [],
+        files, changedFiles: 2 }), stderr: "",
+    }]);
+    const pullRequest = await new GitHubClient(commands).pullRequest(project, 22);
+    assert.equal(pullRequest.changedFiles, undefined);
+    assert.equal(requiredTeamReviewApplies(pullRequest, { known: true, requiredStatusChecks: [], requiredApprovingReviewCount: 0,
+      requireCodeOwnerReviews: false, dismissStaleApprovals: false,
+      requiredTeamReviews: [{ teamId: 42, minimumApprovals: 1, filePatterns: ["src/**"] }] }), true);
+  }
 });
 
 test("pull request parsing includes the exact merged commit SHA", async () => {
@@ -461,7 +484,100 @@ test("branch protection combines classic settings with active rulesets", async (
     requiredApprovingReviewCount: 3,
     requireCodeOwnerReviews: true,
     dismissStaleApprovals: true,
+    requiredTeamReviews: [],
   });
+});
+
+test("branch ruleset required team reviewers are parsed with approval thresholds and file patterns", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 404: Branch not protected"),
+    { stdout: JSON.stringify([{
+      type: "pull_request",
+      parameters: { required_reviewers: [{
+        reviewer: { type: "Team", id: 123, name: "release-reviewers" },
+        minimum_approvals: 2,
+        file_patterns: ["src/**", "!src/generated/**"],
+      }] },
+    }]), stderr: "" },
+  ]);
+
+  const policy = await new GitHubClient(commands).branchProtection(project);
+
+  assert.deepEqual(policy, {
+    known: true,
+    requiredStatusChecks: [],
+    requiredApprovingReviewCount: 0,
+    requireCodeOwnerReviews: false,
+    dismissStaleApprovals: false,
+    requiredTeamReviews: [{ teamId: 123, minimumApprovals: 2, filePatterns: ["src/**", "!src/generated/**"] }],
+  });
+});
+
+test("branch ruleset required reviewer parsing fails closed on unknown fields", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    new Error("HTTP 404: Branch not protected"),
+    { stdout: JSON.stringify([{
+      type: "pull_request",
+      parameters: { required_reviewers: [{
+        reviewer: { type: "Team", id: 123 }, minimum_approvals: 1, future_requirement: true,
+      }] },
+    }]), stderr: "" },
+  ]);
+
+  const policy = await new GitHubClient(commands).branchProtection(project);
+
+  assert.equal(policy.known, false);
+  if (!policy.known) assert.match(policy.reason, /future_requirement/);
+});
+
+test("team-review applicability follows ordered GitHub fnmatch patterns and server gate status", () => {
+  const policy = {
+    known: true as const,
+    requiredStatusChecks: [],
+    requiredApprovingReviewCount: 0,
+    requireCodeOwnerReviews: false,
+    dismissStaleApprovals: false,
+    requiredTeamReviews: [{
+      teamId: 123,
+      minimumApprovals: 2,
+      filePatterns: ["src/**", "!src/generated/**", "src/generated/keep.ts"],
+    }],
+  };
+  const pullRequest = {
+    changedFiles: ["src/nested/index.ts"],
+    reviewDecision: "APPROVED",
+    mergeStateStatus: "CLEAN",
+  } as GitHubPullRequest;
+
+  assert.equal(requiredTeamReviewApplies(pullRequest, policy), true);
+  assert.equal(teamReviewGateSatisfied(pullRequest, policy), true);
+  assert.equal(teamReviewGateSatisfied({ ...pullRequest, mergeStateStatus: "BLOCKED" }, policy), false);
+  assert.equal(teamReviewGateSatisfied({ ...pullRequest, mergeStateStatus: "UNSTABLE" }, policy), true);
+  assert.equal(teamReviewGateSatisfied({ ...pullRequest, reviewDecision: null }, policy), false);
+  assert.equal(requiredTeamReviewApplies({ ...pullRequest, changedFiles: ["src/generated/index.ts"] }, policy), false);
+  assert.equal(requiredTeamReviewApplies({ ...pullRequest, changedFiles: ["src/generated/keep.ts"] }, policy), true);
+  assert.equal(requiredTeamReviewApplies({ ...pullRequest, changedFiles: ["src-generated/index.ts"] }, policy), false);
+  const { changedFiles: _changedFiles, ...withoutChangedFiles } = pullRequest;
+  assert.equal(requiredTeamReviewApplies(withoutChangedFiles, policy), true);
+  assert.equal(requiredTeamReviewApplies(pullRequest, {
+    ...policy, requiredTeamReviews: [{ teamId: 123, minimumApprovals: 0, filePatterns: [] }],
+  }), false);
+});
+
+test("team review file patterns support rooted paths, basenames, directories and escaped wildcards", () => {
+  const policy = { known: true as const, requiredStatusChecks: [], requiredApprovingReviewCount: 0,
+    requireCodeOwnerReviews: false, dismissStaleApprovals: false, requiredTeamReviews: [{ teamId: 42, minimumApprovals: 1, filePatterns: [] as string[] }] };
+  for (const [pattern, path, applies] of [
+    ["/src/**", "src/index.ts", true], ["/src/**", "nested/src/index.ts", false],
+    ["*.ts", "src/nested/index.ts", true], ["docs/", "docs/nested/readme.md", true],
+    ["src/\\*.ts", "src/*.ts", true], ["src/\\*.ts", "src/index.ts", false],
+    ["src/[!a-z].ts", "src/1.ts", true], ["src/[z-a].ts", "src/index.ts", true],
+  ] as const) {
+    assert.equal(requiredTeamReviewApplies({ changedFiles: [path] } as GitHubPullRequest,
+      { ...policy, requiredTeamReviews: [{ ...policy.requiredTeamReviews[0]!, filePatterns: [pattern] }] }), applies, `${pattern}: ${path}`);
+  }
 });
 
 test("an unprotected branch is known when classic protection returns 404 and no ruleset applies", async () => {
@@ -479,6 +595,7 @@ test("an unprotected branch is known when classic protection returns 404 and no 
     requiredApprovingReviewCount: 0,
     requireCodeOwnerReviews: false,
     dismissStaleApprovals: false,
+    requiredTeamReviews: [],
   });
   assert.equal(commands.calls[2]?.args[1], "repos/acme/widget/rules/branches/main");
 });
@@ -504,6 +621,7 @@ test("branch rulesets remain authoritative when classic protection returns 404",
     requiredApprovingReviewCount: 0,
     requireCodeOwnerReviews: false,
     dismissStaleApprovals: false,
+    requiredTeamReviews: [],
   });
 });
 
@@ -522,6 +640,7 @@ test("non_fast_forward ruleset policy is supported without affecting merge readi
     requiredApprovingReviewCount: 0,
     requireCodeOwnerReviews: false,
     dismissStaleApprovals: false,
+    requiredTeamReviews: [],
   });
 });
 

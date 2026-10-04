@@ -232,6 +232,16 @@ test("Git client creates an exact detached checkout for dependency review", asyn
   assert.equal(await git(checkoutPath, "rev-parse", "HEAD"), mergedCommit);
   assert.equal(await git(checkoutPath, "branch", "--show-current"), "");
   assert.equal(await git(checkoutPath, "show", "HEAD:merged.txt"), "merged change");
+  await git(project.path, "checkout", "-b", "reviewed-not-published");
+  await writeFile(join(project.path, "contract.txt"), "reviewed API contract\n");
+  await git(project.path, "add", "contract.txt");
+  await git(project.path, "commit", "-m", "reviewed prerequisite");
+  const reviewedCommit = await git(project.path, "rev-parse", "HEAD");
+  const reviewedCheckout = join(root, "runtime", "reviewed", "dependencies", "1");
+  await new GitClient().createReadOnlyCheckout({ ...projectRecord, baseRemote: "", pushRemote: "" }, reviewedCheckout, reviewedCommit);
+  assert.equal(await git(reviewedCheckout, "rev-parse", "HEAD"), reviewedCommit);
+  assert.equal(await git(reviewedCheckout, "show", "HEAD:contract.txt"), "reviewed API contract");
+  await assert.rejects(new GitClient().createReadOnlyCheckout(projectRecord, join(root, "remote-only-checkout"), reviewedCommit));
   await assert.rejects(new GitClient().createReadOnlyCheckout(projectRecord, join(root, "bad-checkout"), "f".repeat(40)));
 });
 

@@ -22,10 +22,11 @@ import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
 import { migrateLocalMergeState } from "./local-merge-migration.js";
+import { migrateTeamReviewState } from "./team-review-migration.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -93,6 +94,8 @@ function relationFromRow(row: Record<string, unknown>): Relation {
     confidence: row.confidence as Relation["confidence"],
     rationale: String(row.rationale),
     evidence: String(row.evidence),
+    ...(row.gate === "reviewed" || row.gate === "done" ? { gate: row.gate } : {}),
+    ...(typeof row.consumed_reviewed_commit === "string" ? { consumedReviewedCommit: String(row.consumed_reviewed_commit) } : {}),
   };
 }
 
@@ -366,6 +369,19 @@ export class MerroStore {
       migrateLocalMergeState(this.#db);
       version = 18;
     }
+    if (version < 19) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_19);
+        this.#db.prepare("UPDATE schema_meta SET version = 19").run();
+        this.#db.exec("COMMIT");
+        version = 19;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    }
+    if (version < 20) {
+      migrateTeamReviewState(this.#db);
+      version = 20;
+    }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
     }
@@ -509,17 +525,22 @@ export class MerroStore {
     try {
       this.#db.prepare("UPDATE relations SET active = 0 WHERE active = 1").run();
       const upsert = this.#db.prepare(`
-        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, active, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, gate, consumed_reviewed_commit, active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(kind, from_work_item_id, to_work_item_id) DO UPDATE SET
           confidence = excluded.confidence,
           rationale = excluded.rationale,
           evidence = excluded.evidence,
+          consumed_reviewed_commit = CASE WHEN relations.gate IS excluded.gate
+            THEN COALESCE(excluded.consumed_reviewed_commit, relations.consumed_reviewed_commit)
+            ELSE excluded.consumed_reviewed_commit END,
+          gate = excluded.gate,
           automatic = 0,
           active = 1
       `);
       for (const relation of effective) {
-        upsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence, now());
+        upsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence,
+          relation.kind === "Requires" ? relation.gate ?? null : null, relation.consumedReviewedCommit ?? null, now());
       }
       this.appendEvent("Relations", "workspace", "replaced", effective);
       this.#db.exec("COMMIT");
@@ -573,23 +594,30 @@ export class MerroStore {
       const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE id = ?");
       for (const id of rebuild.deactivateIds) deactivate.run(id);
       const upsert = this.#db.prepare(`
-        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, active, automatic, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?)
+        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, gate, consumed_reviewed_commit, active, automatic, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?)
         ON CONFLICT(kind, from_work_item_id, to_work_item_id) DO UPDATE SET
-          confidence = excluded.confidence, rationale = excluded.rationale, evidence = excluded.evidence, active = 1, automatic = 1
+          confidence = excluded.confidence, rationale = excluded.rationale, evidence = excluded.evidence,
+          gate = excluded.gate, consumed_reviewed_commit = excluded.consumed_reviewed_commit, active = 1, automatic = 1
         WHERE relations.automatic = 1 OR relations.active = 0
       `);
       for (const relation of relations.map(normalizeRelation)) {
-        upsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence, now());
+        upsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence,
+          relation.kind === "Requires" ? relation.gate ?? null : null, relation.consumedReviewedCommit ?? null, now());
       }
       const explicitUpsert = this.#db.prepare(`
-        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, active, automatic, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)
+        INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, gate, consumed_reviewed_commit, active, automatic, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)
         ON CONFLICT(kind, from_work_item_id, to_work_item_id) DO UPDATE SET
-          confidence = excluded.confidence, rationale = excluded.rationale, evidence = excluded.evidence, active = 1, automatic = 0
+          confidence = excluded.confidence, rationale = excluded.rationale, evidence = excluded.evidence,
+          consumed_reviewed_commit = CASE WHEN relations.gate IS excluded.gate
+            THEN COALESCE(excluded.consumed_reviewed_commit, relations.consumed_reviewed_commit)
+            ELSE excluded.consumed_reviewed_commit END,
+          gate = excluded.gate, active = 1, automatic = 0
       `);
       for (const relation of explicitRelations.map(normalizeRelation)) {
-        explicitUpsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence, now());
+        explicitUpsert.run(relation.kind, relation.from, relation.to, relation.confidence, relation.rationale, relation.evidence,
+          relation.kind === "Requires" ? relation.gate ?? null : null, relation.consumedReviewedCommit ?? null, now());
       }
       const rebuilt = this.listRelations();
       const previous = this.#db.prepare("SELECT payload_json FROM event_log WHERE entity_type = 'Relations' AND event_type = 'rebuilt' ORDER BY id DESC LIMIT 1").get();
@@ -605,6 +633,16 @@ export class MerroStore {
     const where = includeInactive ? "" : "WHERE active = 1";
     const relations = this.#db.prepare(`SELECT * FROM relations ${where} ORDER BY id`).all().map(relationFromRow);
     return includeInactive ? relations : effectiveRelations(relations);
+  }
+
+  recordReviewedDependencyConsumption(dependentId: string, prerequisiteId: string, commit: string): void {
+    if (!/^[0-9a-f]{40,64}$/i.test(commit)) throw new Error("consumed dependency commit must be a full Git commit ID");
+    const result = this.#db.prepare(`
+      UPDATE relations SET consumed_reviewed_commit = ?
+      WHERE kind = 'Requires' AND from_work_item_id = ? AND to_work_item_id = ? AND active = 1 AND gate = 'reviewed'
+    `).run(commit, dependentId, prerequisiteId);
+    if (Number(result.changes) !== 1) throw new Error("reviewed dependency relation is missing or no longer active");
+    this.appendEvent("Relation", `${dependentId}->${prerequisiteId}`, "reviewed_commit_consumed", { commit });
   }
 
   createDecision(input: Omit<Decision, "createdAt" | "resolvedAt" | "state"> & { state?: Decision["state"] }): Decision {
@@ -670,6 +708,7 @@ export class MerroStore {
       githubChecks: row.github_checks as Exclude<ChangeSetRuntimeRecord["githubChecks"], undefined>,
       githubChecksAt: row.github_checks_at === null ? null : String(row.github_checks_at),
       githubReviewDecision: row.github_review_decision === null ? null : String(row.github_review_decision),
+      githubTeamReviewPending: Number(row.github_team_review_pending) === 1,
       pullRequestHeadSha: row.pull_request_head_sha === null ? null : String(row.pull_request_head_sha),
       pullRequestBaseSha: row.pull_request_base_sha === null ? null : String(row.pull_request_base_sha),
       mergedCommitSha: row.merged_commit_sha === null ? null : String(row.merged_commit_sha),
@@ -689,8 +728,8 @@ export class MerroStore {
         work_item_id, branch_name, clone_path, base_commit, pull_request_number, pull_request_url,
         pull_request_state, pull_request_head_sha, pull_request_base_sha, merged_commit_sha, last_issue_state,
         reviewed_diff_hash, review_round, infrastructure_retries, implementation_attempt, last_reconciled_at,
-        last_rework_trigger, base_update_json, github_checks, github_checks_at, github_review_decision
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_rework_trigger, base_update_json, github_checks, github_checks_at, github_review_decision, github_team_review_pending
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(work_item_id) DO UPDATE SET
         branch_name = excluded.branch_name, clone_path = excluded.clone_path, base_commit = excluded.base_commit,
         pull_request_number = excluded.pull_request_number, pull_request_url = excluded.pull_request_url,
@@ -701,14 +740,15 @@ export class MerroStore {
         implementation_attempt = excluded.implementation_attempt, last_reconciled_at = excluded.last_reconciled_at,
         last_rework_trigger = excluded.last_rework_trigger, base_update_json = excluded.base_update_json,
         github_checks = excluded.github_checks, github_checks_at = excluded.github_checks_at,
-        github_review_decision = excluded.github_review_decision
+        github_review_decision = excluded.github_review_decision,
+        github_team_review_pending = excluded.github_team_review_pending
     `).run(
       record.changeSetId, record.branchName, record.clonePath, record.baseCommit, record.pullRequestNumber,
       record.pullRequestUrl, record.pullRequestState, record.pullRequestHeadSha, record.pullRequestBaseSha,
       record.mergedCommitSha, record.lastIssueState, record.reviewedDiffHash, record.reviewRound,
       record.infrastructureRetries, record.implementationAttempt, record.lastReconciledAt, record.lastReworkTrigger,
       record.baseUpdate ? JSON.stringify(record.baseUpdate) : null, record.githubChecks ?? null,
-      record.githubChecksAt ?? null, record.githubReviewDecision ?? null,
+      record.githubChecksAt ?? null, record.githubReviewDecision ?? null, Number(record.githubTeamReviewPending ?? false),
     );
   }
 
@@ -716,8 +756,8 @@ export class MerroStore {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const item = this.getChangeSet(runtime.changeSetId);
-      if (!item || item.state !== "AwaitingMerge") {
-        throw new Error(`ChangeSet ${runtime.changeSetId} is not AwaitingMerge`);
+      if (!item || item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval") {
+        throw new Error(`ChangeSet ${runtime.changeSetId} is not awaiting pull request review or merge`);
       }
       this.saveChangeSetRuntime(runtime);
       this.transitionChangeSet(item.id, "Implementing");
@@ -995,7 +1035,7 @@ export class MerroStore {
         this.#db.exec("COMMIT");
         return false;
       }
-      if (item.state !== "AwaitingMerge" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing" && item.state !== "Done") {
+      if (item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing" && item.state !== "Done") {
         throw new Error(`ChangeSet ${id} is not awaiting a pull request merge`);
       }
       if (this.activeTask(id)) throw new Error(`ChangeSet ${id} still has an active Task`);
@@ -1028,7 +1068,7 @@ export class MerroStore {
   completeChangeSetAfterExternalMerge(id: string): void {
     const item = this.getChangeSet(id);
     if (!item) throw new Error(`unknown ChangeSet: ${id}`);
-    if (item.state !== "AwaitingMerge" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing") {
+    if (item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing") {
       throw new Error(`ChangeSet ${id} is not awaiting an external pull request merge`);
     }
     if (this.activeTask(id)) throw new Error(`ChangeSet ${id} still has an active Task`);
