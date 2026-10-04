@@ -195,7 +195,10 @@ test("only the user's own message in the current turn can approve", async (t) =>
     assert.equal(await start(),'Unknown choice: approvve\\nChoose: approve · edit · cancel');
     say('approve'); say('Merro needs your attention','extension');
     assert.match(await start(),/^Unknown choice: \\(empty\\)/);
-    say('approve'); events.get('agent_end')();
+    // Pi ends the agent run before an automatic retry or post-compaction continuation; the reply still authorizes.
+    say('approve'); events.get('agent_end')?.();
+    await assert.rejects(start(),/No pending plan/);
+    say('approve'); events.get('agent_settled')();
     assert.match(await start(),/^Unknown choice: \\(empty\\)/);
     say('approve');
     await assert.rejects(start(),/No pending plan/);`;

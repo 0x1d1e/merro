@@ -167,8 +167,8 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
         return;
       }
       if (verb === "approve" || verb === "leave") {
-        if (!main) { report(ctx, "Open Main to resolve a merge decision.", "warning"); return; }
-        report(ctx, await main.resolveDecisionForChange(target || undefined, verb === "approve"));
+        if (!main) { report(ctx, `Open Main to ${verb === "approve" ? "approve a plan or" : "resolve"} a merge decision.`, "warning"); return; }
+        report(ctx, verb === "approve" ? await main.approvePending(target || undefined) : await main.resolveDecisionForChange(target || undefined, false));
         return;
       }
       if (verb === "retry") {

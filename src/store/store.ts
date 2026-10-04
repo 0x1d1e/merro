@@ -23,7 +23,7 @@ import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, MIGRATION_21, MIGRATION_22, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, MIGRATION_21, MIGRATION_22, MIGRATION_23, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
 import { migrateLocalMergeState } from "./local-merge-migration.js";
@@ -396,19 +396,31 @@ export class MerroStore {
       this.#db.exec("BEGIN IMMEDIATE");
       try {
         this.#db.exec(MIGRATION_22);
-        // Pending proposals predating persisted numbers keep the queue position users already saw, so new
-        // proposals continue after them instead of colliding.
+        this.#db.prepare("UPDATE schema_meta SET version = 22").run();
+        this.#db.exec("COMMIT");
+        version = 22;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    }
+    if (version < 23) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        const columns = this.#db.prepare("SELECT name FROM pragma_table_info('objective_settings')").all();
+        if (!columns.some((column) => column.name === "worker_settings_json")) this.#db.exec(MIGRATION_22);
+        this.#db.exec(MIGRATION_23);
+        // Pending proposals predating persisted numbers keep the queue position users already saw and continue after
+        // any already numbered, so no two proposals collide.
         const legacy = this.#db.prepare(`
           SELECT id FROM decisions
           WHERE kind = 'issue' AND subject_type = 'IssueProposal' AND state = 'pending' AND json_extract(payload_json, '$.number') IS NULL
           ORDER BY created_at, id
         `).all() as Array<{ id: string }>;
+        const next = this.nextIssueProposalNumber();
         legacy.forEach((row, index) => {
-          this.#db.prepare("UPDATE decisions SET payload_json = json_set(payload_json, '$.number', ?) WHERE id = ?").run(index + 1, row.id);
+          this.#db.prepare("UPDATE decisions SET payload_json = json_set(payload_json, '$.number', ?) WHERE id = ?").run(next + index, row.id);
         });
-        this.#db.prepare("UPDATE schema_meta SET version = 22").run();
+        this.#db.prepare("UPDATE schema_meta SET version = 23").run();
         this.#db.exec("COMMIT");
-        version = 22;
+        version = 23;
       } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
     }
     if (version !== SCHEMA_VERSION) {
@@ -540,7 +552,20 @@ export class MerroStore {
     this.appendEvent("Objective", id, "settings_changed", settings);
   }
 
-  /** Snapshots worker runtime settings approved with an Objective so later config edits do not alter its work. */
+  /** Snapshots worker runtime settings approved with an Objective; ChangeSets it later gains inherit them. */
+  saveObjectiveWorkerSettings(id: string, settings: WorkerSettings): void {
+    this.#db.prepare(`
+      INSERT INTO objective_settings(objective_id, worker_settings_json) VALUES (?, ?)
+      ON CONFLICT(objective_id) DO UPDATE SET worker_settings_json = excluded.worker_settings_json
+    `).run(id, JSON.stringify(settings));
+  }
+
+  /** Null only for Objectives approved before settings were snapshotted. */
+  objectiveWorkerSettings(id: string): WorkerSettings | null {
+    const row = this.#db.prepare("SELECT worker_settings_json FROM objective_settings WHERE objective_id = ?").get(id);
+    return row?.worker_settings_json ? JSON.parse(String(row.worker_settings_json)) as WorkerSettings : null;
+  }
+
   /** First approval wins: a ChangeSet keeps the worker settings it was approved with, even when another Objective shares it. */
   claimChangeSetWorkerSettings(changeSetId: string, settings: WorkerSettings): void {
     this.#db.prepare("INSERT OR IGNORE INTO change_set_worker_settings(work_item_id, settings_json) VALUES (?, ?)")

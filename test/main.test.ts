@@ -2098,7 +2098,7 @@ test("incomplete v11 Objective scopes remain readable and reconcile after upgrad
   try {
     database.prepare("UPDATE objectives SET issue_scopes_json = ? WHERE id = ?")
       .run(JSON.stringify([{ projectSlug: "api", query: { labels: ["feature"] } }]), objective.id);
-    database.exec("DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE task_runtime DROP COLUMN agent; DROP TABLE change_set_worker_settings; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
+    database.exec("DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; DROP INDEX task_runtime_pending_cleanup; ALTER TABLE task_runtime DROP COLUMN cleanup_completed_at; DROP TRIGGER change_set_slug_immutable; DROP TRIGGER change_set_sources_exclusive; DROP INDEX change_sets_unique_slug; ALTER TABLE work_items DROP COLUMN slug; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN window_id; ALTER TABLE task_runtime DROP COLUMN agent; DROP TABLE change_set_worker_settings; ALTER TABLE objective_settings DROP COLUMN worker_settings_json; ALTER TABLE work_item_runtime DROP COLUMN github_checks; ALTER TABLE work_item_runtime DROP COLUMN github_checks_at; ALTER TABLE work_item_runtime DROP COLUMN github_review_decision; UPDATE schema_meta SET version = 11;");
   } finally { database.close(); }
   const restarted = harness.restartMain();
   assert.deepEqual((await restarted.statusSnapshot()).objectives[0]?.issueScopes, [
@@ -5772,6 +5772,57 @@ test("a shared ChangeSet keeps its first approved worker settings when ownership
   // The review launches after the first owner stopped; it still uses the settings approved first.
   assert.deepEqual(harness.launches.map((launch) => [launch.role, launch.workerSettings?.implement.model, launch.workerSettings?.review.model]),
     [["implement", "model/a", "model/a-review"], ["review", "model/a", "model/a-review"]]);
+});
+
+test("changes an approved Objective gains later keep its approved worker settings after config reload", async (t) => {
+  const harness = await createHarness(t, { workerModels: { implement: "model/a", review: "model/a-review" } });
+  const original = harness.issues.get("example:7")!;
+  await harness.main.startObjective({ goal: "Features", projectSlugs: ["example"], issues: [{ projectSlug: "example", query: { labels: ["feature"] } }] });
+  await harness.main.runPass();
+  harness.config.workers = { implementer: { runtime: "pi", model: "model/b", thinking: null }, reviewer: { runtime: "pi", model: "model/b-review", thinking: null } };
+  // A new issue enters the approved query scope, and a finished issue reopens as a new generation.
+  harness.issues.set("example:9", { ...original, number: 9, url: original.url.replace("/7", "/9") } as GitHubIssue);
+  harness.setIssueState("example", 7, "CLOSED");
+  await harness.main.runPass();
+  harness.setIssueState("example", 7, "OPEN");
+  await harness.main.runPass();
+  await harness.main.runPass();
+  const launched = new Set(harness.launches.map((launch) => launch.changeSetId));
+  assert.ok(launched.has("example:issue-9:g1") && launched.has("example:issue-7:g2"), [...launched].join(", "));
+  assert.deepEqual([...new Set(harness.launches.map((launch) => launch.workerSettings?.implement.model))], ["model/a"]);
+});
+
+test("/merro approve approves the pending plan it names, and asks when a merge decision also waits", async (t) => {
+  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [42, 43] }] });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => undefined, consume() {} });
+  const commands = new Map<string, Parameters<PiExtensionLike["registerCommand"]>[1]>();
+  registerCommands({ registerCommand(name, definition) { commands.set(name, definition); } }, harness.workspacePath, harness.main);
+  const messages: string[] = [];
+  const run = (args: string) => commands.get("merro")!.handler(args, { ui: { notify(message: string) { messages.push(message); } } });
+
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  await run("approve");
+  assert.equal(messages.pop(), "Working: fix-42.");
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 1);
+  for (let pass = 0; pass < 3; pass++) await harness.main.runPass();
+  assert.equal((await harness.main.statusSnapshot()).decisions.filter((decision) => decision.kind === "merge").length, 1);
+
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #43", change: "fix-43", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [43] }] });
+  await run("approve");
+  assert.match(messages.pop() ?? "", /both waiting\. Name one/);
+  assert.deepEqual(harness.mergeCalls, []);
+  await run("approve fix-43");
+  assert.equal(messages.pop(), "Working: fix-43.");
+  // A plan that shares the change awaiting merge cannot be approved by that change's name alone.
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Track 42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  await run("approve fix-42");
+  assert.match(messages.pop() ?? "", /both name fix-42\. Use \/merro approve track-42 for the plan/);
+  assert.deepEqual(harness.mergeCalls, []);
+  await run("approve track-42");
+  assert.equal(messages.pop(), "Working: fix-42.");
+  await run("approve fix-42");
+  assert.equal(harness.mergeCalls.length, 1);
 });
 
 test("the review-round limit is read when the plan is approved, not when it is proposed", async (t) => {

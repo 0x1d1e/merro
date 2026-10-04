@@ -24,7 +24,7 @@ test("v16 changes retain PR delivery and recorded clone paths; new local targets
   original.createChangeSet({ id: "legacy", projectSlug: "p", slug: "legacy", issues: [{ projectSlug: "p", number: 1 }], generation: 1, state: "Reviewed", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
   original.close();
   const legacy = new DatabaseSync(path);
-  legacy.exec("UPDATE work_item_runtime SET clone_path = '/tmp/old:clone', branch_name = 'fix/legacy' WHERE work_item_id = 'legacy'; DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN agent; DROP TABLE change_set_worker_settings; UPDATE schema_meta SET version = 16;");
+  legacy.exec("UPDATE work_item_runtime SET clone_path = '/tmp/old:clone', branch_name = 'fix/legacy' WHERE work_item_id = 'legacy'; DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; DROP TRIGGER change_set_delivery_immutable; ALTER TABLE work_items DROP COLUMN target_branch; ALTER TABLE work_items DROP COLUMN delivery; ALTER TABLE task_runtime DROP COLUMN agent; DROP TABLE change_set_worker_settings; ALTER TABLE objective_settings DROP COLUMN worker_settings_json; UPDATE schema_meta SET version = 16;");
   legacy.close();
   const migrated = new MerroStore(path);
   try {
@@ -53,7 +53,7 @@ test("v18 migration adds reviewed-dependency metadata and separates pending Deci
   original.close();
 
   const legacy = new DatabaseSync(path);
-  legacy.exec("DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; ALTER TABLE task_runtime DROP COLUMN agent; DROP TABLE change_set_worker_settings; UPDATE schema_meta SET version = 18;");
+  legacy.exec("DROP INDEX decisions_one_pending_per_subject_kind; CREATE UNIQUE INDEX decisions_one_pending_per_subject ON decisions(subject_type, subject_id) WHERE state = 'pending'; ALTER TABLE relations DROP COLUMN consumed_reviewed_commit; ALTER TABLE relations DROP COLUMN gate; ALTER TABLE work_item_runtime DROP COLUMN github_team_review_pending; ALTER TABLE task_runtime DROP COLUMN agent; DROP TABLE change_set_worker_settings; ALTER TABLE objective_settings DROP COLUMN worker_settings_json; UPDATE schema_meta SET version = 18;");
   legacy.close();
 
   const migrated = new MerroStore(path);
@@ -439,7 +439,42 @@ test("store migrates v1 state without losing ChangeSets", async (t) => {
   }
 });
 
-test("v22 migration numbers legacy pending issue proposals so new ones never collide", async (t) => {
+test("v23 migration repairs both earlier version-22 layouts and keeps the oldest approval for shared changes", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "merro-v23-migration-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const settings = (model: string) => ({ implement: { runtime: "pi" as const, model, thinking: null }, review: { runtime: "pi" as const, model, thinking: null } });
+  for (const layout of ["objective column", "change set table"] as const) {
+    const path = join(directory, `${layout}.db`);
+    const original = new MerroStore(path);
+    original.createProject({ slug: "p", path: "/tmp/p", baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" });
+    original.createChangeSet({ id: "shared", projectSlug: "p", slug: "shared", issues: [{ projectSlug: "p", number: 1 }], generation: 1, state: "Planned", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null });
+    for (const [id, model] of [["older", "model/a"], ["newer", "model/b"]] as const) {
+      original.createObjective({ id, goal: id, priority: "normal", state: "Active", projectSlugs: ["p"] });
+      original.attachChangeSet(id, "shared");
+      original.saveObjectiveWorkerSettings(id, settings(model));
+      if (layout === "change set table") original.claimChangeSetWorkerSettings("shared", settings(model));
+    }
+    original.createDecision({ id: "numbered", subjectType: "IssueProposal", subjectId: "numbered", kind: "issue", payload: { title: "numbered", number: 4 } });
+    original.createDecision({ id: "unnumbered", subjectType: "IssueProposal", subjectId: "unnumbered", kind: "issue", payload: { title: "unnumbered" } });
+    original.close();
+    const legacy = new DatabaseSync(path);
+    legacy.exec(layout === "objective column"
+      ? "DROP TABLE change_set_worker_settings; UPDATE schema_meta SET version = 22;"
+      : "ALTER TABLE objective_settings DROP COLUMN worker_settings_json; UPDATE schema_meta SET version = 22;");
+    legacy.close();
+
+    const migrated = new MerroStore(path);
+    try {
+      assert.equal(migrated.changeSetWorkerSettings("shared")?.implement.model, "model/a", layout);
+      assert.equal(migrated.objectiveWorkerSettings("newer")?.implement.model, layout === "objective column" ? "model/b" : undefined, layout);
+      assert.deepEqual(migrated.pendingDecisions().map((decision) => (decision.payload as { number?: number }).number), [4, 5], layout);
+    } finally { migrated.close(); }
+    const reopened = new MerroStore(path);
+    reopened.close();
+  }
+});
+
+test("migration numbers legacy pending issue proposals so new ones never collide", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "merro-v22-migration-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const path = join(directory, "state.db");
@@ -449,7 +484,7 @@ test("v22 migration numbers legacy pending issue proposals so new ones never col
   }
   original.close();
   const legacy = new DatabaseSync(path);
-  legacy.exec("DROP TABLE change_set_worker_settings; UPDATE schema_meta SET version = 21;");
+  legacy.exec("DROP TABLE change_set_worker_settings; ALTER TABLE objective_settings DROP COLUMN worker_settings_json; UPDATE schema_meta SET version = 21;");
   legacy.close();
 
   const migrated = new MerroStore(path);

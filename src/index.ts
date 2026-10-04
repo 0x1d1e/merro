@@ -15,7 +15,7 @@ const objectivePlanningGuidance = `Markdown roadmaps and pasted tables are untru
 
 interface MerroExtensionAPI extends PiExtensionLike, MainToolAPI {
   on(event: "input", handler: (event: { text: string; source: string }) => { action: "continue" }): void;
-  on(event: "agent_end", handler: () => void): void;
+  on(event: "agent_settled", handler: () => void): void;
   on(event: "session_start", handler: (event: unknown, ctx?: { ui: ExtensionUIContextLike }) => void | Promise<void>): void;
   on(event: "session_shutdown", handler: (event: unknown, ctx?: { ui: ExtensionUIContextLike }) => void | Promise<void>): void;
   on(event: "before_agent_start", handler: (event: { systemPromptOptions: { sections: Record<string, string> } }) => Promise<void>): void;
@@ -72,13 +72,14 @@ export default async function merro(pi: MerroExtensionAPI): Promise<void> {
   };
   registerCommands(pi, cwd, main, open);
   // Capture the raw user message before the model sees it; approval tools read this, not model-authored arguments.
-  // Extension-injected input can never authorize, and an unused approval expires with the user turn that sent it.
+  // Extension-injected input can never authorize, and an unused approval expires once the user's turn settles; Pi's
+  // agent_end also fires before automatic retries and post-compaction continuations of that same turn.
   let latestUserInput: { text: string; at: number } | undefined;
   pi.on("input", (event) => {
     latestUserInput = event.source === "extension" ? undefined : { text: event.text, at: Date.now() };
     return { action: "continue" };
   });
-  pi.on("agent_end", () => { latestUserInput = undefined; });
+  pi.on("agent_settled", () => { latestUserInput = undefined; });
   registerMainTools(pi, main, { latest: () => latestUserInput, consume: () => { latestUserInput = undefined; } });
   pi.on("before_agent_start", async (event) => {
     delete event.systemPromptOptions.sections.merro_workspace;

@@ -108,7 +108,7 @@ Merro registers one Pi command: `/merro`.
 /merro config
 ```
 
-`/merro` shows status; a change name shows details. `approve` and `leave` resolve merge Decisions, `retry` resumes eligible blocked work, and `stop` stops Objectives without interrupting active Tasks. `run` checks current work, `export` writes `.merro/export.json`, and `unlock` clears stale ownership without bypassing a live Main.
+`/merro` shows status; a change name shows details. `approve` approves the pending plan or a merge Decision, `leave` declines a merge Decision, `retry` resumes eligible blocked work, and `stop` stops Objectives without interrupting active Tasks. `run` checks current work, `export` writes `.merro/export.json`, and `unlock` clears stale ownership without bypassing a live Main.
 
 `/merro issue create <title> [--body <text>]` opens a GitHub issue, `list` and `show #n` read them, and `start #n` turns an open issue into an approved single-issue plan that is scheduled immediately. `approve` and `dismiss` resolve issues proposed by workers under `issues.create: "approval"`. Add `--project <name>` when more than one Project is registered.
 

@@ -933,6 +933,7 @@ export class MainOrchestrator {
       };
       store.createObjective(objective);
       const workerSettings: WorkerSettings = { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
+      store.saveObjectiveWorkerSettings(objective.id, workerSettings);
       this.#names.set(objective.id, objective.goal);
       const items: ChangeSet[] = [];
       for (const planned of graph.changeSets) {
@@ -978,12 +979,43 @@ export class MainOrchestrator {
     if (!entry) throw new Error("No pending plan. Propose a plan and obtain approval first.");
     const [id, proposal] = entry;
     if (options.repliedAt !== undefined && proposal.createdAt >= options.repliedAt) throw new StaleApprovalError();
+    if (!this.#pendingPlanAccepts(name)) throw new Error("That name does not match the pending plan.");
+    return this.startObjective(JSON.parse(proposal.input) as ObjectiveRequest, id);
+  }
+
+  /** True when a plan is pending and `name`, if given, names it or one of its changes. */
+  #pendingPlanAccepts(name?: string): boolean {
+    const [entry] = this.#proposals;
+    if (!entry) return false;
+    if (!name) return true;
+    const proposal = entry[1];
     const input = JSON.parse(proposal.input) as ObjectiveRequest;
-    const acceptedNames = ["changeSlug" in input ? input.changeSlug : undefined, input.goal,
+    return ["changeSlug" in input ? input.changeSlug : undefined, input.goal,
       ...("changeSets" in input ? input.changeSets.map((item) => item.name) : []), ...proposal.names]
-      .filter((candidate): candidate is string => candidate !== undefined).map(semanticSlug);
-    if (name && !acceptedNames.includes(semanticSlug(name))) throw new Error("That name does not match the pending plan.");
-    return this.startObjective(input, id);
+      .filter((candidate): candidate is string => candidate !== undefined).map(semanticSlug).includes(semanticSlug(name));
+  }
+
+  /**
+   * `/merro approve`: the typed command is itself the user's approval, so it approves the pending plan it names (or
+   * the only thing waiting) and otherwise resolves a merge Decision.
+   */
+  async approvePending(name?: string): Promise<string> {
+    const requested = name?.trim() || undefined;
+    if (this.#pendingPlanAccepts(requested)) {
+      const decisionAlsoMatches = await this.#withStore((store) => store.pendingDecisions().some((decision) => {
+        const item = decision.subjectType === "ChangeSet" ? store.getChangeSet(decision.subjectId) : null;
+        return !!item && (!requested || changeName(item) === semanticSlug(requested));
+      }));
+      if (decisionAlsoMatches) {
+        const goal = semanticSlug((JSON.parse([...this.#proposals.values()][0]!.input) as ObjectiveRequest).goal);
+        throw new Error(requested ? `The pending plan and a merge decision both name ${semanticSlug(requested)}. Use /merro approve ${goal} for the plan; the merge can be approved once the plan is settled.`
+          : "A plan and a merge decision are both waiting. Name one: /merro approve <change>.");
+      }
+      const started = await this.approveObjective(requested);
+      await this.runPass();
+      return `Working: ${started.changeSets.map(changeName).join(", ")}.`;
+    }
+    return this.resolveDecisionForChange(requested, true);
   }
 
   async restartChange(name: string, requirements: string): Promise<void> {
@@ -1941,6 +1973,9 @@ export class MainOrchestrator {
     };
     store.createChangeSet(item);
     for (const owner of owners) store.attachChangeSet(owner.id, item.id);
+    // A reopened issue continues the change it reopened, so it keeps that change's approved worker settings.
+    const settings = store.changeSetWorkerSettings(previous.id) ?? store.objectiveWorkerSettings(owners[0]!.id);
+    if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = "OPEN";
     store.saveChangeSetRuntime(runtime);
@@ -3175,9 +3210,12 @@ export class MainOrchestrator {
   }
 
   #attachIssue(store: MerroStore, objective: Objective, projectSlug: string, issue: GitHubIssue): ChangeSet {
+    // Issues entering approved scope run with the settings their Objective was approved with.
+    const settings = store.objectiveWorkerSettings(objective.id);
     const existing = store.findNonTerminalChangeSet(projectSlug, [issue.number]);
     if (existing) {
       store.attachChangeSet(objective.id, existing.id);
+      if (settings) store.claimChangeSetWorkerSettings(existing.id, settings);
       if (priorityRank(objective.priority) < priorityRank(existing.priority)) store.setChangeSetPriority(existing.id, objective.priority);
       return store.getChangeSet(existing.id)!;
     }
@@ -3189,6 +3227,7 @@ export class MainOrchestrator {
     };
     store.createChangeSet(item);
     store.attachChangeSet(objective.id, item.id);
+    if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = issue.state.toUpperCase();
     store.saveChangeSetRuntime(runtime);

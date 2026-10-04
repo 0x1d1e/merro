@@ -129,6 +129,7 @@ test("/merro routes change details and management actions using semantic targets
   const calls: unknown[][] = [];
   const main = {
     async changeDetails(name: string) { calls.push(["details", name]); return null; },
+    async approvePending(name: string | undefined) { calls.push(["approve", name]); return "Approved."; },
     async resolveDecisionForChange(name: string | undefined, approved: boolean) { calls.push(["decision", name, approved]); return "Resolved."; },
     async retryChangeSet(name: string | undefined) { calls.push(["retry", name]); return "Retried."; },
     async stopObjectives(name: string | undefined) { calls.push(["stop", name]); return 1; },
@@ -139,7 +140,7 @@ test("/merro routes change details and management actions using semantic targets
   for (const args of ["safety", "approve", "approve safety", "leave", "leave safety", "retry", "retry safety", "stop", "stop goal", "run"]) {
     await merro.handler(args, { ui: { notify: (message) => messages.push(message) } });
   }
-  assert.deepEqual(calls, [["details", "safety"], ["decision", undefined, true], ["decision", "safety", true], ["decision", undefined, false], ["decision", "safety", false], ["retry", undefined], ["retry", "safety"], ["stop", undefined], ["stop", "goal"], ["run"]]);
+  assert.deepEqual(calls, [["details", "safety"], ["approve", undefined], ["approve", "safety"], ["decision", undefined, false], ["decision", "safety", false], ["retry", undefined], ["retry", "safety"], ["stop", undefined], ["stop", "goal"], ["run"]]);
   assert.ok(messages.includes("Stopped 1 Objective. Active changes will finish; no new work will start."));
 });
 
