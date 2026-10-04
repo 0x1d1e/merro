@@ -59,7 +59,7 @@ test("remote registration clones into configured workspace paths without GitHub 
   } });
   const config = validateConfig({ projectsDir: "owned/projects", worktreesDir: "owned/work" });
   const messages: string[] = [];
-  const main = new MainOrchestrator({ workspacePath: workspace, config, notify: (message) => { messages.push(message); },
+  const main = new MainOrchestrator({ workspacePath: workspace, config, notify: (message) => { messages.push(message); }, progress: (message) => { messages.push(message); },
     github: new Proxy({}, { get() { return () => { throw new Error("Registration must not call GitHub"); }; } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]> });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
@@ -211,10 +211,11 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   assert.deepEqual(pendingMerge.decisions.map((decision) => decision.kind), ["local_merge"]);
   assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
   const publicStatus = await main.publicSnapshot();
-  assert.equal(publicStatus.changes[0]!.status, "Ready to merge");
+  assert.equal(publicStatus.changes[0]!.status, "Needs you");
+  assert.equal(publicStatus.changes[0]!.reason, "ready to merge");
   assert.equal(publicStatus.decisions[0]!.summary, "Approve local merge?");
   const formattedStatus = await call("merro_status");
-  assert.match(formattedStatus.content[0]?.text ?? "", /Approve local merge\?/);
+  assert.match(formattedStatus.content[0]?.text ?? "", /Approve local merge: \/merro approve/);
   assert.match(formattedStatus.content[0]?.text ?? "", /Leave unchanged/);
   assert.doesNotMatch(formattedStatus.content[0]?.text ?? "", /Leave open/);
   if (scenario === "merge-declined") {

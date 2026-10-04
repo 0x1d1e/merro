@@ -15,15 +15,15 @@ export interface MerroConfig {
   worktreesDir: string;
   workers: { implementer: WorkerRoleSettings; reviewer: WorkerRoleSettings };
   issues: { create: IssueCreatePolicy };
-  merge: { auto: boolean; method: MergeMethod; delete_branch: boolean };
+  merge: { auto: boolean; method: MergeMethod; deleteBranch: boolean };
   git: { defaultDelivery: "auto" | "local" | "pr" };
   tmux: { session: string };
-  max_concurrent_tasks: number | "unlimited";
-  max_review_rounds: number | "unlimited";
+  maxConcurrentTasks: number | "unlimited";
+  maxReviewRounds: number | "unlimited";
   sandbox: "docker" | "none";
   network: "on" | "off";
-  worker_github: "on" | "off";
-  notify_command: string | null;
+  workerGithub: boolean;
+  notifyCommand: string | null;
 }
 
 export const DEFAULT_CONFIG: Readonly<MerroConfig> = {
@@ -35,22 +35,48 @@ export const DEFAULT_CONFIG: Readonly<MerroConfig> = {
     reviewer: { runtime: "pi", model: null, thinking: null },
   },
   issues: { create: "approval" },
-  merge: { auto: false, method: "squash", delete_branch: true },
+  merge: { auto: false, method: "squash", deleteBranch: true },
   git: { defaultDelivery: "auto" },
   tmux: { session: "merro" },
-  max_concurrent_tasks: 3,
-  max_review_rounds: 3,
+  maxConcurrentTasks: 3,
+  maxReviewRounds: 3,
   sandbox: "none",
   network: "on",
-  worker_github: "off",
-  notify_command: null,
+  workerGithub: false,
+  notifyCommand: null,
 };
+
+/** Pre-camelCase names, accepted as migration-only inputs. */
+const LEGACY_KEYS: Readonly<Record<string, string>> = {
+  max_concurrent_tasks: "maxConcurrentTasks",
+  max_review_rounds: "maxReviewRounds",
+  worker_github: "workerGithub",
+  notify_command: "notifyCommand",
+};
+
+function migrateLegacyKeys(input: Record<string, unknown>): Record<string, unknown> {
+  const migrated: Record<string, unknown> = { ...input };
+  const move = (target: Record<string, unknown>, from: string, to: string, label: string) => {
+    if (!(from in target)) return;
+    if (to in target) throw new Error(`Cannot combine ${label}${from} with ${label}${to}; use ${label}${to} only.`);
+    const value = target[from];
+    delete target[from];
+    // The legacy workerGithub form was "on" | "off".
+    target[to] = to === "workerGithub" && (value === "on" || value === "off") ? value === "on" : value;
+  };
+  for (const [from, to] of Object.entries(LEGACY_KEYS)) move(migrated, from, to, "");
+  if (typeof migrated.merge === "object" && migrated.merge !== null && !Array.isArray(migrated.merge)) {
+    migrated.merge = { ...migrated.merge };
+    move(migrated.merge as Record<string, unknown>, "delete_branch", "deleteBranch", "merge.");
+  }
+  return migrated;
+}
 
 export function validateConfig(value: unknown): MerroConfig {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("Merro config must be an object");
   }
-  const input = value as Record<string, unknown>;
+  const input = migrateLegacyKeys(value as Record<string, unknown>);
   // Deprecated clone-root settings are read only for persisted-config migration.
   const { work_root: _oldRoot, pi_config: _oldPiConfig, ...current } = input;
   // `worker`, `reviewer`, `worker_models` and `worker_thinking` are migration-only inputs for `workers`.
@@ -81,18 +107,18 @@ export function validateConfig(value: unknown): MerroConfig {
   if (typeof session !== "string" || !/^[a-zA-Z0-9_-]+$/.test(session)) throw new Error("tmux.session must be a safe session prefix");
 
   if (merged.version !== 1) throw new Error(`unsupported Merro config version: ${String(merged.version)}`);
-  const concurrency = merged.max_concurrent_tasks;
+  const concurrency = merged.maxConcurrentTasks;
   if (concurrency !== "unlimited" && (!Number.isInteger(concurrency) || Number(concurrency) < 1)) {
-    throw new Error("max_concurrent_tasks must be a positive integer or unlimited");
+    throw new Error("maxConcurrentTasks must be a positive integer or unlimited");
   }
-  const rounds = merged.max_review_rounds;
+  const rounds = merged.maxReviewRounds;
   if (rounds !== "unlimited" && (!Number.isInteger(rounds) || Number(rounds) < 1)) {
-    throw new Error("max_review_rounds must be a positive integer or unlimited");
+    throw new Error("maxReviewRounds must be a positive integer or unlimited");
   }
   if (merged.sandbox !== "docker" && merged.sandbox !== "none") throw new Error("sandbox must be docker or none");
   if (merged.network !== "on" && merged.network !== "off") throw new Error("network must be on or off");
-  if (merged.worker_github !== "on" && merged.worker_github !== "off") throw new Error("worker_github must be on or off");
-  if (merged.notify_command !== null && typeof merged.notify_command !== "string") throw new Error("notify_command must be a string or null");
+  if (typeof merged.workerGithub !== "boolean") throw new Error("workerGithub must be true or false");
+  if (merged.notifyCommand !== null && typeof merged.notifyCommand !== "string") throw new Error("notifyCommand must be a string or null");
   let implementer: unknown;
   let reviewer: unknown;
   if (hasRoleMaps) {
@@ -116,15 +142,15 @@ export function validateConfig(value: unknown): MerroConfig {
   const issues = settingsObject(merged.issues, "issues", ["create"]);
   const create = issues.create ?? "approval";
   if (create !== "disabled" && create !== "approval" && create !== "auto") throw new Error("issues.create must be disabled, approval or auto");
-  const merge = settingsObject(merged.merge, "merge", ["auto", "method", "delete_branch"]);
+  const merge = settingsObject(merged.merge, "merge", ["auto", "method", "deleteBranch"]);
   const auto = merge.auto ?? false;
   const method = merge.method ?? "squash";
-  const deleteBranch = merge.delete_branch ?? true;
+  const deleteBranch = merge.deleteBranch ?? true;
   if (typeof auto !== "boolean") throw new Error("merge.auto must be a boolean");
   if (method !== "squash" && method !== "merge" && method !== "rebase") throw new Error("merge.method must be squash, merge or rebase");
-  if (typeof deleteBranch !== "boolean") throw new Error("merge.delete_branch must be a boolean");
+  if (typeof deleteBranch !== "boolean") throw new Error("merge.deleteBranch must be a boolean");
   return {
-    ...merged, projectsDir, worktreesDir, workers, issues: { create }, merge: { auto, method, delete_branch: deleteBranch },
+    ...merged, projectsDir, worktreesDir, workers, issues: { create }, merge: { auto, method, deleteBranch: deleteBranch },
     git: { defaultDelivery }, tmux: { session },
   } as unknown as MerroConfig;
 }
@@ -212,4 +238,35 @@ export async function saveConfig(path: string, value: unknown): Promise<MerroCon
     await rm(temporary, { force: true });
   }
   return config;
+}
+
+function leaves(value: unknown, prefix: string, out: Map<string, unknown>): Map<string, unknown> {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    for (const [key, child] of Object.entries(value)) leaves(child, prefix ? `${prefix}.${key}` : key, out);
+  } else out.set(prefix, value);
+  return out;
+}
+
+const display = (value: unknown): string => typeof value === "string" ? value : JSON.stringify(value);
+
+/** Renders only values that differ from Merro defaults, unless `all` is set. */
+export function formatConfig(path: string, config: MerroConfig, all = false): string {
+  const defaults = leaves(DEFAULT_CONFIG, "", new Map());
+  const current = leaves(config, "", new Map());
+  const shown = [...current].filter(([key, value]) => key !== "version" && (all || JSON.stringify(defaults.get(key)) !== JSON.stringify(value)));
+  const groups = new Map<string, Array<[string, unknown]>>();
+  const singles: string[] = [];
+  for (const [key, value] of shown) {
+    const parts = key.split(".");
+    if (parts.length < 3) { singles.push(`${key}  ${display(value)}`); continue; }
+    const group = parts.slice(0, -1).join(".");
+    groups.set(group, [...(groups.get(group) ?? []), [parts.at(-1)!, value]]);
+  }
+  const width = Math.max(0, ...[...groups.values()].flat().map(([key]) => key.length)) + 2;
+  const blocks = [
+    ...[...groups].map(([group, entries]) => `${group}\n${entries.map(([key, value]) => `  ${key.padEnd(width)}${display(value)}`).join("\n")}`),
+    ...singles,
+  ];
+  if (all) return `Config: ${path}\n\n${blocks.join("\n\n")}`;
+  return `Config: ${path}\n\n${blocks.length ? `Overrides\n\n${blocks.join("\n\n")}\n\nEverything else uses Merro defaults.` : "No overrides. Everything uses Merro defaults."}\n\nShow all: /merro config --all`;
 }

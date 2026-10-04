@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { loadConfig } from "../config.js";
+import { formatConfig, loadConfig } from "../config.js";
 import type { MainOrchestrator } from "../runtime/main.js";
+import { systemCommandRunner } from "../runtime/commands.js";
 import { MainLock } from "../runtime/main-lock.js";
 import { MerroStore } from "../store/store.js";
 import { initializeWorkspace, isWorkspace, requireWorkspace } from "../runtime/workspace.js";
-import { formatChangeDetails, formatStatus, presentChangeDetails, presentWorkspace, publicText } from "../runtime/presentation.js";
+import { formatChangeDetails, formatOverview, formatStatus, presentChangeDetails, presentWorkspace, publicText } from "../runtime/presentation.js";
 
 interface CommandContext { ui?: { notify(message: string, level?: "info" | "warning" | "error"): void } }
 export interface PiExtensionLike {
@@ -26,7 +27,7 @@ async function withStore<T>(cwd: string, action: (store: MerroStore) => T | Prom
   finally { try { store?.close(); } finally { await lock.release(); } }
 }
 
-const commandUsage = "Commands: /merro · /merro init · /merro status · /merro <change> · /merro issue create|list|show|start|approve|dismiss · /merro approve [change] · /merro leave [change] · /merro retry [change] · /merro stop [objective] · /merro run · /merro export · /merro unlock · /merro config";
+const commandUsage = "Commands: /merro · /merro init · /merro status · /merro <change> [--history] · /merro watch <change> · /merro issue create|list|show|start|approve|dismiss · /merro approve [change] · /merro leave [change] · /merro retry [change] · /merro stop [objective] · /merro run · /merro export · /merro unlock · /merro config [--all]";
 const issueUsage = "Usage: /merro issue create <title> [--project <name>] [--body <text>] · list [--project <name>] · show #<n> [--project <name>] · start #<n> [--project <name>] · approve [<n>] · dismiss [<n>]";
 
 interface IssueArguments { positional: string; project: string | undefined; body: string }
@@ -89,26 +90,37 @@ async function runIssueCommand(main: MainOrchestrator, text: string): Promise<st
 }
 
 export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?: MainOrchestrator, onInitialized?: () => Promise<void>): void {
-  const showStatus = async (ctx: CommandContext) => {
+  const showStatus = async (ctx: CommandContext, full: boolean) => {
     const snapshot = main ? await main.publicSnapshot() : await withStore(cwd, presentWorkspace);
-    report(ctx, formatStatus(snapshot));
+    report(ctx, full ? formatStatus(snapshot) : formatOverview(snapshot));
   };
-  const showDetails = async (name: string, ctx: CommandContext) => {
+  const showDetails = async (name: string, ctx: CommandContext, history: boolean) => {
     const details = main
       ? await main.changeDetails(name)
       : await withStore(cwd, (store) => presentChangeDetails(store, name));
-    report(ctx, formatChangeDetails(details));
+    report(ctx, formatChangeDetails(details, { history }));
+  };
+  const watch = async (name: string, ctx: CommandContext) => {
+    if (!main) { report(ctx, "Open Main to watch a change.", "warning"); return; }
+    if (!name) { report(ctx, "Usage: /merro watch <change>", "warning"); return; }
+    const target = await main.watchTarget(name);
+    if (!target) { report(ctx, `${name} has no running worker to watch.`); return; }
+    const spec = `=${target.session}:=${target.window}`;
+    if (process.env.TMUX) {
+      await systemCommandRunner.run("tmux", ["switch-client", "-t", spec]);
+      report(ctx, `Switched to ${target.window}.`);
+    } else report(ctx, `Watch ${name}:\n  tmux attach -t '${spec}'`);
   };
   const runMerro = async (args: string, ctx: CommandContext) => {
     const [verb, ...rest] = args.trim().split(/\s+/).filter(Boolean);
     const target = rest.join(" ");
     if (!verb || verb === "status") await requireWorkspace(cwd);
     try {
-      if (target && ["init", "status", "run", "export", "unlock", "config"].includes(verb ?? "")) {
+      if (target && ["init", "status", "run", "export", "unlock"].includes(verb ?? "") || verb === "config" && target !== "" && target !== "--all") {
         report(ctx, commandUsage, "warning");
         return;
       }
-      if (!verb) { await showStatus(ctx); return; }
+      if (!verb) { await showStatus(ctx, false); return; }
       if (verb === "init") {
         const alreadyInitialized = await isWorkspace(cwd);
         if (alreadyInitialized) { report(ctx, "Merro already initialized."); return; }
@@ -117,13 +129,13 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
         await onInitialized?.();
         return;
       }
-      if (verb === "status") { await showStatus(ctx); return; }
+      if (verb === "status") { await showStatus(ctx, true); return; }
       if (verb === "config") {
         await requireWorkspace(cwd);
         const path = resolve(cwd, ".merro", "config.json");
         const config = await loadConfig(path);
         // Config contains user-owned values, not private orchestration identities.
-        const message = `Config: ${path}\n\n${JSON.stringify(config, null, 2)}`;
+        const message = formatConfig(path, config, target === "--all");
         if (ctx.ui) ctx.ui.notify(message, "info");
         else console.log(message);
         return;
@@ -174,12 +186,14 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
         report(ctx, "Checked current work.");
         return;
       }
-      if (!target) { await showDetails(verb, ctx); return; }
+      if (verb === "watch") { await watch(target, ctx); return; }
+      if (!target) { await showDetails(verb, ctx, false); return; }
+      if (target === "--history") { await showDetails(verb, ctx, true); return; }
       report(ctx, commandUsage, "warning");
     } catch (error) {
       report(ctx, error instanceof Error ? error.message : String(error), "warning");
     }
   };
 
-  pi.registerCommand("merro", { description: "Merro: init, status, issue, <change>, approve, leave, retry, stop, run, export, unlock, config", handler: runMerro });
+  pi.registerCommand("merro", { description: "Merro: init, status, issue, <change>, watch, approve, leave, retry, stop, run, export, unlock, config", handler: runMerro });
 }

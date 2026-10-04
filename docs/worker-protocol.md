@@ -12,7 +12,7 @@ One Task is one fresh native Pi process in one tmux pane. Launch uses `pi --no-s
 
 Host mode inherits the user's normal HOME, Pi config, models, auth, packages and unrelated extensions. Merro does not copy or replace host configuration. Worker-specific environment sets `MERRO_RUNTIME=worker`; the installed Main extension is inert under this marker, preventing nested orchestration. Host mode is not an OS security boundary. Worker restrictions, including reviewer non-editing, are contractual.
 
-Docker is optional. It stages normal Pi configuration into scratch, mounts only the change clone and Task/dependency scratch, and mounts the review clone read-only. It uses an interactive tty, version-matched Pi image, read-only container root and optional network isolation. Workers never receive Main's database mount. GitHub tokens are passed only when `worker_github` is enabled (default off). Tokens and staged config are secrets removed by safe finalized cleanup.
+Docker is optional. It stages normal Pi configuration into scratch, mounts only the change clone and Task/dependency scratch, and mounts the review clone read-only. It uses an interactive tty, version-matched Pi image, read-only container root and optional network isolation. Workers never receive Main's database mount. GitHub tokens are passed only when `workerGithub` is enabled (default off). Tokens and staged config are secrets removed by safe finalized cleanup.
 
 ## Paths and input
 

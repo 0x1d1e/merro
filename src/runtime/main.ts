@@ -449,6 +449,7 @@ export class MainOrchestrator {
   readonly #stateDirectory: string;
   get #workRoot(): string { return join(this.#workspacePath, this.#config.worktreesDir); }
   readonly #config: MerroConfig;
+  readonly #notifiedBySubject = new Map<string, string>();
   readonly #notify: (message: string, level?: "info" | "warning" | "error") => void;
   readonly #progress: (message: string) => void;
   readonly #git: GitAdapter;
@@ -466,7 +467,15 @@ export class MainOrchestrator {
     this.#stateDirectory = join(this.#workspacePath, ".merro");
     this.#config = options.config;
     const notify = options.notify ?? ((message: string) => console.log(message));
-    this.#notify = (message, level) => notify(publicText(message, this.#names), level);
+    // Reconciliation re-derives the same conditions every pass; an equivalent message per subject is shown once until it changes.
+    const lastBySubject = this.#notifiedBySubject;
+    this.#notify = (message, level) => {
+      const text = publicText(message, this.#names);
+      const subject = text.split(/\n| · /, 1)[0]!;
+      if (lastBySubject.get(subject) === text) return;
+      lastBySubject.set(subject, text);
+      notify(text, level);
+    };
     this.#progress = (message) => options.progress?.(publicText(message, this.#names));
     const commands = options.commands ?? systemCommandRunner;
     this.#commands = commands;
@@ -587,7 +596,8 @@ export class MainOrchestrator {
         id: randomUUID(), subjectType: "IssueProposal", subjectId: randomUUID(), kind: "issue",
         payload: { projectSlug: project.slug, title: proposal.title, body, change: changeName(item) },
       });
-      this.#notify(`${changeName(item)} · Proposed issue: ${proposal.title}\nCreate it? /merro issue approve · Dismiss: /merro issue dismiss`, "warning");
+      const position = this.#pendingIssueProposals(store).length;
+      this.#notify(`${changeName(item)} proposed a follow-up\n\n${position}. ${proposal.title}\nApprove: /merro issue approve ${position} · Dismiss: /merro issue dismiss ${position}`, "warning");
     }
   }
 
@@ -607,6 +617,17 @@ export class MainOrchestrator {
 
   async changeDetails(name: string) {
     return this.#withStore((store) => presentChangeDetails(store, semanticSlug(name)));
+  }
+
+  /** Resolves the live tmux window of a change's active worker, or null when none is running. */
+  async watchTarget(name: string): Promise<{ session: string; window: string } | null> {
+    return this.#withStore((store) => {
+      const item = store.listChangeSets().find((candidate) => changeName(candidate) === semanticSlug(name));
+      if (!item) throw new Error(`Unknown change: ${name}`);
+      const active = store.activeTask(item.id);
+      const record = active && store.getTaskRuntime(active.id);
+      return record?.tmuxSession && record.tmuxWindow ? { session: record.tmuxSession, window: record.tmuxWindow } : null;
+    });
   }
 
   async statusSummary(): Promise<ReturnType<MerroStore["statusSummary"]>> {
@@ -641,7 +662,7 @@ export class MainOrchestrator {
       } else {
         if (!this.#git.cloneProject) throw new Error("Git adapter cannot clone a remote Project");
         await this.#ensureWorkspaceDirectory(this.#config.projectsDir);
-        this.#notify(`Cloning -> ./${this.#config.projectsDir}/${slug}`);
+        this.#progress(`Cloning -> ./${this.#config.projectsDir}/${slug}`);
         await this.#git.cloneProject(path, projectPath);
       }
     } else {
@@ -946,6 +967,7 @@ export class MainOrchestrator {
   }
 
   async restartChange(name: string, requirements: string): Promise<void> {
+    this.#notifiedBySubject.clear(); // A user action starts a new conversation about the change.
     if (!requirements.trim()) throw new Error("Describe the changed requirements for the fresh attempt.");
     await this.#withStore(async (store) => {
       let item = store.listChangeSets().find((item) => item.slug === semanticSlug(name));
@@ -993,6 +1015,7 @@ export class MainOrchestrator {
   }
 
   async resolveDecisionForChange(name: string | undefined, approved: boolean): Promise<string> {
+    this.#notifiedBySubject.clear(); // A user action starts a new conversation about the change.
     const requested = name?.trim() || undefined;
     const alreadyMerged = () => this.#withStore((store) => {
       const exact = requested ? store.getChangeSet(requested) : null;
@@ -1091,6 +1114,7 @@ export class MainOrchestrator {
   }
 
   async retryChangeSet(name?: string): Promise<string> {
+    this.#notifiedBySubject.clear(); // A user action starts a new conversation about the change.
     const result = await this.#withStore((store) => {
       const requested = name?.trim() || undefined;
       const changes = store.listChangeSets();
@@ -1262,7 +1286,7 @@ export class MainOrchestrator {
       }
 
       mergeAttempted = true;
-      await this.#github.merge(project, runtime.pullRequestNumber, pullRequest.headRefOid, { method: this.#config.merge.method, deleteBranch: this.#config.merge.delete_branch });
+      await this.#github.merge(project, runtime.pullRequestNumber, pullRequest.headRefOid, { method: this.#config.merge.method, deleteBranch: this.#config.merge.deleteBranch });
       mergeCommandSucceeded = true;
       pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
       if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
@@ -1464,7 +1488,7 @@ export class MainOrchestrator {
           reviewedChangeSetIds: [...reviewedChangeSetIds],
           activeTaskCount: active.length + orphans.count,
           activeChangeSetIds: [...active.map((task) => task.changeSetId), ...orphans.changeSetIds],
-          maxConcurrentTasks: this.#config.max_concurrent_tasks,
+          maxConcurrentTasks: this.#config.maxConcurrentTasks,
         });
         if (result.cycle) this.#blockCycle(store, result.cycle, new Set([...active.map((task) => task.changeSetId), ...orphans.changeSetIds]));
         for (const item of result.selected) {
@@ -1499,12 +1523,12 @@ export class MainOrchestrator {
       // Hooks run after ownership and serialization are released; they may query Main.
       for (const notification of notifications) {
         try {
-          await this.#commands.run("bash", ["-lc", this.#config.notify_command!], {
+          await this.#commands.run("bash", ["-lc", this.#config.notifyCommand!], {
             cwd: this.#workspacePath,
             env: { MERRO_EVENT: notification.event, MERRO_CHANGE: this.#names.get(notification.subjectId) ?? "change", MERRO_MESSAGE: publicText(notification.message, this.#names) },
           });
         } catch (error) {
-          this.#notify(`notify_command failed: ${errorText(error)}`, "warning");
+          this.#notify(`notifyCommand failed: ${errorText(error)}`, "warning");
         } finally {
           if (notification.event === "review_complete") this.#reviewNotificationsInFlight.delete(notification.subjectId);
         }
@@ -2033,7 +2057,7 @@ export class MainOrchestrator {
         if (presence.alive) {
           if (!presence.identityMatches) {
             unsafeProjects.add(item.projectSlug);
-            this.#notify(`${changeName(item)} · Merro cannot verify the current process${presence.reason ? `: ${presence.reason}` : ""}. Scheduling is paused until it can be checked safely.`, "warning");
+            this.#notify(`${changeName(item)} · Merro found background work it cannot verify as its own${presence.reason ? ` (${presence.reason})` : ""}.\nInspect: tmux list-panes -t =${this.#config.tmux.session}-${item.projectSlug}\nMerro will not adopt or stop it automatically.`, "warning");
           }
           continue;
         }
@@ -2544,7 +2568,9 @@ export class MainOrchestrator {
     store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable: true });
     const view = presentWorkspace(store).changes.find((change) => change.name === changeName(item));
     const pr = store.getChangeSetRuntime(item.id)?.pullRequestNumber;
-    const message = `${changeName(item)}\nBlocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "Merro could not open the pull request."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
+    // Merro-owned waiting needs no one: show it transiently, never as a permanent notification.
+    if (view?.status === "Waiting") { this.#progress(`${changeName(item)} · Waiting · ${view.summary}`); return; }
+    const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "Merro could not open the pull request."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
     this.#notify(message, "warning");
     this.#queueNotification("publication_blocked", item.id, `${message}\nDetails: ${detail}`);
   }
@@ -2778,7 +2804,7 @@ export class MainOrchestrator {
           },
         });
         if (autoReady) {
-          this.#notify(`${changeName(item)} · Review passed and GitHub checks are green. Merging PR #${pullRequest.number} (${this.#config.merge.method}).`);
+          this.#progress(`${changeName(item)} · Review passed and GitHub checks are green. Merging PR #${pullRequest.number} (${this.#config.merge.method}).`);
           await this.#executeMergeDecision(store, decisionId, true);
           continue;
         }
@@ -3078,7 +3104,8 @@ export class MainOrchestrator {
       .map((relation) => store.getChangeSet(relation.from)).filter((dependent): dependent is ChangeSet => dependent !== null)
       .map(changeName);
     const waiting = dependents.length ? `\nAlso waiting: ${dependents.join(", ")}.` : "";
-    const message = `${changeName(item)}\nBlocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "This change needs attention."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${waiting}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
+    if (view?.status === "Waiting") { this.#progress(`${changeName(item)} · Waiting · ${view.summary}`); return; }
+    const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "This change needs attention."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${waiting}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
     this.#notify(message, "warning");
     this.#queueNotification("blocked", item.id, `${message}${detail ? `\nDetails: ${detail}` : ""}`);
   }
@@ -3087,7 +3114,7 @@ export class MainOrchestrator {
     const limits = store.listObjectives()
       .filter((objective) => objective.state === "Active"
         && store.listChangeSets(objective.id, true).some((changeSet) => changeSet.id === item.id))
-      .map((objective) => objective.maxReviewRounds ?? this.#config.max_review_rounds);
+      .map((objective) => objective.maxReviewRounds ?? this.#config.maxReviewRounds);
     if (limits.length === 0 || limits.every((limit) => limit === "unlimited")) return "unlimited";
     return Math.min(...limits.filter((limit): limit is number => limit !== "unlimited"));
   }
@@ -3129,7 +3156,7 @@ export class MainOrchestrator {
   }
 
   #queueNotification(event: string, subjectId: string, message: string): void {
-    if (this.#config.notify_command?.trim()) {
+    if (this.#config.notifyCommand?.trim()) {
       this.#pendingNotifications.push({ event, subjectId, message });
       if (event === "review_complete") this.#reviewNotificationsInFlight.add(subjectId);
     }

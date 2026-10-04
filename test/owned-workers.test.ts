@@ -80,7 +80,7 @@ test("refusing an unowned session never stops its existing workers during launch
   t.after(() => rm(root, { recursive: true, force: true }));
   const calls: string[] = [];
   const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), piConfigPath: join(root, "missing"),
-    config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off" }, commands: {
+    config: { ...DEFAULT_CONFIG, sandbox: "none", workerGithub: false }, commands: {
       async run(file, args) { calls.push(`${file} ${args[0]}`); return { stdout: "", stderr: "" }; },
     } });
   await assert.rejects(runtime.launch({ taskId: "unowned", changeSetId: "work", changeSlug: "safety", taskName: "implement-safety", role: "implement", project,

@@ -139,7 +139,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
     config: {
       ...DEFAULT_CONFIG,
       sandbox: "none",
-      worker_github: "on",
+      workerGithub: true,
       workers: { ...DEFAULT_CONFIG.workers, reviewer: { runtime: "pi", model: "openai/gpt-4o", thinking: "high" } },
     },
     commands,
@@ -225,7 +225,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
   const movedPath = join(root, "moved-project");
   await rename(projectPath, movedPath);
   containerId = "b".repeat(64);
-  const restarted = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "docker", worker_github: "on" }, commands, piConfigPath });
+  const restarted = new WorkerRuntime({ workspacePath, config: { ...DEFAULT_CONFIG, sandbox: "docker", workerGithub: true }, commands, piConfigPath });
   const legacyClonePath = join(root, "merro-acceptance:issue-1:g1");
   await mkdir(legacyClonePath);
   const successor = await restarted.launch({ taskId: "task-2", changeSetId: "merro-acceptance:issue-1:g1", changeSlug: "safety", taskName: "implement-safety", role: "implement",
@@ -355,7 +355,7 @@ for (const sandbox of ["docker", "none"] as const) {
     };
     const runtime = new WorkerRuntime({
       workspacePath,
-      config: { ...DEFAULT_CONFIG, sandbox, worker_github: "on" },
+      config: { ...DEFAULT_CONFIG, sandbox, workerGithub: true },
       commands,
       piConfigPath: join(root, "missing-pi-config"),
     });
@@ -388,7 +388,7 @@ test("partial host launch rolls back the owned tmux window before removing Task 
   t.after(() => rm(root, { recursive: true, force: true }));
   let windowExists = false;
   let stopped = false;
-  const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off" }, piConfigPath: join(root, "missing"), commands: {
+  const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"), config: { ...DEFAULT_CONFIG, sandbox: "none", workerGithub: false }, piConfigPath: join(root, "missing"), commands: {
     async run(file, args) {
       assert.equal(file, "tmux");
       if (args[0] === "has-session") throw new Error("missing session");
@@ -416,7 +416,7 @@ for (const scenario of ["exited pane", "unrecorded container", "missing cidfile"
     let containerAlive = scenario === "unrecorded container";
     let stops = 0;
     const runtime = new WorkerRuntime({ workspacePath,
-      config: { ...DEFAULT_CONFIG, sandbox: "docker", worker_github: "on" }, piConfigPath: join(root, "missing"), commands: {
+      config: { ...DEFAULT_CONFIG, sandbox: "docker", workerGithub: true }, piConfigPath: join(root, "missing"), commands: {
         async run(file, args) {
           if (file === "gh") return { stdout: "launch-secret\n", stderr: "" };
           if (file === "pi") return { stdout: "1.0.0\n", stderr: "" };
@@ -472,7 +472,7 @@ test("Docker launch rollback reports real tmux cleanup failures alongside the or
   const killError = new Error("tmux permission denied");
   const lookupError = new Error("tmux connection lost");
   const runtime = new WorkerRuntime({ workspacePath: join(root, "runtime"),
-    config: { ...DEFAULT_CONFIG, sandbox: "docker", worker_github: "off" }, piConfigPath: join(root, "missing"), commands: {
+    config: { ...DEFAULT_CONFIG, sandbox: "docker", workerGithub: false }, piConfigPath: join(root, "missing"), commands: {
       async run(file, args) {
         if (file === "docker" && args[0] === "image") return { stdout: "[]", stderr: "" };
         if (file === "pi") return { stdout: "1.0.0\n", stderr: "" };
@@ -584,7 +584,7 @@ test("sandbox none launches Pi with host paths and staged system-prompt context,
   };
   const runtime = new WorkerRuntime({
     workspacePath,
-    config: { ...DEFAULT_CONFIG, sandbox: "none", worker_github: "off" },
+    config: { ...DEFAULT_CONFIG, sandbox: "none", workerGithub: false },
     commands,
     piConfigPath,
   });

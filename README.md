@@ -163,7 +163,7 @@ Machine settings belong in `config.json`, not prompts or review policy. Init wri
     "reviewer": { "runtime": "claude", "model": "claude-sonnet-5", "thinking": "high" }
   },
   "issues": { "create": "approval" },
-  "merge": { "auto": false, "method": "squash", "delete_branch": true },
+  "merge": { "auto": false, "method": "squash", "deleteBranch": true },
   "git": { "defaultDelivery": "auto" },
   "tmux": { "session": "merro" }
 }

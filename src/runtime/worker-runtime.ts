@@ -269,7 +269,7 @@ export class WorkerRuntime {
       MERRO_TASK_SCRATCH: TASK_MOUNT,
       ...(workerGuidance ? { MERRO_WORKER_GUIDANCE_PATH: sandbox === "docker" ? join(TASK_MOUNT, "worker-guidance.md") : workerGuidancePath } : {}),
     };
-    const workerGithub = input.projectSettings?.workerGithub ?? this.#config.worker_github === "on";
+    const workerGithub = input.projectSettings?.workerGithub ?? this.#config.workerGithub;
     if (workerGithub) {
       const token = (await this.#commands.run("gh", ["auth", "token"], { cwd: input.project.path })).stdout.trim();
       if (!token || /[\r\n]/.test(token)) throw new Error("gh auth token returned an invalid worker token");

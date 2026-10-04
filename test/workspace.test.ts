@@ -60,7 +60,7 @@ for (const gitRepository of [false, true]) {
         const messages=[];
         await commands.get('merro').handler('config',{ui:{notify(message){messages.push(message)}}});
         assert.ok(messages[0].startsWith('Config: '+process.cwd()+'/.merro/config.json\\n\\n'));
-        assert.deepEqual(JSON.parse(messages[0].slice(messages[0].indexOf('{'))),${JSON.stringify(DEFAULT_CONFIG)});
+        assert.match(messages[0], /No overrides\\. Everything uses Merro defaults\\./);
       } finally { await events.get('session_shutdown')(); }`;
     const result = await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, MERRO_RUNTIME: "" } });
     assert.match(result.stdout, /Merro initialized in /);
@@ -113,7 +113,7 @@ test("/merro init excludes local state and preserves explicitly registered Proje
     await tools.get('merro_add_project').execute('register',{path:process.cwd(),slug:'kinetix'});`;
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", registration], { cwd, env });
   const config = join(cwd, ".merro", "config.json");
-  const customConfig = '{"max_concurrent_tasks":2,"max_review_rounds":3}\n';
+  const customConfig = '{"maxConcurrentTasks":2,"maxReviewRounds":3}\n';
   await writeFile(config, customConfig);
   await writeFile(join(cwd, ".merro", "runtime", "sentinel"), "preserved");
   await mkdir(join(cwd, ".merro", "projects"), { recursive: true });

@@ -275,7 +275,7 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
         }).join("\n")}` : "";
       const unresolvedText = proposal.planning?.unresolved.length
         ? `\n\nUnresolved / blocked workstreams (no dependency inferred)\n${proposal.planning.unresolved.map((entry) => `  ${entry.projectSlug} / ${entry.workstream}: ${entry.statement}`).join("\n")}` : "";
-      const message = publicText(`Plan\n\n${planText}${roadmapText}${unresolvedText}\n\n${totals}${warning}\n\nApprove?`, names);
+      const message = publicText(`Plan\n\n${planText}${roadmapText}${unresolvedText}\n\n${totals}${warning}\n\nApprove · edit · cancel`, names);
       const details = { plans, relations, planning: proposal.planning ?? null, runnableImmediately: proposal.runnableImmediately };
       pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details });
       return result(message, details);

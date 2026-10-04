@@ -10,6 +10,7 @@ import { MerroStore } from "../src/store/store.js";
 import type { Project, Relation } from "../src/domain/model.js";
 import { GitHubMergeError, type GitHubIssue, type GitHubPullRequest, type RequiredTeamReviewRequirement } from "../src/github/client.js";
 import { MainOrchestrator, type NamedObjectiveStartInput, type ObjectiveProposal, type ObjectiveStartInput, type RoadmapStatus } from "../src/runtime/main.js";
+import { formatChangeDetails, formatOverview, formatStatus } from "../src/runtime/presentation.js";
 import { initializedState } from "./fixtures.js";
 
 // These reconciliation scenarios intentionally deliver each issue as a separate change.
@@ -50,7 +51,7 @@ test("first-worker walkthrough registers a Project, approves work and reaches a 
   const issues = await call("merro_discover_issues", { project_slug: "my-app" });
   assert.match(issues.content[0]?.text ?? "", /Issue 42/);
   const proposed = await call("merro_propose_objective", { goal: "Fix #42", change: "fix-42", project_slugs: ["my-app"], issues: [{ project_slug: "my-app", numbers: [42] }] });
-  assert.match(proposed.content[0]?.text ?? "", /Approve\?/);
+  assert.match(proposed.content[0]?.text ?? "", /Approve · edit · cancel/);
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
   assert.match((await call("merro_start_objective")).content[0]?.text ?? "", /Working: fix-42\./);
@@ -324,7 +325,7 @@ test("authoritative proposal and approval persist exactly the acceptance graph",
   const proposed = await tools.get("merro_propose_objective")!.execute("proposal", args);
   const proposal = proposed.details as { relations: Array<{ from: string; to: string }> };
   assert.deepEqual(proposal.relations.map((edge) => [edge.from, edge.to]), [["acceptance-2", "acceptance"], ["acceptance-4", "acceptance-2"]]);
-  assert.ok(displayed[0]?.includes("Approve?"));
+  assert.ok(displayed[0]?.includes("Approve · edit · cancel"));
   assert.ok(!displayed[0]?.includes(":issue-"));
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
   await tools.get("merro_start_objective")!.execute("approved", {});
@@ -383,7 +384,7 @@ test("status shows approved dependents waiting on named prerequisites while inde
   assert.deepEqual(harness.launches.map((input) => input.changeSlug).sort(), ["alpha", "beta", "delta"]);
   assert.equal(byName.get("alpha")?.summary, "Working on the change");
   assert.equal(byName.get("delta")?.summary, "Working on the change");
-  assert.equal(byName.get("gamma")?.summary, "Approved · waiting for alpha, beta (lib)");
+  assert.equal(byName.get("gamma")?.summary, "waiting for alpha, beta (lib)");
   assert.deepEqual(byName.get("gamma")?.waitingOn, ["alpha", "beta (lib)"]);
   assert.deepEqual(byName.get("alpha")?.waitingOn, []);
 });
@@ -1617,8 +1618,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
       ...DEFAULT_CONFIG,
       git: { defaultDelivery: "pr" }, // This harness tests explicitly requested PR delivery.
       sandbox: options.realWorkerPlan ? "docker" : "none",
-      max_concurrent_tasks: options.maxConcurrentTasks ?? 3,
-      notify_command: options.notifyCommand ?? null,
+      maxConcurrentTasks: options.maxConcurrentTasks ?? 3,
+      notifyCommand: options.notifyCommand ?? null,
       merge: { ...DEFAULT_CONFIG.merge, ...options.mergeConfig },
       issues: { create: options.issuesCreate ?? DEFAULT_CONFIG.issues.create },
       workers: {
@@ -1785,7 +1786,7 @@ test("Main runs one issue through implement, review, PR approval, merge, and Obj
 });
 
 test("merge.auto merges after review pass and green CI using the configured method, with no approval prompt", async (t) => {
-  const harness = await createHarness(t, { mergeConfig: { auto: true, method: "rebase", delete_branch: false } });
+  const harness = await createHarness(t, { mergeConfig: { auto: true, method: "rebase", deleteBranch: false } });
   await startDefaultObjective(harness.main);
   for (let pass = 0; pass < 4; pass += 1) await harness.main.runPass();
 
@@ -3008,7 +3009,7 @@ test("blocked reason follows external PR closure without losing resume state", a
 test("unchanged blocked policy is silent across repeated reconciliation passes", async (t) => {
   const hookEvents: string[] = [];
   const harness = await createHarness(t, {
-    branchPolicyAvailable: false,
+    unsupportedPolicyReason: "ruleset contains unsupported rule",
     notifyCommand: "notify-test",
     commands: { async run(_file, _args, options) { hookEvents.push(options?.env?.MERRO_EVENT ?? "missing"); return { stdout: "", stderr: "" }; } },
   });
@@ -3017,14 +3018,14 @@ test("unchanged blocked policy is silent across repeated reconciliation passes",
   const item = (await harness.main.statusSnapshot()).changeSets[0]!;
   assert.equal(item.state, "Blocked");
   assert.equal(item.blockedReason, "policy_unknown");
-  const blockedMessages = harness.notifications.filter((message) => /\nBlocked(?: · PR #\d+)?\n\n/.test(message));
+  const blockedMessages = harness.notifications.filter((message) => / · Blocked(?: · PR #\d+)?\n\n/.test(message));
   assert.equal(blockedMessages.length, 1);
   assert.deepEqual(hookEvents.filter((event) => event === "blocked"), ["blocked"]);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   const eventCount = (store.snapshot().event_log ?? []).filter((event) => event.event_type === "blocked").length;
   store.close();
   for (let pass = 0; pass < 2; pass++) await harness.main.runPass();
-  assert.equal(harness.notifications.filter((message) => /\nBlocked(?: · PR #\d+)?\n\n/.test(message)).length, 1);
+  assert.equal(harness.notifications.filter((message) => / · Blocked(?: · PR #\d+)?\n\n/.test(message)).length, 1);
   assert.deepEqual(hookEvents.filter((event) => event === "blocked"), ["blocked"]);
   const after = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   assert.equal((after.snapshot().event_log ?? []).filter((event) => event.event_type === "blocked").length, eventCount);
@@ -3041,12 +3042,12 @@ test("changed blocker detail emits a fresh event and notification", async (t) =>
   const harness = await createHarness(t, options);
   await startDefaultObjective(harness.main);
   for (let pass = 0; pass < 5; pass++) await harness.main.runPass();
-  assert.equal(harness.notifications.filter((message) => /\nBlocked(?: · PR #\d+)?\n\n/.test(message)).length, 1);
+  assert.equal(harness.notifications.filter((message) => / · Blocked(?: · PR #\d+)?\n\n/.test(message)).length, 1);
 
   options.unsupportedPolicyReason = "ruleset contains unsupported rule two";
   await harness.main.runPass();
 
-  assert.equal(harness.notifications.filter((message) => /\nBlocked(?: · PR #\d+)?\n\n/.test(message)).length, 2);
+  assert.equal(harness.notifications.filter((message) => / · Blocked(?: · PR #\d+)?\n\n/.test(message)).length, 2);
   assert.deepEqual(hookEvents.filter((event) => event === "blocked"), ["blocked", "blocked"]);
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   assert.equal((store.snapshot().event_log ?? []).filter((event) => event.event_type === "blocked").length, 2);
@@ -3063,7 +3064,23 @@ test("deterministic unsupported policy cannot be retried with /merro-continue", 
   assert.equal((await harness.main.statusSnapshot()).changeSets[0]!.state, "Blocked");
 });
 
-test("notify_command runs for merge-ready, Objective Done, and Blocked, with failures isolated", async (t) => {
+test("overview, status and details present attention-first output with history opt-in", async (t) => {
+  const harness = await createHarness(t, { unsupportedPolicyReason: "ruleset contains unsupported rule" });
+  await startDefaultObjective(harness.main);
+  for (let pass = 0; pass < 5; pass++) await harness.main.runPass();
+  const snapshot = await harness.main.publicSnapshot();
+  const overview = formatOverview(snapshot);
+  assert.match(overview, /Blocked/);
+  assert.doesNotMatch(overview, /Next: \/merro retry/);
+  assert.match(formatStatus(snapshot), /Roadmap/);
+  const name = snapshot.changes[0]!.name;
+  const details = (await harness.main.changeDetails(name))!;
+  assert.match(formatChangeDetails(details), /Blocked/);
+  assert.doesNotMatch(formatChangeDetails(details), /Implementation 1/);
+  assert.match(formatChangeDetails(details, { history: true }), /Implementation 1 +passed/);
+});
+
+test("notifyCommand runs for merge-ready, Objective Done, and Blocked, with failures isolated", async (t) => {
   const events: string[] = [];
   const harness = await createHarness(t, { notifyCommand: "notify-test", commands: {
     async run(file, args, options) {
@@ -3119,12 +3136,11 @@ test("GitHub connection outage explains automatic recovery without replacing the
   assert.equal(blocked.state, "Blocked");
   assert.equal(blocked.blockedReason, "project_unavailable");
   assert.equal(blocked.blockedResumeState, "Implementing");
-  const messages = harness.notifications.filter((message) => /Blocked|is unavailable/.test(message));
-  assert.equal(messages.filter((message) => message.includes("Blocked\n\n")).length, 1);
+  assert.deepEqual(harness.notifications.filter((message) => /· Blocked/.test(message)), []);
+  const messages = [...harness.notifications, ...harness.progressMessages].filter((message) => /Waiting|is unavailable/.test(message));
   assert.ok(messages.some((message) => /temporarily unavailable/.test(message)));
   assert.ok(messages.some((message) => /retry automatically/.test(message)));
   assert.doesNotMatch(messages.join("\n"), /merro-continue/);
-  assert.ok(messages.some((message) => /error connecting to api.github.com/.test(message)));
 
   unavailable = false;
   await harness.main.runPass();
@@ -3362,7 +3378,7 @@ test("retrying finalized cleanup never removes a successor Task input", async (t
 });
 
 for (const blocker of ["merge_rejected", "conflict_abandoned", "review_cap"] as const) {
-  test(`notify_command fires for ${blocker}`, async (t) => {
+  test(`notifyCommand fires for ${blocker}`, async (t) => {
     const events: Array<{ event: string | undefined; message: string | undefined }> = [];
     const harness = await createHarness(t, {
       notifyCommand: "notify-test",
@@ -4168,7 +4184,7 @@ test("active worker inspection failure does not abort reconciliation of other Ta
   assert.equal(inspectCalls, 2);
   const state = await harness.main.statusSnapshot();
   assert.equal(state.changeSets.filter((item) => item.blockedReason === "github_unavailable").length, 1);
-  assert.ok(harness.notifications.some((message) => /could not safely verify the current work/i.test(message)));
+  assert.ok(harness.progressMessages.some((message) => /could not safely verify the current work/i.test(message)));
 });
 
 test("closed-issue PR lookup failure is isolated and clears its merge Decision", async (t) => {
@@ -5407,7 +5423,8 @@ test("known transient publication outage retries only publication and reports co
   await harness.main.runPass();
   await harness.main.runPass();
   assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "PublishBlocked");
-  assert.equal(harness.notifications.filter((message) => /review complete, publication blocked/i.test(message)).length, 1);
+  assert.deepEqual(harness.notifications.filter((message) => /publication blocked/i.test(message)), []);
+  assert.ok(harness.progressMessages.some((message) => /publication/i.test(message)));
   unavailable = false;
   await harness.restartMain().runPass();
   assert.equal((await harness.main.statusSnapshot()).changeSets[0]?.state, "AwaitingMerge");
@@ -5432,8 +5449,8 @@ test("status distinguishes passed review and green local CI from blocked publica
   let details = "";
   await commands.get("merro")!.handler("issue-7-for-example", { ui: { notify(message) { details = message; } } });
   assert.match(details, /Review: passed/);
-  assert.match(details, /Checks: Local checks passed/);
-  assert.match(details, /No pull request yet/);
+  assert.match(details, /Checks: Local passed/);
+  assert.doesNotMatch(details, /PR:/);
 });
 
 test("status uses GitHub checks as the single current CI source after PR creation", async (t) => {
@@ -5458,7 +5475,7 @@ test("status uses GitHub checks as the single current CI source after PR creatio
 
   let details = "";
   await commands.get("merro")!.handler("issue-7-for-example", { ui: { notify(message) { details = message; } } });
-  assert.match(details, /Checks: GitHub checks failed .*checked \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/);
+  assert.match(details, /Checks: GitHub failed \(required checks pass\)/);
   assert.doesNotMatch(details, /Local checks/);
 });
 

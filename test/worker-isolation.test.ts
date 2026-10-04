@@ -65,7 +65,7 @@ for (const sandbox of ["docker", "none"] as const) {
       }
       throw new Error(`unexpected ${file} ${args.join(" ")}`);
     } };
-    const runtime = new WorkerRuntime({ workspacePath: runtimePath, config: { ...DEFAULT_CONFIG, sandbox, worker_github: "off" }, piConfigPath: config, commands });
+    const runtime = new WorkerRuntime({ workspacePath: runtimePath, config: { ...DEFAULT_CONFIG, sandbox, workerGithub: false }, piConfigPath: config, commands });
     const record = await runtime.launch({ taskId: "task", changeSetId: "p:issue-1:g1", changeSlug: "implement", taskName: "implement-change", role: "implement", project: { slug: "p", path: root, baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" }, clonePath: clone, taskFile: "Implement", expectedCommit: base, projectSettings: null });
     const scratch = dirname(record.resultPath);
     const copied = sandbox === "docker" ? join(scratch, "pi-config") : config;

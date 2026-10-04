@@ -69,7 +69,7 @@ test("/merro config displays current effective settings and edit path without wr
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const path = join(cwd, ".merro", "config.json");
   const notifyCommand = "notify 11111111-2222-4333-8444-555555555555";
-  const original = `${JSON.stringify({ workers: { reviewer: { model: "openai/reviewer" } }, tmux: {}, notify_command: notifyCommand })}\n`;
+  const original = `${JSON.stringify({ workers: { reviewer: { model: "openai/reviewer" } }, tmux: {}, notifyCommand: notifyCommand })}\n`;
   await writeFile(path, original);
   const lock = new MainLock(join(cwd, ".merro", "main.lock.db"));
   await lock.acquire();
@@ -77,28 +77,36 @@ test("/merro config displays current effective settings and edit path without wr
   const messages: string[] = [];
   const merro = commandRegistry(cwd).get("merro")!;
   await merro.handler("config", { ui: { notify: (message) => messages.push(message) } });
-  assert.ok(messages[0]?.startsWith(`Config: ${path}\n\n`));
-  assert.deepEqual(JSON.parse(messages[0]!.slice(messages[0]!.indexOf("{"))), {
-    ...DEFAULT_CONFIG, notify_command: notifyCommand,
-    workers: { ...DEFAULT_CONFIG.workers, reviewer: { runtime: "pi", model: "openai/reviewer", thinking: null } },
-  });
+  assert.equal(messages[0], `Config: ${path}
+
+Overrides
+
+workers.reviewer
+  model  openai/reviewer
+
+notifyCommand  notify 11111111-2222-4333-8444-555555555555
+
+Everything else uses Merro defaults.
+
+Show all: /merro config --all`);
   assert.equal(await readFile(path, "utf8"), original);
   await writeFile(path, "{}");
   await merro.handler("config", { ui: { notify: (message) => messages.push(message) } });
-  assert.deepEqual(JSON.parse(messages[1]!.slice(messages[1]!.indexOf("{"))), DEFAULT_CONFIG);
-  const legacy = '{"worker_models":{"review":"provider/review"},"worker_thinking":{"implement":"off"}}\n';
+  assert.match(messages[1]!, /No overrides\. Everything uses Merro defaults\./);
+  await merro.handler("config --all", { ui: { notify: (message) => messages.push(message) } });
+  assert.match(messages[2]!, /maxConcurrentTasks {2}3/);
+  assert.match(messages[2]!, /merge\.deleteBranch|deleteBranch {2}true/);
+  // Legacy snake_case names and worker_models still load as migration-only inputs.
+  const legacy = '{"max_concurrent_tasks":5,"worker_github":"on","merge":{"delete_branch":false},"worker_models":{"review":"provider/review"},"worker_thinking":{"implement":"off"}}\n';
   await writeFile(path, legacy);
   await merro.handler("config", { ui: { notify: (message) => messages.push(message) } });
-  assert.deepEqual(JSON.parse(messages[2]!.slice(messages[2]!.indexOf("{"))), {
-    ...DEFAULT_CONFIG,
-    workers: {
-      implementer: { runtime: "pi", model: null, thinking: "off" },
-      reviewer: { runtime: "pi", model: "provider/review", thinking: null },
-    },
-  });
+  assert.match(messages[3]!, /maxConcurrentTasks {2}5/);
+  assert.match(messages[3]!, /workerGithub {2}true/);
+  assert.match(messages[3]!, /workers\.implementer\n {2}thinking {2}off/);
+  assert.match(messages[3]!, /workers\.reviewer\n {2}model +provider\/review/);
   assert.equal(await readFile(path, "utf8"), legacy);
   await merro.handler("config set sandbox docker", { ui: { notify: (message) => messages.push(message) } });
-  assert.match(messages[3]!, /^Commands:/);
+  assert.match(messages[4]!, /^Commands:/);
   assert.equal(await readFile(path, "utf8"), legacy);
 });
 

@@ -29,7 +29,7 @@ idle unfinished work -> Obsolete | Cancelled
 
 Successful implementation requires at least one reported verification command, all with zero exit codes, before review. Main validates result and commit integrity; it does not independently rerun repository CI. Manual-only results cannot unlock review.
 
-Review receives all issue contents and acceptance criteria, complete base-to-head diff, latest successful implementation summary/verification, prior findings, guidance and repository instructions. No implementer conversation history. Rejection is not a Task failure; its findings go to a fresh implementer on the same branch. `max_review_rounds` defaults to 3. At the cap, Blocked(review_cap); explicit continuation grants a new round.
+Review receives all issue contents and acceptance criteria, complete base-to-head diff, latest successful implementation summary/verification, prior findings, guidance and repository instructions. No implementer conversation history. Rejection is not a Task failure; its findings go to a fresh implementer on the same branch. `maxReviewRounds` defaults to 3. At the cap, Blocked(review_cap); explicit continuation grants a new round.
 
 Changed requirements require stopping the exact owned Worker, confirming exit, cancelling its Task and restoring the attempt base before launching a fresh implementer. Never send steering input to a running Worker. Finalized Task commits/history remain immutable.
 
@@ -80,3 +80,11 @@ Main asks per PR only when review covers the latest diff, the PR is open/mergeab
 Completion writes immutable final history and unblocks dependents. Cleanup is best-effort afterward. PR closed unmerged or branch deleted before merge blocks; a lost clone may be restored from the authoritative reviewed remote head. Unsafe live-worker occupancy prohibits restoration/deletion.
 
 Project repository identity changes require confirmation. Transport-equivalent URLs, remote renames and validated checkout moves may be adopted. New default branches apply to future changes; existing local target branches and PR bases remain intact. Project removal is outside v0.1.
+
+## Public states and notifications
+
+Internal states map to five public states: Working, Waiting, Needs you, Blocked, Done. Waiting carries `waitingFor {kind, change, gate}` with kind `dependency|github_checks|github_review|github_availability|capacity|worker_exit`. Needs you covers merge approval (reason "ready to merge"), local merge approval and merge-conflict rework. Blocked covers review cap and broken checkout/config.
+
+Permanent notifications fire only for Needs you, genuine Blocked, requested deliverables and worker-proposed scope. Waiting and progress go to the transient status line. Identical notifications are deduplicated per change until its state changes. Merro-owned messages carry no `Next:`; external-owned messages say Merro continues automatically; user-owned messages show approve and leave commands.
+
+`/merro` shows attention-first overview, `/merro status` the roadmap, `/merro <change> [--history]` one change, `/merro watch <change>` attaches to its worker window. Config changes are reloaded each reconcile pass and apply to future plans only.
