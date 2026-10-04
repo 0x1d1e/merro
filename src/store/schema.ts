@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 export const MIGRATION_19 = `
 ALTER TABLE relations ADD COLUMN gate TEXT CHECK (gate IN ('reviewed','done'));
@@ -320,4 +320,8 @@ CREATE INDEX task_runtime_pending_cleanup ON task_runtime(task_id) WHERE cleanup
 export const MIGRATION_16 = `
 ALTER TABLE work_item_runtime ADD COLUMN github_checks_at TEXT;
 ALTER TABLE work_item_runtime ADD COLUMN github_review_decision TEXT;
+`;
+
+export const MIGRATION_21 = `
+ALTER TABLE task_runtime ADD COLUMN agent TEXT CHECK (agent IN ('pi', 'claude'));
 `;

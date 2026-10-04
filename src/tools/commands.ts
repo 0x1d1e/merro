@@ -26,7 +26,67 @@ async function withStore<T>(cwd: string, action: (store: MerroStore) => T | Prom
   finally { try { store?.close(); } finally { await lock.release(); } }
 }
 
-const commandUsage = "Commands: /merro · /merro init · /merro status · /merro <change> · /merro approve [change] · /merro leave [change] · /merro retry [change] · /merro stop [objective] · /merro run · /merro export · /merro unlock · /merro config";
+const commandUsage = "Commands: /merro · /merro init · /merro status · /merro <change> · /merro issue create|list|show|start|approve|dismiss · /merro approve [change] · /merro leave [change] · /merro retry [change] · /merro stop [objective] · /merro run · /merro export · /merro unlock · /merro config";
+const issueUsage = "Usage: /merro issue create <title> [--project <name>] [--body <text>] · list [--project <name>] · show #<n> [--project <name>] · start #<n> [--project <name>] · approve [<n>] · dismiss [<n>]";
+
+interface IssueArguments { positional: string; project: string | undefined; body: string }
+
+/** `--body` takes the rest of the line; `--project` takes one word. */
+function parseIssueArguments(text: string): IssueArguments {
+  let rest = text;
+  let body = "";
+  const bodyAt = rest.search(/(^|\s)--body(\s|$)/);
+  if (bodyAt >= 0) {
+    body = rest.slice(bodyAt).replace(/^\s*--body\s*/, "");
+    rest = rest.slice(0, bodyAt);
+  }
+  let project: string | undefined;
+  rest = rest.replace(/(^|\s)--project\s+(\S+)/, (_match, lead: string, slug: string) => { project = slug; return lead; });
+  return { positional: rest.trim().replace(/\s+/g, " "), project, body };
+}
+
+function issueNumber(value: string): number {
+  const match = /^#?(\d+)$/.exec(value.trim());
+  if (!match) throw new Error(issueUsage);
+  return Number(match[1]);
+}
+
+async function runIssueCommand(main: MainOrchestrator, text: string): Promise<string> {
+  const [action = "", ...words] = text.trim().split(/\s+/).filter(Boolean);
+  const args = parseIssueArguments(words.join(" "));
+  if (action === "create") {
+    if (!args.positional) throw new Error(issueUsage);
+    const issue = await main.createIssue(args.project, args.positional, args.body);
+    return `Created ${issue.projectSlug} #${issue.number}: ${issue.title}\n${issue.url}`;
+  }
+  if (action === "list") {
+    const { projectSlug, issues } = await main.listIssues(args.project);
+    const lines = [issues.length ? `Open issues in ${projectSlug}:` : `No open issues in ${projectSlug}.`,
+      ...issues.map((issue) => `  #${issue.number} ${issue.title}${issue.labels.length ? ` [${issue.labels.join(", ")}]` : ""}`)];
+    const proposals = await main.issueProposals();
+    if (proposals.length) {
+      lines.push("", "Proposed by workers, waiting for you:",
+        ...proposals.map((proposal) => `  ${proposal.position}. ${proposal.title} (${proposal.projectSlug}, from ${proposal.change})`),
+        "Create: /merro issue approve <n> · Dismiss: /merro issue dismiss <n>");
+    }
+    return lines.join("\n");
+  }
+  if (action === "show") {
+    const issue = await main.showIssue(args.project, issueNumber(args.positional));
+    return `${issue.projectSlug} #${issue.number} · ${issue.state.toLowerCase()}\n${issue.title}\n${issue.url}${issue.labels.length ? `\nLabels: ${issue.labels.join(", ")}` : ""}\n\n${issue.body.trim() || "(no description)"}`;
+  }
+  if (action === "start") {
+    const started = await main.startIssue(args.project, issueNumber(args.positional));
+    return `Started #${started.issue.number}: ${started.issue.title}\nChanges: ${started.changeSets.map((item) => item.slug).join(", ")}`;
+  }
+  if (action === "approve" || action === "dismiss") {
+    const proposals = await main.issueProposals();
+    const position = args.positional ? Number(args.positional) : proposals.length === 1 ? 1 : Number.NaN;
+    if (!Number.isInteger(position)) throw new Error(proposals.length ? "Choose a proposed issue number from /merro issue list." : "No proposed issues.");
+    return main.resolveIssueProposal(position, action === "approve");
+  }
+  throw new Error(issueUsage);
+}
 
 export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?: MainOrchestrator, onInitialized?: () => Promise<void>): void {
   const showStatus = async (ctx: CommandContext) => {
@@ -87,6 +147,11 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
         report(ctx, "Merro lock is clear.");
         return;
       }
+      if (verb === "issue") {
+        if (!main) { report(ctx, "Open Main to work with issues.", "warning"); return; }
+        report(ctx, await runIssueCommand(main, target));
+        return;
+      }
       if (verb === "approve" || verb === "leave") {
         if (!main) { report(ctx, "Open Main to resolve a merge decision.", "warning"); return; }
         report(ctx, await main.resolveDecisionForChange(target || undefined, verb === "approve"));
@@ -116,5 +181,5 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
     }
   };
 
-  pi.registerCommand("merro", { description: "Merro: init, status, <change>, approve, leave, retry, stop, run, export, unlock, config", handler: runMerro });
+  pi.registerCommand("merro", { description: "Merro: init, status, issue, <change>, approve, leave, retry, stop, run, export, unlock, config", handler: runMerro });
 }

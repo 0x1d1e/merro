@@ -30,3 +30,17 @@ test("legacy results without changes use intent and generated titles stay conven
   assert.match(result.body, /^## Summary\n\n- Fix permission revocation/);
   assert.doesNotMatch(result.body, /Do not use this activity/);
 });
+
+test("related pull requests section is generated, replaced in place and removed when empty", async () => {
+  const { withRelatedPullRequests } = await import("../src/runtime/pr-content.js");
+  const base = "## Summary\n\n- Did it\n\n## Issues\n\nCloses #1";
+  const first = withRelatedPullRequests(base, [{ name: "api", relation: "Requires", url: "https://github.com/o/lib/pull/4" }]);
+  assert.match(first, /## Related pull requests\n\n- Requires `api`: https:\/\/github.com\/o\/lib\/pull\/4$/);
+  const second = withRelatedPullRequests(first, [
+    { name: "api", relation: "Requires", url: "https://github.com/o/lib/pull/4" },
+    { name: "ui", relation: "Required by", url: "https://github.com/o/app/pull/9" },
+  ]);
+  assert.equal(second.match(/## Related pull requests/g)?.length, 1);
+  assert.match(second, /Required by `ui`: https:\/\/github.com\/o\/app\/pull\/9/);
+  assert.equal(withRelatedPullRequests(second, []), base);
+});

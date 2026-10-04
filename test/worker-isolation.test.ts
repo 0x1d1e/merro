@@ -72,7 +72,7 @@ for (const sandbox of ["docker", "none"] as const) {
     assert.equal(await readFile(join(copied, "settings.json"), "utf8"), settings);
     assert.equal(await readFile(join(copied, "models.json"), "utf8"), '{"providers":{}}');
     assert.equal(await readFile(join(copied, "auth.json"), "utf8"), '{"test":"private"}');
-    assert.match(await readFile(join(scratch, "merro-runtime", "tools", "worker-result.js"), "utf8"), /merro_submit_result/);
+    assert.match(await readFile(join(scratch, "merro-runtime", "protocol", "submit-result.js"), "utf8"), /merro_submit_result/);
     // Model installed-package discovery from the copied config with the worker checkout as cwd.
     const startup = `import merro from ${JSON.stringify(pathToFileURL(join(copied, "git/Merro/src/index.js")).href)};
       await merro({ registerCommand(){throw Error('Main command')}, registerTool(){throw Error('Main tool')}, on(){throw Error('Main loop')} });`;

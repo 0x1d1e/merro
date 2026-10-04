@@ -16,9 +16,12 @@ export interface DependencySuggestion {
   gate: "reviewed" | "done";
   reason: string;
 }
+/** Out-of-scope follow-up work a worker noticed; Main applies the `issues.create` policy. */
+export interface ProposedIssue { title: string; body: string }
 
 export interface ImplementSuccessResult {
   task_id: string;
+  proposed_issues?: ProposedIssue[];
   status: "success";
   summary: string;
   commit: string;
@@ -31,6 +34,7 @@ export interface ImplementSuccessResult {
 
 export interface ImplementFailedResult {
   task_id: string;
+  proposed_issues?: ProposedIssue[];
   status: "failed";
   summary: string;
   commit: string;
@@ -42,6 +46,7 @@ export interface ImplementFailedResult {
 
 export interface ReviewResult {
   task_id: string;
+  proposed_issues?: ProposedIssue[];
   status: "pass" | "reject";
   summary: string;
   reviewed_commit: string;
@@ -51,6 +56,7 @@ export interface ReviewResult {
 
 export interface ReviewFailedResult {
   task_id: string;
+  proposed_issues?: ProposedIssue[];
   status: "failed";
   summary: string;
   reason: string;
@@ -114,6 +120,24 @@ function assertSuccessfulVerification(verification: readonly Verification[], sta
   if (failed && failed.kind === "command") {
     throw new ResultValidationError(`${status} result contains failing verification: ${failed.command} exited ${failed.exit_code}`);
   }
+}
+
+const MAX_PROPOSED_ISSUES = 5;
+
+function proposedIssues(value: unknown): { proposed_issues?: ProposedIssue[] } {
+  if (value === undefined) return {};
+  if (!Array.isArray(value) || value.length > MAX_PROPOSED_ISSUES) {
+    throw new ResultValidationError(`proposed_issues must contain at most ${MAX_PROPOSED_ISSUES} issues`);
+  }
+  if (value.length === 0) return {};
+  return {
+    proposed_issues: value.map((entry, index) => {
+      const row = object(entry, `proposed_issues[${index}]`);
+      const title = text(row.title, `proposed_issues[${index}].title`).trim();
+      if (title.length > 200 || /[\r\n]/.test(title)) throw new ResultValidationError(`proposed_issues[${index}].title must be a single line of at most 200 characters`);
+      return { title, body: text(row.body, `proposed_issues[${index}].body`) };
+    }),
+  };
 }
 
 function findings(value: unknown): ReviewFinding[] {
@@ -189,6 +213,7 @@ export function parseImplementResult(value: unknown): ImplementSuccessResult | I
       summary,
       commit: text(row.commit, "commit"),
       verification,
+      ...proposedIssues(row.proposed_issues),
     };
     if (row.changes !== undefined) {
       if (!Array.isArray(row.changes) || row.changes.length < 1 || row.changes.length > 20) {
@@ -216,6 +241,7 @@ export function parseImplementResult(value: unknown): ImplementSuccessResult | I
       commit: text(row.commit, "commit"),
       reason: text(row.reason, "reason"),
       verification,
+      ...proposedIssues(row.proposed_issues),
     };
     if (row.diagnostics !== undefined) result.diagnostics = text(row.diagnostics, "diagnostics");
     if (row.dependency_suggestions !== undefined) result.dependency_suggestions = dependencySuggestions(row.dependency_suggestions);
@@ -242,6 +268,7 @@ export function parseReviewResult(value: unknown): ReviewResult | ReviewFailedRe
       reviewed_commit,
       findings: parsedFindings,
       verification,
+      ...proposedIssues(row.proposed_issues),
     };
   }
 
@@ -267,6 +294,7 @@ export function parseReviewResult(value: unknown): ReviewResult | ReviewFailedRe
     reviewed_commit,
     findings: parsedFindings,
     verification,
+    ...proposedIssues(row.proposed_issues),
   };
 }
 

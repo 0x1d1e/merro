@@ -43,6 +43,8 @@ Changed requirements require stopping the exact owned Worker, confirming exit, c
 - Worker-reported cross-Project prerequisites are untrusted proposals, including reports from failed implementations. Main requests approval for separate companion ChangeSets and Relations, reusing existing approved work. Discoveries hold the reporting implementation before review/delivery; they never expand scope automatically.
 - Reviewed gates persist the consumed prerequisite commit. If it changes or loses review eligibility, expire dependent merge approvals immediately, wait for active Workers to exit, then reimplement and review unfinished dependent work against the new passing snapshot. Finalized Tasks remain unchanged. This also gates transitive dependents. See [ADR-0012](adr/0012-approved-reviewed-dependencies.md).
 
+Approval of an Objective pre-approves every change in it. A change with unfinished `Requires` prerequisites stays Planned/Ready and is shown as `Approved · waiting for <change>` (cross-Project prerequisites carry their Project); it becomes eligible automatically when they are Done. PR bodies list the PRs of related changes under `Related pull requests`.
+
 A slot is one active Task, implementation or review. Default global capacity is 3; at most one Task per ChangeSet regardless of its issue count. Order: highest active-owner priority, downstream unblock count, oldest Ready, stable private tie-breaker. Ready changes without a slot remain Ready.
 
 Main reconciles before scheduling, on startup and periodically while open. `/merro run` requests a pass. Serialized access lets status/export wait behind an active pass without competing for the writer lock.
@@ -73,7 +75,7 @@ External requested changes or required-check failure schedule fresh implementati
 
 ## Merge and external authority
 
-Main asks per PR only when review covers the latest diff, the PR is open/mergeable, policy is known and required checks/reviews pass. Approval rechecks external state and worker safety before squash merge. Rejection keeps the PR/branch/clone and blocks. GitHub merge rejection needs fresh approval, not blind retry. An external merge completes the change regardless of merge method.
+Main asks per PR only when review covers the latest diff, the PR is open/mergeable, policy is known and required checks/reviews pass. With `merge.auto` it skips the prompt and runs the same head-pinned merge with the configured method and branch deletion, but only when GitHub CI is not pending and no check has failed; pending CI waits, and a failed non-required check, unknown policy or rejected merge falls back to the human Decision or a block (ADR-0012). Approval rechecks external state and worker safety before squash merge. Rejection keeps the PR/branch/clone and blocks. GitHub merge rejection needs fresh approval, not blind retry. An external merge completes the change regardless of merge method.
 
 Completion writes immutable final history and unblocks dependents. Cleanup is best-effort afterward. PR closed unmerged or branch deleted before merge blocks; a lost clone may be restored from the authoritative reviewed remote head. Unsafe live-worker occupancy prohibits restoration/deletion.
 

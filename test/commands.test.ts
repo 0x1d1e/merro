@@ -69,7 +69,7 @@ test("/merro config displays current effective settings and edit path without wr
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const path = join(cwd, ".merro", "config.json");
   const notifyCommand = "notify 11111111-2222-4333-8444-555555555555";
-  const original = `${JSON.stringify({ reviewer: { model: "openai/reviewer" }, tmux: {}, notify_command: notifyCommand })}\n`;
+  const original = `${JSON.stringify({ workers: { reviewer: { model: "openai/reviewer" } }, tmux: {}, notify_command: notifyCommand })}\n`;
   await writeFile(path, original);
   const lock = new MainLock(join(cwd, ".merro", "main.lock.db"));
   await lock.acquire();
@@ -79,7 +79,8 @@ test("/merro config displays current effective settings and edit path without wr
   await merro.handler("config", { ui: { notify: (message) => messages.push(message) } });
   assert.ok(messages[0]?.startsWith(`Config: ${path}\n\n`));
   assert.deepEqual(JSON.parse(messages[0]!.slice(messages[0]!.indexOf("{"))), {
-    ...DEFAULT_CONFIG, reviewer: { model: "openai/reviewer", thinking: null }, notify_command: notifyCommand,
+    ...DEFAULT_CONFIG, notify_command: notifyCommand,
+    workers: { ...DEFAULT_CONFIG.workers, reviewer: { runtime: "pi", model: "openai/reviewer", thinking: null } },
   });
   assert.equal(await readFile(path, "utf8"), original);
   await writeFile(path, "{}");
@@ -90,8 +91,10 @@ test("/merro config displays current effective settings and edit path without wr
   await merro.handler("config", { ui: { notify: (message) => messages.push(message) } });
   assert.deepEqual(JSON.parse(messages[2]!.slice(messages[2]!.indexOf("{"))), {
     ...DEFAULT_CONFIG,
-    worker: { model: null, thinking: "off" },
-    reviewer: { model: "provider/review", thinking: null },
+    workers: {
+      implementer: { runtime: "pi", model: null, thinking: "off" },
+      reviewer: { runtime: "pi", model: "provider/review", thinking: null },
+    },
   });
   assert.equal(await readFile(path, "utf8"), legacy);
   await merro.handler("config set sandbox docker", { ui: { notify: (message) => messages.push(message) } });
@@ -130,4 +133,44 @@ test("/merro routes change details and management actions using semantic targets
   }
   assert.deepEqual(calls, [["details", "safety"], ["decision", undefined, true], ["decision", "safety", true], ["decision", undefined, false], ["decision", "safety", false], ["retry", undefined], ["retry", "safety"], ["stop", undefined], ["stop", "goal"], ["run"]]);
   assert.ok(messages.includes("Stopped 1 Objective. Active changes will finish; no new work will start."));
+});
+
+test("/merro issue routes create, list, show, start, approve and dismiss", async () => {
+  const calls: unknown[][] = [];
+  const issue = (number: number, title = `Issue ${number}`) => ({ number, title, body: "", url: `https://x/${number}`, state: "OPEN", labels: ["bug"], projectSlug: "app" });
+  const main = {
+    async createIssue(project: string | undefined, title: string, body: string) { calls.push(["create", project, title, body]); return issue(9, title); },
+    async listIssues(project?: string) { calls.push(["list", project]); return { projectSlug: "app", issues: [issue(1)] }; },
+    async showIssue(project: string | undefined, number: number) { calls.push(["show", project, number]); return issue(number); },
+    async startIssue(project: string | undefined, number: number) { calls.push(["start", project, number]); return { issue: issue(number), objective: {}, changeSets: [{ slug: "issue-slug" }] }; },
+    async issueProposals() { return [{ position: 1, projectSlug: "app", title: "Cleanup", body: "", change: "safety" }]; },
+    async resolveIssueProposal(position: number, approved: boolean) { calls.push(["resolve", position, approved]); return "Done."; },
+  } as unknown as MainOrchestrator;
+  const merro = commandRegistry("/unused", main).get("merro")!;
+  const messages: string[] = [];
+  const run = (args: string) => merro.handler(args, { ui: { notify: (message) => messages.push(message) } });
+  await run("issue create Fix the thing --project app --body Longer   explanation");
+  await run("issue list");
+  await run("issue show #4 --project app");
+  await run("issue start 12");
+  await run("issue approve");
+  await run("issue dismiss 1");
+  assert.deepEqual(calls, [
+    ["create", "app", "Fix the thing", "Longer explanation"],
+    ["list", undefined], ["show", "app", 4], ["start", undefined, 12], ["resolve", 1, true], ["resolve", 1, false],
+  ]);
+  assert.match(messages[0]!, /Created app #9: Fix the thing/);
+  assert.match(messages[1]!, /#1 Issue 1 \[bug\][\s\S]*1\. Cleanup \(app, from safety\)/);
+  assert.match(messages[3]!, /Started #12: Issue 12\nChanges: issue-slug/);
+
+  await run("issue show nope");
+  await run("issue");
+  assert.match(messages.at(-1)!, /Usage: \/merro issue/);
+});
+
+test("/merro issue asks to open Main when none is attached", async () => {
+  const merro = commandRegistry("/unused").get("merro")!;
+  const messages: string[] = [];
+  await merro.handler("issue list", { ui: { notify: (message) => messages.push(message) } });
+  assert.match(messages[0]!, /Open Main/);
 });

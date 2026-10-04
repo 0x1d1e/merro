@@ -3,15 +3,19 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, normalize, sep } from "node:path";
 
 export type WorkerThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export interface WorkerRoleSettings { model: string | null; thinking: WorkerThinkingLevel | null }
+export type WorkerRuntimeKind = "pi" | "claude";
+export interface WorkerRoleSettings { runtime: WorkerRuntimeKind; model: string | null; thinking: WorkerThinkingLevel | null }
 export type WorkerSettings = Record<"implement" | "review", WorkerRoleSettings>;
+export type IssueCreatePolicy = "disabled" | "approval" | "auto";
+export type MergeMethod = "squash" | "merge" | "rebase";
 
 export interface MerroConfig {
   version: 1;
   projectsDir: string;
   worktreesDir: string;
-  worker: WorkerRoleSettings;
-  reviewer: WorkerRoleSettings;
+  workers: { implementer: WorkerRoleSettings; reviewer: WorkerRoleSettings };
+  issues: { create: IssueCreatePolicy };
+  merge: { auto: boolean; method: MergeMethod; delete_branch: boolean };
   git: { defaultDelivery: "auto" | "local" | "pr" };
   tmux: { session: string };
   max_concurrent_tasks: number | "unlimited";
@@ -26,8 +30,12 @@ export const DEFAULT_CONFIG: Readonly<MerroConfig> = {
   version: 1,
   projectsDir: "projects",
   worktreesDir: ".wt",
-  worker: { model: null, thinking: null },
-  reviewer: { model: null, thinking: null },
+  workers: {
+    implementer: { runtime: "pi", model: null, thinking: null },
+    reviewer: { runtime: "pi", model: null, thinking: null },
+  },
+  issues: { create: "approval" },
+  merge: { auto: false, method: "squash", delete_branch: true },
   git: { defaultDelivery: "auto" },
   tmux: { session: "merro" },
   max_concurrent_tasks: 3,
@@ -45,15 +53,21 @@ export function validateConfig(value: unknown): MerroConfig {
   const input = value as Record<string, unknown>;
   // Deprecated clone-root settings are read only for persisted-config migration.
   const { work_root: _oldRoot, pi_config: _oldPiConfig, ...current } = input;
-  const allowed = new Set([...Object.keys(DEFAULT_CONFIG), "worker_models", "worker_thinking"]);
+  // `worker`, `reviewer`, `worker_models` and `worker_thinking` are migration-only inputs for `workers`.
+  const allowed = new Set([...Object.keys(DEFAULT_CONFIG), "worker", "reviewer", "worker_models", "worker_thinking"]);
   const unsupported = Object.keys(current).find((key) => !allowed.has(key));
   if (unsupported) throw new Error(`Unsupported Merro setting '${unsupported}'; put instructions in Markdown.`);
   const { worker_models, worker_thinking, ...canonical } = current;
-  const hasLegacy = "worker_models" in current || "worker_thinking" in current;
-  if (hasLegacy && ("worker" in current || "reviewer" in current)) {
-    throw new Error("Cannot combine worker/reviewer with legacy worker_models/worker_thinking; migrate to worker and reviewer.");
+  const { worker: legacyWorker, reviewer: legacyReviewer, ...rest } = canonical;
+  const hasRoleMaps = "worker_models" in current || "worker_thinking" in current;
+  const hasRoleKeys = "worker" in current || "reviewer" in current;
+  if (hasRoleMaps && hasRoleKeys) {
+    throw new Error("Cannot combine worker/reviewer with legacy worker_models/worker_thinking; migrate to workers.");
   }
-  const merged = { ...DEFAULT_CONFIG, ...canonical } as Record<string, unknown>;
+  if ((hasRoleMaps || hasRoleKeys) && "workers" in current) {
+    throw new Error("Cannot combine workers with legacy worker, reviewer, worker_models or worker_thinking; use workers only.");
+  }
+  const merged = { ...DEFAULT_CONFIG, ...rest } as Record<string, unknown>;
   const projectsDir = validateDirectory(merged.projectsDir, "projectsDir");
   const worktreesDir = validateDirectory(merged.worktreesDir, "worktreesDir");
   if (projectsDir === worktreesDir || projectsDir.startsWith(`${worktreesDir}${sep}`) || worktreesDir.startsWith(`${projectsDir}${sep}`)) {
@@ -79,26 +93,54 @@ export function validateConfig(value: unknown): MerroConfig {
   if (merged.network !== "on" && merged.network !== "off") throw new Error("network must be on or off");
   if (merged.worker_github !== "on" && merged.worker_github !== "off") throw new Error("worker_github must be on or off");
   if (merged.notify_command !== null && typeof merged.notify_command !== "string") throw new Error("notify_command must be a string or null");
-  if (hasLegacy) {
+  let implementer: unknown;
+  let reviewer: unknown;
+  if (hasRoleMaps) {
     const models = "worker_models" in current
       ? validateRoleSettings(worker_models, { implement: null, review: null }, "worker_models", (value) => validateModel(value, "worker_models values"))
       : { implement: null, review: null };
     const thinking = "worker_thinking" in current
       ? validateRoleSettings(worker_thinking, { implement: null, review: null }, "worker_thinking", (value) => validateThinking(value, "worker_thinking values"))
       : { implement: null, review: null };
-    merged.worker = { model: models.implement, thinking: thinking.implement };
-    merged.reviewer = { model: models.review, thinking: thinking.review };
+    implementer = { model: models.implement, thinking: thinking.implement };
+    reviewer = { model: models.review, thinking: thinking.review };
+  } else if (hasRoleKeys) {
+    implementer = legacyWorker ?? {};
+    reviewer = legacyReviewer ?? {};
+  } else {
+    const workers = settingsObject(merged.workers, "workers", ["implementer", "reviewer"]);
+    implementer = workers.implementer ?? {};
+    reviewer = workers.reviewer ?? {};
   }
-  const worker = validateWorkerSettings(merged.worker, "worker");
-  const reviewer = validateWorkerSettings(merged.reviewer, "reviewer");
-  return { ...merged, projectsDir, worktreesDir, worker, reviewer, git: { defaultDelivery }, tmux: { session } } as unknown as MerroConfig;
+  const workers = { implementer: validateWorkerSettings(implementer, "workers.implementer"), reviewer: validateWorkerSettings(reviewer, "workers.reviewer") };
+  const issues = settingsObject(merged.issues, "issues", ["create"]);
+  const create = issues.create ?? "approval";
+  if (create !== "disabled" && create !== "approval" && create !== "auto") throw new Error("issues.create must be disabled, approval or auto");
+  const merge = settingsObject(merged.merge, "merge", ["auto", "method", "delete_branch"]);
+  const auto = merge.auto ?? false;
+  const method = merge.method ?? "squash";
+  const deleteBranch = merge.delete_branch ?? true;
+  if (typeof auto !== "boolean") throw new Error("merge.auto must be a boolean");
+  if (method !== "squash" && method !== "merge" && method !== "rebase") throw new Error("merge.method must be squash, merge or rebase");
+  if (typeof deleteBranch !== "boolean") throw new Error("merge.delete_branch must be a boolean");
+  return {
+    ...merged, projectsDir, worktreesDir, workers, issues: { create }, merge: { auto, method, delete_branch: deleteBranch },
+    git: { defaultDelivery }, tmux: { session },
+  } as unknown as MerroConfig;
 }
 
 function validateWorkerSettings(value: unknown, name: string): WorkerRoleSettings {
-  const settings = settingsObject(value, name, ["model", "thinking"]);
+  const settings = settingsObject(value, name, ["runtime", "model", "thinking"]);
+  const runtime = settings.runtime === undefined ? "pi" : settings.runtime;
+  if (runtime !== "pi" && runtime !== "claude") throw new Error(`${name}.runtime must be pi or claude`);
+  const thinking = validateThinking(settings.thinking === undefined ? null : settings.thinking, `${name}.thinking`);
+  if (runtime === "claude" && (thinking === "off" || thinking === "minimal")) {
+    throw new Error(`${name}.thinking must be low, medium, high, xhigh or max for the claude runtime`);
+  }
   return {
+    runtime,
     model: validateModel(settings.model === undefined ? null : settings.model, `${name}.model`),
-    thinking: validateThinking(settings.thinking === undefined ? null : settings.thinking, `${name}.thinking`),
+    thinking,
   };
 }
 
@@ -111,7 +153,7 @@ function validateModel(value: unknown, name: string): string | null {
 function validateThinking(value: unknown, name: string): WorkerThinkingLevel | null {
   if (value === null) return null;
   if (typeof value !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)) {
-    throw new Error(`${name} must be a Pi thinking level or null`);
+    throw new Error(`${name} must be a supported thinking level or null`);
   }
   return value as WorkerThinkingLevel;
 }

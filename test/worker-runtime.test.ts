@@ -140,7 +140,7 @@ test("Docker worker uses the built Merro image, owns its tmux session, and isola
       ...DEFAULT_CONFIG,
       sandbox: "none",
       worker_github: "on",
-      reviewer: { model: "openai/gpt-4o", thinking: "high" },
+      workers: { ...DEFAULT_CONFIG.workers, reviewer: { runtime: "pi", model: "openai/gpt-4o", thinking: "high" } },
     },
     commands,
     piConfigPath,

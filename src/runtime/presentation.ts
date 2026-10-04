@@ -119,7 +119,7 @@ export function workerName(item: ChangeSet, task: Pick<Task, "role">): string {
 /** Default status contains only user-level state, decisions, and one-line context. */
 export function presentWorkspace(store: MerroStore) {
   const items = store.listChangeSets().filter((item) => item.state !== "Obsolete");
-  const decisionRows = store.pendingDecisions().map((decision) => {
+  const decisionRows = store.pendingDecisions().filter((decision) => decision.subjectType === "ChangeSet").map((decision) => {
     const payload = typeof decision.payload === "object" && decision.payload !== null ? decision.payload as Record<string, unknown> : {};
     const item = store.getChangeSet(decision.subjectId);
     const runtime = item && store.getChangeSetRuntime(item.id);
@@ -131,6 +131,13 @@ export function presentWorkspace(store: MerroStore) {
     return { change: item ? changeName(item) : "change", action, pr, summary };
   });
   const decisionByChange = new Map(decisionRows.map((decision) => [decision.change, decision]));
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const requires = store.listRelations().filter((relation) => relation.kind === "Requires");
+  const waitingOn = (item: ChangeSet): string[] => requires
+    .filter((relation) => relation.from === item.id)
+    .map((relation) => byId.get(relation.to))
+    .filter((required): required is ChangeSet => !!required && required.state !== "Done")
+    .map((required) => required.projectSlug === item.projectSlug ? changeName(required) : `${changeName(required)} (${required.projectSlug})`);
 
   return {
     projects: store.listProjects().map((project) => ({ slug: project.slug })),
@@ -152,6 +159,7 @@ export function presentWorkspace(store: MerroStore) {
       const blocked = item.blockedReason
         ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, changeName(item), review === "passed", item.delivery === "local")
         : null;
+      const waiting = waitingOn(item);
       let summary: string;
       if (state === "Done") summary = item.delivery === "local" ? `Completed locally on ${item.targetBranch}` : runtime?.pullRequestNumber ? `PR #${runtime.pullRequestNumber} merged` : "Completed";
       else if (runtime?.pullRequestState?.toUpperCase() === "MERGED" && !runtime.mergedCommitSha) summary = `GitHub marked PR #${runtime.pullRequestNumber} merged; Merro is verifying completion`;
@@ -168,13 +176,13 @@ export function presentWorkspace(store: MerroStore) {
       else if (item.state === "AwaitingApproval") summary = `PR #${runtime?.pullRequestNumber} · Awaiting required team review`;
       else if (item.state === "AwaitingMerge" && checks.state === "waiting") summary = `PR #${runtime?.pullRequestNumber} · GitHub checks running`;
       else if (item.state === "AwaitingMerge") summary = `PR #${runtime?.pullRequestNumber} · Waiting for GitHub review and checks`;
-      else if (item.state === "Ready" || item.state === "Planned") summary = "Waiting to start";
+      else if (item.state === "Ready" || item.state === "Planned") summary = waiting.length ? `Approved · waiting for ${waiting.join(", ")}` : "Approved · ready to start";
       else summary = "Working on the change";
       return {
         name: changeName(item), project: item.projectSlug, issues: issueNumbers(item), status: state, summary,
         pr: runtime?.pullRequestNumber ?? null,
         prState: item.delivery === "local" ? "not requested" : runtime?.mergedCommitSha ? "MERGED" : runtime?.pullRequestState?.toUpperCase() === "MERGED" ? "verifying merge" : runtime?.pullRequestState?.toUpperCase() ?? "not opened",
-        checks, review, decision: decision ?? null,
+        checks, review, decision: decision ?? null, waitingOn: item.state === "Ready" || item.state === "Planned" ? waiting : [],
         blocked: blocked ? { message: blocked.summary, next: blocked.next } : null,
       };
     }),

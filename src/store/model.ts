@@ -51,6 +51,8 @@ export interface FinalSummaryRecord {
 export interface TaskRuntimeRecord {
   taskId: string;
   runtimeKind: "docker" | "host" | null;
+  /** Agent CLI that owns the process. Absent on Tasks launched before runtime selection (Pi). */
+  agent?: "pi" | "claude";
   tmuxSession: string;
   tmuxWindow: string;
   paneId: string | null;

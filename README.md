@@ -63,7 +63,9 @@ independent reviewer
   └─ accept → local completion, or requested PR → approved merge
 ```
 
-Main shows a named plan, including delivery mode, then asks `Approve?`. Nothing starts before approval. Review follows passing reported verification; each attempt uses a fresh Pi process.
+Main shows a named plan, including delivery mode, then asks `Approve?`. Nothing starts before approval. Approving a plan also pre-approves dependent changes: they wait (`Approved · waiting for <change>`) and start automatically when their prerequisites complete, including across Projects, while independent changes run in parallel. Dependent PRs link their prerequisite PRs. Review follows passing reported verification; each attempt uses a fresh worker process, Pi by default or Claude per `workers` config.
+
+With `merge.auto` enabled the flow ends without a prompt: review passes, verification passes, PR opens, CI is green, GitHub rulesets are satisfied, then Merro merges.
 
 Watch the real worker terminals:
 
@@ -83,6 +85,7 @@ Merro registers one Pi command: `/merro`.
 /merro
 /merro init
 /merro status
+/merro issue create|list|show|start|approve|dismiss
 /merro <change>
 /merro approve [change]
 /merro leave [change]
@@ -95,6 +98,8 @@ Merro registers one Pi command: `/merro`.
 ```
 
 `/merro` shows status; a change name shows details. `approve` and `leave` resolve merge Decisions, `retry` resumes eligible blocked work, and `stop` stops Objectives without interrupting active Tasks. `run` checks current work, `export` writes `.merro/export.json`, and `unlock` clears stale ownership without bypassing a live Main.
+
+`/merro issue create <title> [--body <text>]` opens a GitHub issue, `list` and `show #n` read them, and `start #n` turns an open issue into an approved single-issue plan that is scheduled immediately. `approve` and `dismiss` resolve issues proposed by workers under `issues.create: "approval"`. Add `--project <name>` when more than one Project is registered.
 
 `/merro config` shows the config file location and effective Merro settings, including defaults for omitted fields. Edit that JSON file directly; `null` model/thinking values inherit normal Pi settings.
 
@@ -153,8 +158,12 @@ Machine settings belong in `config.json`, not prompts or review policy. Init wri
 {
   "projectsDir": "projects",
   "worktreesDir": ".wt",
-  "worker": { "model": "provider/model", "thinking": "high" },
-  "reviewer": { "model": "provider/model", "thinking": "high" },
+  "workers": {
+    "implementer": { "runtime": "pi", "model": "provider/model", "thinking": "high" },
+    "reviewer": { "runtime": "claude", "model": "claude-sonnet-5", "thinking": "high" }
+  },
+  "issues": { "create": "approval" },
+  "merge": { "auto": false, "method": "squash", "delete_branch": true },
   "git": { "defaultDelivery": "auto" },
   "tmux": { "session": "merro" }
 }

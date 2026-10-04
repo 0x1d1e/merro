@@ -316,13 +316,42 @@ test("squash merge requires the approved pull request head commit", async () => 
     { stdout: "", stderr: "" },
   ]);
   const expectedHead = "a".repeat(40);
-  await new GitHubClient(commands).mergeSquash(project, 23, expectedHead);
+  await new GitHubClient(commands).merge(project, 23, expectedHead);
 
   assert.deepEqual(commands.calls[1]?.args, [
     "pr", "merge", "23", "--repo", "acme/widget", "--squash",
     "--match-head-commit", expectedHead,
   ]);
-  await assert.rejects(new GitHubClient(new FakeCommands([])).mergeSquash(project, 23, "bad-sha"), /invalid expected/);
+  await assert.rejects(new GitHubClient(new FakeCommands([])).merge(project, 23, "bad-sha"), /invalid expected/);
+});
+
+test("merge honors the configured method and branch deletion while pinning the head commit", async () => {
+  const expectedHead = "b".repeat(40);
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: "", stderr: "" },
+  ]);
+  await new GitHubClient(commands).merge(project, 5, expectedHead, { method: "rebase", deleteBranch: true });
+  assert.deepEqual(commands.calls[1]?.args, [
+    "pr", "merge", "5", "--repo", "acme/widget", "--rebase", "--match-head-commit", expectedHead, "--delete-branch",
+  ]);
+});
+
+test("createIssue posts once through the REST API and parses the created issue", async () => {
+  const commands = new FakeCommands([
+    { stdout: repository("acme/widget"), stderr: "" },
+    { stdout: JSON.stringify({
+      number: 12, title: "Follow up", body: "Details", html_url: "https://github.com/acme/widget/issues/12",
+      state: "open", labels: [], updated_at: "2026-01-01T00:00:00Z", milestone: null,
+    }), stderr: "" },
+  ]);
+  const issue = await new GitHubClient(commands).createIssue(project, " Follow up ", "Details");
+  assert.deepEqual(commands.calls[1]?.args, [
+    "api", "--method", "POST", "repos/acme/widget/issues", "-f", "title=Follow up", "-f", "body=Details",
+  ]);
+  assert.equal(issue.number, 12);
+  assert.equal(issue.state, "OPEN");
+  await assert.rejects(new GitHubClient(new FakeCommands([])).createIssue(project, "  ", "x"), /title/);
 });
 
 test("transient squash merge retries only after confirming the approved pull request head", async () => {
@@ -339,7 +368,7 @@ test("transient squash merge retries only after confirming the approved pull req
     { stdout: "", stderr: "" },
   ]);
 
-  await new GitHubClient(commands).mergeSquash(project, 23, expectedHead);
+  await new GitHubClient(commands).merge(project, 23, expectedHead);
 
   assert.equal(commands.calls.length, 4);
   assert.equal(commands.calls[1]?.args[1], "merge");
@@ -360,7 +389,7 @@ test("transient merge response loss is reconciled without issuing a second merge
     }), stderr: "" },
   ]);
 
-  await new GitHubClient(commands).mergeSquash(project, 23, expectedHead);
+  await new GitHubClient(commands).merge(project, 23, expectedHead);
 
   assert.equal(commands.calls.length, 3);
   assert.equal(commands.calls[1]?.args[1], "merge");
@@ -374,7 +403,7 @@ test("squash merge classifies permanent rejection separately from availability f
     new Error("Squash merging is disabled for this repository"),
   ]));
   await assert.rejects(
-    rejected.mergeSquash(project, 23, expectedHead),
+    rejected.merge(project, 23, expectedHead),
     (error: unknown) => error instanceof GitHubMergeError && error.kind === "rejected",
   );
 
@@ -383,7 +412,7 @@ test("squash merge classifies permanent rejection separately from availability f
     new Error("gh pr merge failed (ETIMEDOUT): network timeout"),
   ]));
   await assert.rejects(
-    unavailable.mergeSquash(project, 23, expectedHead),
+    unavailable.merge(project, 23, expectedHead),
     (error: unknown) => error instanceof GitHubMergeError && error.kind === "unavailable",
   );
 });

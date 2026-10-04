@@ -15,7 +15,7 @@ import { MerroStore } from "../store/store.js";
 import type { TaskRuntimeRecord, ChangeSetRuntimeRecord } from "../store/model.js";
 import { renderTaskFile } from "./task-file.js";
 import { loadMarkdownGuidance, renderMarkdownGuidance } from "./guidance.js";
-import { normalizedVerification, renderPullRequestContent } from "./pr-content.js";
+import { normalizedVerification, renderPullRequestContent, withRelatedPullRequests, type RelatedPullRequest } from "./pr-content.js";
 import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { requireWorkspace } from "./workspace.js";
@@ -26,7 +26,7 @@ import { GitClient } from "../vcs/git.js";
 
 type GitAdapter = Pick<GitClient, "discoverProject" | "createChangeSetClone" | "currentCommit" | "validateTaskCommit" | "pushBranch" | "fetchBaseCommit" | "syncBranchHead" | "effectiveDiffFingerprint">
   & Partial<Pick<GitClient, "discardAttempt" | "remoteBranchCommit" | "ensureChangeSetClone" | "createReadOnlyCheckout" | "deleteClone" | "cloneProject" | "inspectLocalDelivery" | "deliverLocal">>;
-type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "issues" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "mergeSquash" | "syncPullRequestContent">
+type GitHubAdapter = Pick<GitHubClient, "repository" | "repositoryInDirectory" | "listOpenIssues" | "issue" | "issues" | "createPullRequest" | "pullRequest" | "branchProtection" | "hasWritePermission" | "merge" | "createIssue" | "syncPullRequestContent">
   & Partial<Pick<GitHubClient, "findPullRequest" | "beginPass">>;
 type WorkerAdapter = Pick<WorkerRuntime, "prepareClone" | "launch" | "inspect" | "cleanup" | "listOwnedWorkers">
   & Partial<Pick<WorkerRuntime, "plan" | "stop">>;
@@ -243,8 +243,21 @@ function ensureMarkdownSection(body: string, title: string, content: string): st
   return `${body.trim()}\n\n${heading}\n\n${content}`.trim();
 }
 
-function reconcilePullRequestBody(body: string, item: ChangeSet, verification: string): string {
-  const updated = ensureMarkdownSection(body, "Verification", verification);
+/** Opened PRs of changes this one requires or that require it, across Projects, so reviewers see the companion set. */
+function relatedPullRequests(store: MerroStore, item: ChangeSet): RelatedPullRequest[] {
+  const related: RelatedPullRequest[] = [];
+  for (const relation of store.listRelations()) {
+    if (relation.kind !== "Requires" || (relation.from !== item.id && relation.to !== item.id)) continue;
+    const otherId = relation.from === item.id ? relation.to : relation.from;
+    const other = store.getChangeSet(otherId);
+    const url = other && store.getChangeSetRuntime(other.id)?.pullRequestUrl;
+    if (other && url) related.push({ name: changeName(other), relation: relation.from === item.id ? "Requires" : "Required by", url });
+  }
+  return related.sort((a, b) => a.relation.localeCompare(b.relation) || a.name.localeCompare(b.name));
+}
+
+function reconcilePullRequestBody(body: string, item: ChangeSet, verification: string, related: readonly RelatedPullRequest[] = []): string {
+  const updated = withRelatedPullRequests(ensureMarkdownSection(body, "Verification", verification), related);
   if (!item.issues.length) return updated;
   const lines = updated.split(/\r?\n/);
   let issuesStart = lines.findIndex((line) => line.trim() === "## Issues");
@@ -482,6 +495,101 @@ export class MainOrchestrator {
     return this.#github.listOpenIssues(project);
   }
 
+  #issueProject(store: MerroStore, projectSlug?: string): Project {
+    if (projectSlug) {
+      const project = store.getProject(projectSlug);
+      if (!project) throw new Error(`unknown Project: ${projectSlug}`);
+      return project;
+    }
+    const projects = store.listProjects();
+    if (projects.length === 1) return projects[0]!;
+    throw new Error(projects.length ? `Choose a project: ${projects.map((project) => project.slug).join(", ")}.` : "No projects registered. Register one first.");
+  }
+
+  async createIssue(projectSlug: string | undefined, title: string, body = ""): Promise<GitHubIssue & { projectSlug: string }> {
+    if (!title.trim()) throw new Error("Issue title must not be empty");
+    const project = await this.#withStore((store) => this.#issueProject(store, projectSlug));
+    return { ...await this.#github.createIssue(project, title, body), projectSlug: project.slug };
+  }
+
+  async listIssues(projectSlug?: string): Promise<{ projectSlug: string; issues: GitHubIssue[] }> {
+    const project = await this.#withStore((store) => this.#issueProject(store, projectSlug));
+    return { projectSlug: project.slug, issues: await this.#github.listOpenIssues(project) };
+  }
+
+  async showIssue(projectSlug: string | undefined, number: number): Promise<GitHubIssue & { projectSlug: string }> {
+    const project = await this.#withStore((store) => this.#issueProject(store, projectSlug));
+    return { ...await this.#github.issue(project, number), projectSlug: project.slug };
+  }
+
+  /** issue -> Objective -> implementation: the command is the user's approval of the single-issue scope. */
+  async startIssue(projectSlug: string | undefined, number: number): Promise<{ issue: GitHubIssue; objective: Objective; changeSets: ChangeSet[] }> {
+    const project = await this.#withStore((store) => this.#issueProject(store, projectSlug));
+    const issue = await this.#github.issue(project, number);
+    if (issue.state !== "OPEN") throw new Error(`Issue #${number} is ${issue.state.toLowerCase()}`);
+    const started = await this.startObjective({
+      goal: issue.title, projectSlugs: [project.slug], issues: [{ projectSlug: project.slug, numbers: [number] }],
+    });
+    await this.runPass();
+    return { issue, ...started };
+  }
+
+  /** Issues proposed by workers under issues.create=approval, oldest first; the 1-based position is the user-facing handle. */
+  async issueProposals(): Promise<Array<{ position: number; projectSlug: string; title: string; body: string; change: string }>> {
+    return this.#withStore((store) => this.#pendingIssueProposals(store).map(({ payload }, index) => ({ position: index + 1, ...payload })));
+  }
+
+  #pendingIssueProposals(store: MerroStore) {
+    return store.pendingDecisions().filter((decision) => decision.kind === "issue" && decision.subjectType === "IssueProposal")
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map((decision) => {
+        const payload = decision.payload as { projectSlug: string; title: string; body: string; change: string };
+        return { decision, payload };
+      });
+  }
+
+  async resolveIssueProposal(position: number, approved: boolean): Promise<string> {
+    return this.#withStore(async (store) => {
+      const entry = this.#pendingIssueProposals(store)[position - 1];
+      if (!entry) throw new Error(`No proposed issue ${position}. See /merro issue list.`);
+      if (!approved) {
+        store.resolveDecision(entry.decision.id, "rejected");
+        return `Dismissed proposed issue: ${entry.payload.title}`;
+      }
+      const project = this.#issueProject(store, entry.payload.projectSlug);
+      const created = await this.#github.createIssue(project, entry.payload.title, entry.payload.body);
+      store.resolveDecision(entry.decision.id, "approved");
+      return `Created ${project.slug} #${created.number}: ${created.title}\n${created.url}`;
+    });
+  }
+
+  async #handleProposedIssues(store: MerroStore, item: ChangeSet, task: Task, result: WorkerResult): Promise<void> {
+    const proposals = result.proposed_issues ?? [];
+    const policy = this.#config.issues.create;
+    if (!proposals.length || policy === "disabled" || store.hasEvent("Task", task.id, "issues_proposed")) return;
+    store.appendEvent("Task", task.id, "issues_proposed", { count: proposals.length });
+    const project = store.getProject(item.projectSlug);
+    if (!project) return;
+    const origin = `${task.role === "implement" ? "Implementer" : "Reviewer"} for ${changeName(item)}`;
+    for (const proposal of proposals) {
+      const body = `${proposal.body.trim()}\n\n---\nProposed by the ${origin}; out of scope for the current change.`;
+      if (policy === "auto") {
+        try {
+          const created = await this.#github.createIssue(project, proposal.title, body);
+          this.#notify(`${changeName(item)} · Created follow-up ${project.slug} #${created.number}: ${created.title}`);
+        } catch (error) {
+          this.#notify(`${changeName(item)} · Could not create follow-up issue "${proposal.title}": ${errorText(error)}`, "warning");
+        }
+        continue;
+      }
+      store.createDecision({
+        id: randomUUID(), subjectType: "IssueProposal", subjectId: randomUUID(), kind: "issue",
+        payload: { projectSlug: project.slug, title: proposal.title, body, change: changeName(item) },
+      });
+      this.#notify(`${changeName(item)} · Proposed issue: ${proposal.title}\nCreate it? /merro issue approve · Dismiss: /merro issue dismiss`, "warning");
+    }
+  }
+
   async statusSnapshot(): Promise<{ projects: Project[]; objectives: Objective[]; changeSets: ChangeSet[]; tasks: Task[]; decisions: ReturnType<MerroStore["pendingDecisions"]> }> {
     return this.#withStore((store) => ({
       projects: store.listProjects(),
@@ -565,8 +673,8 @@ export class MainOrchestrator {
     const prepared = await this.#prepareObjective(store, input);
     const id = randomUUID();
     const workerSettings: WorkerSettings = {
-      implement: { ...this.#config.worker },
-      review: { ...this.#config.reviewer },
+      implement: { ...this.#config.workers.implementer },
+      review: { ...this.#config.workers.reviewer },
     };
     const proposal = { id, workerSettings, ...prepared.graph };
     this.#proposals.clear();
@@ -948,6 +1056,7 @@ export class MainOrchestrator {
       const exact = name ? store.getChangeSet(name) : null;
       const normalized = name ? exact ? changeName(exact) : semanticSlug(name) : "";
       const matches = store.pendingDecisions().filter((decision) => {
+        if (decision.subjectType !== "ChangeSet") return false;
         const item = store.getChangeSet(decision.subjectId);
         return !normalized || item && changeName(item) === normalized;
       });
@@ -1058,113 +1167,115 @@ export class MainOrchestrator {
     }
     if (decisionKind !== "merge") throw new Error(`pending merge Decision not found: ${decisionId}`);
 
-    await this.#withStore(async (store) => {
-      const decision = store.getDecision(decisionId);
-      if (!decision || decision.state !== "pending" || decision.kind !== "merge") {
-        throw new Error(`pending merge Decision not found: ${decisionId}`);
-      }
-      const item = store.getChangeSet(decision.subjectId);
-      const runtime = item && store.getChangeSetRuntime(item.id);
-      const project = item && store.getProject(item.projectSlug);
-      if (!item || item.state !== "AwaitingMerge" || !runtime?.pullRequestNumber || !project) {
-        throw new Error(`merge Decision ${decisionId} no longer matches an AwaitingMerge ChangeSet`);
-      }
-
-      const { unsafeProjects } = await this.#workerSafetyPreflight(store);
-      if ((await this.#unapprovedDiscoveredDependencies(store, item)).length || this.#reconcileReviewedDependencies(store, unsafeProjects).has(item.id)) {
-        throw new Error("Merge approval expired because prerequisites changed or a discovery still needs approval; reconcile before approving again.");
-      }
-      if (approved && unsafeProjects.has(project.slug)) {
-        throw new Error(`Worker safety prevents merge approval in Project ${project.slug}; retry after live workers exit and inventory succeeds. Decision remains pending.`);
-      }
-
-      let mergeAttempted = false;
-      let mergeCommandSucceeded = false;
-      try {
-        let pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
-        this.#savePullRequest(store, runtime, pullRequest);
-        if (pullRequest.mergedAt) {
-          if (!isCommitSha(pullRequest.mergeCommitSha)) {
-            store.resolveDecision(decisionId, "resolved");
-            this.#block(store, item, "github_unavailable", "Merged pull request has no valid merge commit SHA");
-            return;
-          }
-          await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
-          store.resolveDecision(decisionId, "resolved");
-          await this.#finishObjectives(store, new Set(), unsafeProjects);
-          return;
-        }
-        if (pullRequest.state !== "OPEN") {
-          store.resolveDecision(decisionId, "resolved");
-          this.#block(store, item, "pr_closed", "Pull request was closed without merging");
-          return;
-        }
-        if (!approved) {
-          store.resolveDecision(decisionId, "rejected");
-          this.#block(store, item, "merge_rejected", "Merge rejected; PR and branch remain open");
-          return;
-        }
-
-        const payload = typeof decision.payload === "object" && decision.payload !== null
-          ? decision.payload as Record<string, unknown>
-          : {};
-        const expectedDiff = typeof payload.diffHash === "string" ? payload.diffHash : null;
-        if (runtime.clonePath && runtime.branchName) {
-          await this.#git.ensureChangeSetClone?.(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
-        }
-        const currentDiff = runtime.clonePath
-          ? await this.#git.effectiveDiffFingerprint(project, runtime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid)
-          : null;
-        const latestReview = store.listTasks(item.id).reverse()
-          .find((task) => task.role === "review" && task.outcome === "pass");
-        const policy = await this.#github.branchProtection(project, pullRequest.baseRefName);
-        const remoteHead = runtime.branchName && this.#git.remoteBranchCommit
-          ? await this.#git.remoteBranchCommit(project, runtime.branchName)
-          : pullRequest.headRefOid;
-        const reviewHash = runtime.reviewedDiffHash
-          ?? (latestReview?.reviewedCommit === pullRequest.headRefOid ? currentDiff : null);
-
-        if (!remoteHead) {
-          store.resolveDecision(decisionId, "resolved");
-          this.#block(store, item, "remote_branch_deleted", `Remote branch ${runtime.branchName ?? "(unknown)"} was deleted`);
-          return;
-        }
-        if (!currentDiff || (expectedDiff ? currentDiff !== expectedDiff : payload.headRefOid !== pullRequest.headRefOid)
-          || remoteHead !== pullRequest.headRefOid || !latestReview || reviewHash !== currentDiff
-          || !await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
-          if (requiredTeamReviewApplies(pullRequest, policy) && !teamReviewGateSatisfied(pullRequest, policy)) {
-            this.#waitForRequiredTeamReview(store, item, runtime, pullRequest);
-            return;
-          }
-          store.resolveDecision(decisionId, "resolved");
-          runtime.reviewedDiffHash = null;
-          store.saveChangeSetRuntime(runtime);
-          this.#notify(`${changeName(item)} · Merge approval expired because the pull request changed. Review is next.`, "warning");
-          return;
-        }
-        if (runtime.reviewedDiffHash === null) {
-          runtime.reviewedDiffHash = currentDiff;
-          store.saveChangeSetRuntime(runtime);
-        }
-
-        mergeAttempted = true;
-        await this.#github.mergeSquash(project, runtime.pullRequestNumber, pullRequest.headRefOid);
-        mergeCommandSucceeded = true;
-        pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
-        if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
-        if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("GitHub did not report a valid merged commit SHA");
-        await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
-        store.resolveDecision(decisionId, "approved");
-      } catch (error) {
-        store.resolveDecision(decisionId, "resolved");
-        const unavailable = !mergeAttempted || mergeCommandSucceeded
-          || (error instanceof GitHubMergeError && error.kind === "unavailable");
-        const reason = unavailable ? "github_unavailable" : "merge_failed";
-        this.#block(store, item, reason, `Merge ${unavailable ? "reconciliation failed" : "was rejected"}: ${errorText(error)}`);
-      }
-      await this.#finishObjectives(store, new Set(), unsafeProjects);
-    });
+    await this.#withStore((store) => this.#executeMergeDecision(store, decisionId, approved));
     await this.runPass();
+  }
+
+  async #executeMergeDecision(store: MerroStore, decisionId: string, approved: boolean): Promise<void> {
+    const decision = store.getDecision(decisionId);
+    if (!decision || decision.state !== "pending" || decision.kind !== "merge") {
+      throw new Error(`pending merge Decision not found: ${decisionId}`);
+    }
+    const item = store.getChangeSet(decision.subjectId);
+    const runtime = item && store.getChangeSetRuntime(item.id);
+    const project = item && store.getProject(item.projectSlug);
+    if (!item || item.state !== "AwaitingMerge" || !runtime?.pullRequestNumber || !project) {
+      throw new Error(`merge Decision ${decisionId} no longer matches an AwaitingMerge ChangeSet`);
+    }
+
+    const { unsafeProjects } = await this.#workerSafetyPreflight(store);
+    if ((await this.#unapprovedDiscoveredDependencies(store, item)).length || this.#reconcileReviewedDependencies(store, unsafeProjects).has(item.id)) {
+      throw new Error("Merge approval expired because prerequisites changed or a discovery still needs approval; reconcile before approving again.");
+    }
+    if (approved && unsafeProjects.has(project.slug)) {
+      throw new Error(`Worker safety prevents merge approval in Project ${project.slug}; retry after live workers exit and inventory succeeds. Decision remains pending.`);
+    }
+
+    let mergeAttempted = false;
+    let mergeCommandSucceeded = false;
+    try {
+      let pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
+      this.#savePullRequest(store, runtime, pullRequest);
+      if (pullRequest.mergedAt) {
+        if (!isCommitSha(pullRequest.mergeCommitSha)) {
+          store.resolveDecision(decisionId, "resolved");
+          this.#block(store, item, "github_unavailable", "Merged pull request has no valid merge commit SHA");
+          return;
+        }
+        await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
+        store.resolveDecision(decisionId, "resolved");
+        await this.#finishObjectives(store, new Set(), unsafeProjects);
+        return;
+      }
+      if (pullRequest.state !== "OPEN") {
+        store.resolveDecision(decisionId, "resolved");
+        this.#block(store, item, "pr_closed", "Pull request was closed without merging");
+        return;
+      }
+      if (!approved) {
+        store.resolveDecision(decisionId, "rejected");
+        this.#block(store, item, "merge_rejected", "Merge rejected; PR and branch remain open");
+        return;
+      }
+
+      const payload = typeof decision.payload === "object" && decision.payload !== null
+        ? decision.payload as Record<string, unknown>
+        : {};
+      const expectedDiff = typeof payload.diffHash === "string" ? payload.diffHash : null;
+      if (runtime.clonePath && runtime.branchName) {
+        await this.#git.ensureChangeSetClone?.(project, runtime.clonePath, runtime.branchName, pullRequest.headRefOid);
+      }
+      const currentDiff = runtime.clonePath
+        ? await this.#git.effectiveDiffFingerprint(project, runtime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid)
+        : null;
+      const latestReview = store.listTasks(item.id).reverse()
+        .find((task) => task.role === "review" && task.outcome === "pass");
+      const policy = await this.#github.branchProtection(project, pullRequest.baseRefName);
+      const remoteHead = runtime.branchName && this.#git.remoteBranchCommit
+        ? await this.#git.remoteBranchCommit(project, runtime.branchName)
+        : pullRequest.headRefOid;
+      const reviewHash = runtime.reviewedDiffHash
+        ?? (latestReview?.reviewedCommit === pullRequest.headRefOid ? currentDiff : null);
+
+      if (!remoteHead) {
+        store.resolveDecision(decisionId, "resolved");
+        this.#block(store, item, "remote_branch_deleted", `Remote branch ${runtime.branchName ?? "(unknown)"} was deleted`);
+        return;
+      }
+      if (!currentDiff || (expectedDiff ? currentDiff !== expectedDiff : payload.headRefOid !== pullRequest.headRefOid)
+        || remoteHead !== pullRequest.headRefOid || !latestReview || reviewHash !== currentDiff
+        || !await satisfiesBranchPolicy(pullRequest, policy, (username) => this.#github.hasWritePermission(project, username))) {
+        if (requiredTeamReviewApplies(pullRequest, policy) && !teamReviewGateSatisfied(pullRequest, policy)) {
+          this.#waitForRequiredTeamReview(store, item, runtime, pullRequest);
+          return;
+        }
+        store.resolveDecision(decisionId, "resolved");
+        runtime.reviewedDiffHash = null;
+        store.saveChangeSetRuntime(runtime);
+        this.#notify(`${changeName(item)} · Merge approval expired because the pull request changed. Review is next.`, "warning");
+        return;
+      }
+      if (runtime.reviewedDiffHash === null) {
+        runtime.reviewedDiffHash = currentDiff;
+        store.saveChangeSetRuntime(runtime);
+      }
+
+      mergeAttempted = true;
+      await this.#github.merge(project, runtime.pullRequestNumber, pullRequest.headRefOid, { method: this.#config.merge.method, deleteBranch: this.#config.merge.delete_branch });
+      mergeCommandSucceeded = true;
+      pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
+      if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
+      if (!isCommitSha(pullRequest.mergeCommitSha)) throw new Error("GitHub did not report a valid merged commit SHA");
+      await this.#completeMergedChangeSet(store, item, runtime, project, pullRequest, unsafeProjects);
+      store.resolveDecision(decisionId, "approved");
+    } catch (error) {
+      store.resolveDecision(decisionId, "resolved");
+      const unavailable = !mergeAttempted || mergeCommandSucceeded
+        || (error instanceof GitHubMergeError && error.kind === "unavailable");
+      const reason = unavailable ? "github_unavailable" : "merge_failed";
+      this.#block(store, item, reason, `Merge ${unavailable ? "reconciliation failed" : "was rejected"}: ${errorText(error)}`);
+    }
+    await this.#finishObjectives(store, new Set(), unsafeProjects);
   }
 
   async resolveLocalMergeDecision(decisionId: string, approved: boolean): Promise<LocalMergeOutcome> {
@@ -1554,6 +1665,7 @@ export class MainOrchestrator {
         repositoryInstructions: instructions,
         dependencies: dependencyContext, latestReview: role === "review" ? actionablePriorFindings : latestReview,
         expectedCommit, baseCommit: runtime.baseCommit ?? expectedCommit, baseUpdate,
+        proposeIssues: this.#config.issues.create !== "disabled",
       });
       const launchInput = {
         taskId, changeSetId: item.id, changeSlug: slug, taskName, role, project, clonePath,
@@ -2025,6 +2137,7 @@ export class MainOrchestrator {
 
   async #consumeResult(store: MerroStore, item: ChangeSet, task: Task, result: WorkerResult, runtime: TaskRuntimeRecord, workRuntime: ChangeSetRuntimeRecord, unsafeProjects: ReadonlySet<string>): Promise<void> {
     const flowState = task.role === "implement" ? "Implementing" : "Reviewing";
+    await this.#handleProposedIssues(store, item, task, result);
     if (result.status !== "failed" && item.state === "Blocked" && item.blockedReason === "task_failed"
       && item.blockedResumeState === flowState) {
       // A worker whose failed launch could not be stopped can still finish its owned Task.
@@ -2409,7 +2522,7 @@ export class MainOrchestrator {
         this.#savePullRequest(store, workRuntime, pullRequest);
         if (pullRequest.headRefOid !== review.reviewed_commit) throw new Error("Published PR head differs from the reviewed commit. Reconcile the branch and request fresh review through Main.");
         await this.#github.syncPullRequestContent(project, pullRequest,
-          publicText(reconcilePullRequestBody(pullRequest.body, item, content.verification), this.#names), publicText(reviewNotes(review), this.#names));
+          publicText(reconcilePullRequestBody(pullRequest.body, item, content.verification, relatedPullRequests(store, item)), this.#names), publicText(reviewNotes(review), this.#names));
         workRuntime.reviewedDiffHash = await this.#git.effectiveDiffFingerprint(project, workRuntime.clonePath, pullRequest.baseRefName, pullRequest.baseRefOid, pullRequest.headRefOid);
         store.saveChangeSetRuntime(workRuntime);
         store.transitionChangeSet(item.id, "AwaitingMerge");
@@ -2511,7 +2624,7 @@ export class MainOrchestrator {
           ? parseReviewResult(JSON.parse(latestReviewTask.resultJson))
           : null;
         if (pullRequest.state === "OPEN" && latestReview?.status === "pass") {
-          const body = reconcilePullRequestBody(pullRequest.body, item, finalVerification(store, item, latestReview));
+          const body = reconcilePullRequestBody(pullRequest.body, item, finalVerification(store, item, latestReview), relatedPullRequests(store, item));
           await this.#github.syncPullRequestContent(project, pullRequest, publicText(body, this.#names), publicText(reviewNotes(latestReview), this.#names));
           pullRequest = { ...pullRequest, body };
         }
@@ -2636,17 +2749,25 @@ export class MainOrchestrator {
           this.#resolveMergeDecisions(store, item.id);
           continue;
         }
+        // Auto-merge waits for CI; GitHub rulesets were already enforced by satisfiesBranchPolicy above.
+        const autoMerge = this.#config.merge.auto;
+        if (autoMerge && runtime.githubChecks === "pending") continue;
+        const autoReady = autoMerge && runtime.githubChecks !== "failed";
         const pendingDecision = store.pendingDecisions().find((decision) => decision.kind === "merge" && decision.subjectId === item.id);
         if (pendingDecision) {
           const payload = typeof pendingDecision.payload === "object" && pendingDecision.payload !== null
             ? pendingDecision.payload as Record<string, unknown>
             : {};
           if (payload.pullRequest === pullRequest.number && payload.url === pullRequest.url
-            && payload.title === pullRequest.title && payload.headRefOid === pullRequest.headRefOid) continue;
+            && payload.title === pullRequest.title && payload.headRefOid === pullRequest.headRefOid) {
+            if (autoReady) await this.#executeMergeDecision(store, pendingDecision.id, true);
+            continue;
+          }
           store.resolveDecision(pendingDecision.id, "resolved");
         }
+        const decisionId = randomUUID();
         store.createDecision({
-          id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "merge",
+          id: decisionId, subjectType: "ChangeSet", subjectId: item.id, kind: "merge",
           payload: {
             pullRequest: pullRequest.number,
             url: pullRequest.url,
@@ -2655,6 +2776,11 @@ export class MainOrchestrator {
             diffHash: currentDiffHash,
           },
         });
+        if (autoReady) {
+          this.#notify(`${changeName(item)} · Review passed and GitHub checks are green. Merging PR #${pullRequest.number} (${this.#config.merge.method}).`);
+          await this.#executeMergeDecision(store, decisionId, true);
+          continue;
+        }
         const checks = formatChecks({ source: "GitHub", state: runtime.githubChecks === "green" ? "passed" : runtime.githubChecks === "failed" ? "failed" : runtime.githubChecks === "pending" ? "waiting" : "not reported", observedAt: runtime.githubChecksAt ?? null }, true);
         const message = `${changeName(item)}\nReady to merge · PR #${pullRequest.number}\n${checks} · Merro review passed\n\nApprove merge? /merro approve ${changeName(item)} · Leave open: /merro leave ${changeName(item)}`;
         this.#notify(message, "warning");

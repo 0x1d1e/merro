@@ -44,3 +44,23 @@ export function renderPullRequestContent(input: ReviewedChange): { title: string
   const issues = issueNumbers(input.change).map((number) => `Closes #${number}`).join("\n") || "No linked issues.";
   return { title, verification, body: `## Summary\n\n${summary}\n\n## Verification\n\n${verification}\n\n## Issues\n\n${issues}` };
 }
+
+export interface RelatedPullRequest { name: string; relation: "Requires" | "Required by"; url: string }
+
+const RELATED_HEADING = "## Related pull requests";
+
+/** Replaces the generated section so dependency and companion links track PRs that open after this one. */
+export function withRelatedPullRequests(body: string, related: readonly RelatedPullRequest[]): string {
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === RELATED_HEADING);
+  let kept = lines;
+  if (start >= 0) {
+    let end = start + 1;
+    while (end < lines.length && !/^##\s/.test(lines[end] ?? "")) end += 1;
+    kept = [...lines.slice(0, start), ...lines.slice(end)];
+  }
+  const rest = kept.join("\n").trim();
+  if (!related.length) return rest;
+  const rows = related.map((entry) => `- ${entry.relation} \`${entry.name}\`: ${entry.url}`).join("\n");
+  return `${rest}\n\n${RELATED_HEADING}\n\n${rows}`.trim();
+}

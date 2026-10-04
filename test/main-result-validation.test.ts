@@ -30,8 +30,8 @@ for (const forged of ["implement", "review", "task_id", "schema"] as const) {
     const github: NonNullable<MainOptions["github"]> = {
       repository: async () => repository, repositoryInDirectory: async () => repository,
       listOpenIssues: async () => [issue], issue: async () => issue, issues: async (_project, numbers) => numbers.map(() => issue),
-      createPullRequest: unexpected, pullRequest: unexpected, branchProtection: unexpected,
-      hasWritePermission: unexpected, mergeSquash: unexpected, syncPullRequestContent: unexpected,
+      createIssue: unexpected, createPullRequest: unexpected, pullRequest: unexpected, branchProtection: unexpected,
+      hasWritePermission: unexpected, merge: unexpected, syncPullRequestContent: unexpected,
     };
     const runtime = new WorkerRuntime({ workspacePath: join(workspace, ".merro/runtime"), config: DEFAULT_CONFIG });
     const main = new MainOrchestrator({ workspacePath: workspace, config: DEFAULT_CONFIG, github, notify() {}, workers: {

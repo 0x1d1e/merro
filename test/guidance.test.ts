@@ -43,7 +43,7 @@ test("implement Tasks embed scoped guidance while review handoffs rely on Pi gui
     assert.match(task, /## Task instructions/);
     if (role === "review") {
       for (const text of ["Existing Project guidance", "Repository convention", "Use separate delivery; run CI.", "Kinetix convention.", "Reviewer convention."]) assert.ok(!task.includes(text), text);
-      assert.match(task, /normal Pi mechanisms/);
+      assert.match(task, /the agent's normal mechanisms/);
       assert.match(task, /Do not modify files/);
       assert.match(task, /Base commit: b{40}/);
     } else {

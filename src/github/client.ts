@@ -1,6 +1,7 @@
 import { CommandError, systemCommandRunner, type CommandOptions, type CommandRunner } from "../runtime/commands.js";
 import type { IssueQuery, Project } from "../domain/model.js";
 import { matchesIssueQuery } from "../domain/objective.js";
+import type { MergeMethod } from "../config.js";
 
 export interface GitHubRepository {
   nameWithOwner: string;
@@ -373,6 +374,17 @@ export class GitHubClient {
     return [...issues.values()].sort((a, b) => a.number - b.number);
   }
 
+  /** Creates an issue once; creation is not idempotent, so it is never retried. */
+  async createIssue(project: Project, title: string, body: string): Promise<GitHubIssue> {
+    if (!title.trim()) throw new Error("GitHub issue title must not be empty");
+    const repository = await this.repository(project.baseRemote);
+    const result = await this.#commands.run("gh", [
+      "api", "--method", "POST", `repos/${repository.nameWithOwner}/issues`, "-f", `title=${title.trim()}`, "-f", `body=${body}`,
+    ], { cwd: project.path });
+    const row = object(parseJson(result.stdout, "gh api create issue"), "gh api create issue");
+    return parseIssue({ ...row, url: row.html_url, updatedAt: row.updated_at, state: stringField(row, "state", "gh api create issue").toUpperCase() });
+  }
+
   async issue(project: Project, number: number): Promise<GitHubIssue> {
     const [issue] = await this.issues(project, [number]);
     if (!issue) throw new Error(`GitHub issue #${number} was not returned`);
@@ -701,7 +713,12 @@ export class GitHubClient {
     }
   }
 
-  async mergeSquash(project: Project, number: number, expectedHeadCommit: string): Promise<void> {
+  async merge(
+    project: Project,
+    number: number,
+    expectedHeadCommit: string,
+    options: { method: MergeMethod; deleteBranch: boolean } = { method: "squash", deleteBranch: false },
+  ): Promise<void> {
     if (!/^[0-9a-f]{40,64}$/i.test(expectedHeadCommit)) {
       throw new Error(`invalid expected pull request head SHA: ${expectedHeadCommit}`);
     }
@@ -710,7 +727,8 @@ export class GitHubClient {
       await this.#retry(async () => {
         await this.#commands.run("gh", [
           "pr", "merge", String(number), "--repo", repository.nameWithOwner,
-          "--squash", "--match-head-commit", expectedHeadCommit,
+          `--${options.method}`, "--match-head-commit", expectedHeadCommit,
+          ...options.deleteBranch ? ["--delete-branch"] : [],
         ], { cwd: project.path });
       }, async () => {
         try {

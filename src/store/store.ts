@@ -22,7 +22,7 @@ import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, MIGRATION_21, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
 import { migrateLocalMergeState } from "./local-merge-migration.js";
@@ -381,6 +381,15 @@ export class MerroStore {
     if (version < 20) {
       migrateTeamReviewState(this.#db);
       version = 20;
+    }
+    if (version < 21) {
+      this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#db.exec(MIGRATION_21);
+        this.#db.prepare("UPDATE schema_meta SET version = 21").run();
+        this.#db.exec("COMMIT");
+        version = 21;
+      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
     }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
@@ -774,6 +783,7 @@ export class MerroStore {
     return {
       taskId,
       runtimeKind: row.runtime_kind === "docker" || row.runtime_kind === "host" ? row.runtime_kind : null,
+      ...(row.agent === "pi" || row.agent === "claude" ? { agent: row.agent } : {}),
       tmuxSession: String(row.tmux_session),
       tmuxWindow: String(row.tmux_window),
       paneId: row.pane_id === null ? null : String(row.pane_id),
@@ -793,16 +803,16 @@ export class MerroStore {
 
   saveTaskRuntime(record: TaskRuntimeRecord): void {
     this.#db.prepare(`
-      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, pane_id, container_id, process_pid, process_started_at, clone_path, task_file_path, result_path, expected_commit, started_at, runtime_kind, base_update_json, window_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO task_runtime(task_id, tmux_session, tmux_window, pane_id, container_id, process_pid, process_started_at, clone_path, task_file_path, result_path, expected_commit, started_at, runtime_kind, base_update_json, window_id, agent)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(task_id) DO UPDATE SET
         tmux_session = excluded.tmux_session, tmux_window = excluded.tmux_window, pane_id = excluded.pane_id,
         container_id = excluded.container_id, process_pid = excluded.process_pid, process_started_at = excluded.process_started_at,
         clone_path = excluded.clone_path, task_file_path = excluded.task_file_path,
         result_path = excluded.result_path, expected_commit = excluded.expected_commit, started_at = excluded.started_at,
-        runtime_kind = excluded.runtime_kind, base_update_json = excluded.base_update_json, window_id = excluded.window_id
+        runtime_kind = excluded.runtime_kind, base_update_json = excluded.base_update_json, window_id = excluded.window_id, agent = excluded.agent
     `).run(record.taskId, record.tmuxSession, record.tmuxWindow, record.paneId, record.containerId,
-      record.processPid, record.processStartedAt, record.clonePath, record.taskFilePath, record.resultPath, record.expectedCommit, record.startedAt, record.runtimeKind, record.baseUpdate ? JSON.stringify(record.baseUpdate) : null, record.windowId ?? null);
+      record.processPid, record.processStartedAt, record.clonePath, record.taskFilePath, record.resultPath, record.expectedCommit, record.startedAt, record.runtimeKind, record.baseUpdate ? JSON.stringify(record.baseUpdate) : null, record.windowId ?? null, record.agent ?? null);
   }
 
   #objectiveFromRow(row: Record<string, unknown>): Objective {

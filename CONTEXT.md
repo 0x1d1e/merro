@@ -54,9 +54,9 @@ Private counter preserving history when a terminal source needs new work. Never 
 1. Workspace authority is exactly `cwd/.merro`. Initialization is explicit; no parent search or startup creation.
 2. Public identity is semantic. Internal IDs never appear in status, plans, errors, Task text, worker/path/branch names, PRs, comments, notifications or normal exports.
 3. Review follows green reported command verification and uses a fresh Worker. Rejection leads to a fresh implementer and fresh reviewer on the same change/branch.
-4. Local plan approval authorizes delivery of the exact reviewed commit to its named target branch. PR merge needs separate per-PR approval unless the user merged externally. Main never force-pushes, authors merge commits, or rewrites finalized Task commits.
+4. Local plan approval authorizes delivery of the exact reviewed commit to its named target branch. PR merge needs separate per-PR approval unless the user merged externally or `merge.auto` is enabled (ADR-0012); GitHub policy is never bypassed. Main never force-pushes, authors merge commits, or rewrites finalized Task commits.
 5. GitHub owns issue/PR/policy/merge truth; Git owns commits and working copies; tmux/process identity owns worker liveness. Merro owns orchestration metadata.
-6. Requires defaults to actual completion, normally merge. An explicitly approved reviewed gate unblocks on a passing review of the exact prerequisite commit; changed prerequisites invalidate unfinished dependent work. Merro never auto-splits or auto-creates issues.
+6. Requires defaults to actual completion, normally merge. An explicitly approved reviewed gate unblocks on a passing review of the exact prerequisite commit; changed prerequisites invalidate unfinished dependent work. Merro never auto-splits work. It creates issues only on user command or per `issues.create` policy (ADR-0012).
 7. Guidance precedence: current user instruction, approved ChangeSet guidance, Project guidance (including Markdown), workspace Markdown, Merro defaults. Built-in safety invariants cannot be overridden. Repository AGENTS.md remains normal Pi/repository guidance.
 
 For transitions and operational policy, read [lifecycle.md](docs/lifecycle.md). For worker contracts, read [worker-protocol.md](docs/worker-protocol.md).

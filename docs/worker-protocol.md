@@ -2,6 +2,10 @@
 
 Read before changing Task files, result submission, launch or process identity. [Lifecycle](lifecycle.md) owns scheduling and recovery policy.
 
+## Runtimes
+
+Each role selects a runtime in `workers.<role>.runtime` (`pi` default, `claude`). `AgentRuntime` builds the command and recognises process identity; `WorkerRuntime` owns tmux, Docker and cleanup. The agent kind is stored per Task (`task_runtime.agent`) and survives config changes. Claude Tasks run `claude --session-id <task id> --permission-mode dontAsk` with an allowlist (reviewers get no Edit/Write), a strict MCP config exposing `merro_submit_result`, and hooks that report busy/tool/stop. On Stop after a finished result, the hook ends the Claude process. Identity is the `--session-id` argument. The Claude runtime is host-only. Both runtimes validate and write results through `protocol/submit-result.ts`, so the artifact is identical. Results may include up to 5 `proposed_issues` (`title`, `body`); Main handles them per `issues.create` once, keyed by an `issues_proposed` Task event.
+
 ## Native Pi runtime
 
 One Task is one fresh native Pi process in one tmux pane. Launch uses `pi --no-session --tui-mode regular` with an initial `@.merro-task.md` prompt and Merro's lifecycle/result extensions. No print-mode worker, reconstructed UI, steering API or alternate terminal backend.

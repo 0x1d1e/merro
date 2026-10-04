@@ -8,6 +8,7 @@ import type { MerroConfig } from "../config.js";
 import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import { semanticSlug } from "../domain/names.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
+import { agentRuntime, type AgentRuntime } from "./agent-runtime.js";
 import { CommandError, type CommandRunner, systemCommandRunner } from "./commands.js";
 import { dockerBindMount } from "./docker-mount.js";
 
@@ -198,10 +199,12 @@ export class WorkerRuntime {
     if (sandbox === "none" && network === "off") {
       throw new Error("network=off requires Docker sandboxing");
     }
+    const agent = this.#agentFor(input.role, sandbox);
     const scratchPath = join(this.#workspacePath, "tasks", safeName(input.taskName));
     return {
       taskId: input.taskId,
       runtimeKind: sandbox === "docker" ? "docker" : "host",
+      agent: agent.kind,
       tmuxSession: projectSession(input.project, this.#config.tmux.session),
       tmuxWindow: taskWindowName(input.role, input.changeSlug),
       paneId: null,
@@ -215,6 +218,20 @@ export class WorkerRuntime {
       ...(input.baseUpdate ? { baseUpdate: input.baseUpdate } : {}),
       startedAt: new Date().toISOString(),
     };
+  }
+
+  #agentFor(role: TaskRole, sandbox: "docker" | "none"): AgentRuntime {
+    const settings = role === "implement" ? this.#config.workers.implementer : this.#config.workers.reviewer;
+    const agent = agentRuntime(settings.runtime);
+    if (!agent.sandboxes.includes(sandbox)) {
+      throw new Error(`workers.${role === "implement" ? "implementer" : "reviewer"}.runtime=${agent.kind} does not support sandbox=${sandbox}`);
+    }
+    return agent;
+  }
+
+  /** The agent that owns a recorded Task; Tasks launched before runtime selection were Pi. */
+  #recordedAgent(record: TaskRuntimeRecord): AgentRuntime {
+    return agentRuntime(record.agent ?? "pi");
   }
 
   async launch(input: WorkerLaunchInput, plan = this.plan(input)): Promise<TaskRuntimeRecord> {
@@ -259,19 +276,13 @@ export class WorkerRuntime {
       environment.GH_TOKEN = token;
     }
 
-    const settings = input.role === "implement" ? this.#config.worker : this.#config.reviewer;
-    const roleArguments = [
-      ...(settings.model ? ["--model", settings.model] : []),
-      ...(settings.thinking ? ["--thinking", settings.thinking] : []),
-    ];
-    const commonPiArgs = ["--no-session", "--tui-mode", "regular", "--approve", ...roleArguments];
-    const piArgs = [
-      "pi", ...commonPiArgs,
-      "--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-result.js"),
-      "--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-lifecycle.js"),
-      ...(workerGuidance ? ["--extension", join(TASK_MOUNT, "merro-runtime", "tools", "worker-guidance.js")] : []),
-      "--", `@${CLONE_MOUNT}/.merro-task.md`,
-    ];
+    const settings = input.role === "implement" ? this.#config.workers.implementer : this.#config.workers.reviewer;
+    const agent = this.#agentFor(input.role, sandbox);
+    const piArgs = agent.command({
+      role: input.role, taskId: input.taskId, settings, runtimeRoot: join(TASK_MOUNT, "merro-runtime"),
+      taskFilePath: `${CLONE_MOUNT}/.merro-task.md`, guidance: workerGuidance,
+      guidancePath: workerGuidance ? join(TASK_MOUNT, "worker-guidance.md") : null, toolEnvironment: {},
+    });
     const cidPath = join(this.#workspacePath, "container-ids", `${safeName(input.taskName)}.cid`);
     let paneId: string | null = null;
     let windowId: string | null = null;
@@ -333,14 +344,16 @@ export class WorkerRuntime {
           ...inherited as Record<string, string>, ...workerEnvironment,
           MERRO_RESULT_PATH: resultPath,
           MERRO_TASK_SCRATCH: scratchPath,
+          MERRO_CHECKOUT_PATH: resolve(input.clonePath),
         };
-        const hostArgs = [
-          "pi", ...commonPiArgs,
-          "--extension", join(extensionRoot, "tools", "worker-result.js"),
-          "--extension", join(extensionRoot, "tools", "worker-lifecycle.js"),
-          ...(workerGuidance ? ["--extension", join(extensionRoot, "tools", "worker-guidance.js")] : []),
-          "--", `@${taskFilePath}`,
-        ];
+        const hostArgs = agent.command({
+          role: input.role, taskId: input.taskId, settings, runtimeRoot: extensionRoot, taskFilePath,
+          guidance: workerGuidance, guidancePath: workerGuidance ? workerGuidancePath : null,
+          toolEnvironment: {
+            MERRO_RUNTIME: "worker", MERRO_TASK_ID: input.taskId, MERRO_TASK_ROLE: input.role,
+            MERRO_RESULT_PATH: resultPath, MERRO_TASK_SCRATCH: scratchPath, MERRO_CHECKOUT_PATH: resolve(input.clonePath),
+          },
+        });
         const command = hostArgs.map(shellQuote).join(" ");
         const scriptPath = join(secretRoot, `${safeName(input.taskName)}.sh`);
         launchSecretPath = scriptPath;
@@ -398,10 +411,13 @@ export class WorkerRuntime {
         processStartedAt = await this.#hostProcessStartedAt(processPid);
       }
 
+      await agent.afterLaunch(paneId, this.#commands);
+
       launchSucceeded = true;
       return {
         taskId: input.taskId,
         runtimeKind: sandbox === "docker" ? "docker" : "host",
+        agent: agent.kind,
         tmuxSession: session,
         tmuxWindow: window,
         paneId,
@@ -554,7 +570,7 @@ export class WorkerRuntime {
       if (!identityMatches) return { alive: true, identityMatches: false, reason: "Docker container identity does not match the active Task" };
       try {
         const output = await this.#commands.run("docker", ["exec", actualId, "sh", "-lc", "tr '\\0' ' ' </proc/1/cmdline"]);
-        if (!/\b(?:pi|cli\.js)\b/.test(output.stdout) || !output.stdout.includes("--tui-mode regular")) return { alive: true, identityMatches: false, reason: "container PID 1 is not the expected Pi process" };
+        if (!this.#recordedAgent(record).isContainerProcess(output.stdout)) return { alive: true, identityMatches: false, reason: "container PID 1 is not the expected Pi process" };
       } catch (error) {
         return { alive: true, identityMatches: false, reason: `cannot verify Pi process identity: ${String(error)}` };
       }
@@ -606,10 +622,10 @@ export class WorkerRuntime {
       const startedAt = record.processStartedAt === null ? null : await this.#hostProcessStartedAt(pid);
       const identityMatches = stableIdentityMatches
         && (record.processStartedAt === null || startedAt === record.processStartedAt)
-        && await this.#foregroundPi(pid, result[3]!);
+        && await this.#foregroundAgent(this.#recordedAgent(record), pid, result[3]!, taskId);
       return identityMatches
         ? { alive: true, identityMatches: true, reason: null }
-        : { alive: true, identityMatches: false, reason: "Worker pane or foreground Pi identity is ambiguous; inspect it before retrying." };
+        : { alive: true, identityMatches: false, reason: "Worker pane or foreground agent identity is ambiguous; inspect it before retrying." };
     } catch (error) {
       if (paneFound || !missingTmuxTarget(error)) throw error;
       return { alive: false, identityMatches: false, reason: `tmux pane is gone: ${String(error)}` };
@@ -743,24 +759,19 @@ export class WorkerRuntime {
     await copyFile(join(compiledSource, "tools", "worker-lifecycle.js"), join(tools, "worker-lifecycle.js"));
     await copyFile(join(compiledSource, "tools", "worker-guidance.js"), join(tools, "worker-guidance.js"));
     await copyFile(join(compiledSource, "protocol", "worker-state.js"), join(protocol, "worker-state.js"));
+    await copyFile(join(compiledSource, "protocol", "submit-result.js"), join(protocol, "submit-result.js"));
+    await copyFile(join(compiledSource, "tools", "claude-hook.js"), join(tools, "claude-hook.js"));
+    await copyFile(join(compiledSource, "tools", "claude-result-server.js"), join(tools, "claude-result-server.js"));
     await writeFile(join(target, "package.json"), '{"type":"module"}\n', { encoding: "utf8", mode: 0o600 });
   }
 
-  async #foregroundPi(panePid: number, currentCommand: string): Promise<boolean> {
-    if (!["pi", "node"].includes(currentCommand)) return false;
+  async #foregroundAgent(agent: AgentRuntime, panePid: number, currentCommand: string, taskId: string): Promise<boolean> {
     const group = Number((await this.#commands.run("ps", ["-p", String(panePid), "-o", "tpgid="])).stdout.trim());
     if (!Number.isSafeInteger(group) || group < 1) return false;
     const output = (await this.#commands.run("ps", ["-eo", "pid=,pgid=,comm=,args="])).stdout;
     const foreground = output.split("\n").map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line))
       .filter((row) => row && Number(row[2]) === group);
-    return foreground.filter((row) => row && this.#piCommand(row[3]!, row[4]!)).length === 1;
-  }
-
-  #piCommand(comm: string, args: string): boolean {
-    const argv = args.trim().split(/\s+/);
-    const executable = comm.split("/").at(-1);
-    return executable === "pi" || executable === "node" && Boolean(argv[1]
-      && (/\/(?:pi|pi\.js)$/.test(argv[1]) || /\/pi-coding-agent\/dist\/cli\.js$/.test(argv[1])));
+    return foreground.filter((row) => row && agent.isForegroundProcess({ comm: row[3]!, args: row[4]! }, { taskId, currentCommand })).length === 1;
   }
 
   async capturePane(record: TaskRuntimeRecord, taskId: string): Promise<string> {
