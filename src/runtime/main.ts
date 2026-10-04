@@ -457,7 +457,7 @@ export class MainOrchestrator {
   readonly #workers: WorkerAdapter;
   readonly #commands: CommandRunner;
   #storeQueue: Promise<unknown> = Promise.resolve();
-  readonly #proposals = new Map<string, { input: string; graph: string; names: string[]; workerSettings: WorkerSettings }>();
+  readonly #proposals = new Map<string, { input: string; graph: string; names: string[]; workerSettings: WorkerSettings; maxReviewRounds: number | "unlimited" }>();
   readonly #pendingNotifications: Array<{ event: string; subjectId: string; message: string }> = [];
   readonly #reviewNotificationsInFlight = new Set<string>();
   readonly #names = new Map<string, string>();
@@ -709,7 +709,7 @@ export class MainOrchestrator {
     const proposal = { id, workerSettings, ...prepared.graph };
     this.#proposals.clear();
     this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph, prepared.projects),
-      names: prepared.graph.changeSets.map((item) => changeName(item)), workerSettings });
+      names: prepared.graph.changeSets.map((item) => changeName(item)), workerSettings, maxReviewRounds: this.#config.maxReviewRounds });
     return proposal;
   }
 
@@ -918,14 +918,16 @@ export class MainOrchestrator {
         }
       }
       await this.#validateNewExplicitRelations(store, graph.changeSets, graph.relations, explicitRelations);
-      const approvedWorkerSettings = proposalId === undefined ? undefined : this.#proposals.get(proposalId)?.workerSettings;
+      const approvedProposal = proposalId === undefined ? undefined : this.#proposals.get(proposalId);
+      const approvedWorkerSettings = approvedProposal?.workerSettings;
       if (proposalId !== undefined) this.#proposals.delete(proposalId);
 
       const objective: Objective = {
         id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
         projectSlugs: projects.map((project) => project.slug),
         issueScopes: approvedIssueScopes,
-        ...(input.maxReviewRounds === undefined ? {} : { maxReviewRounds: input.maxReviewRounds }),
+        // Materialized so a later config reload cannot change an approved Objective's review limit.
+        maxReviewRounds: input.maxReviewRounds ?? approvedProposal?.maxReviewRounds ?? this.#config.maxReviewRounds,
       };
       store.createObjective(objective);
       store.saveObjectiveWorkerSettings(objective.id, approvedWorkerSettings ?? {
@@ -1289,7 +1291,7 @@ export class MainOrchestrator {
         store.resolveDecision(decisionId, "resolved");
         runtime.reviewedDiffHash = null;
         store.saveChangeSetRuntime(runtime);
-        this.#notify(`${changeName(item)} · Merge approval expired because the pull request changed. Review is next.`, "warning");
+        this.#progress(`${changeName(item)} · Merge approval expired because the pull request changed. Review is next.`);
         return;
       }
       if (runtime.reviewedDiffHash === null) {

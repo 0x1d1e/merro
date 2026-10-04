@@ -438,3 +438,24 @@ test("store migrates v1 state without losing ChangeSets", async (t) => {
     migrated.close();
   }
 });
+
+test("v22 migration numbers legacy pending issue proposals so new ones never collide", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "merro-v22-migration-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "state.db");
+  const original = new MerroStore(path);
+  for (const id of ["a", "b"]) {
+    original.createDecision({ id, subjectType: "IssueProposal", subjectId: id, kind: "issue", payload: { title: id } });
+  }
+  original.close();
+  const legacy = new DatabaseSync(path);
+  legacy.exec("ALTER TABLE objective_settings DROP COLUMN worker_settings_json; UPDATE schema_meta SET version = 21;");
+  legacy.close();
+
+  const migrated = new MerroStore(path);
+  try {
+    const numbers = migrated.pendingDecisions().map((decision) => [decision.id, (decision.payload as { number?: number }).number]);
+    assert.deepEqual(numbers, [["a", 1], ["b", 2]]);
+    assert.equal(migrated.nextIssueProposalNumber(), 3);
+  } finally { migrated.close(); }
+});

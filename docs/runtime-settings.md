@@ -1,6 +1,6 @@
 # Runtime settings
 
-`.merro/config.json` contains machine settings. Init writes all editable defaults without replacing existing files. `/merro config` shows the file location and effective Merro settings, filling omitted fields with defaults without rewriting the file. `null` preserves Pi inheritance rather than copying Pi settings into Merro. Restart Main after editing the JSON; the config view reads the current file, not Main's startup snapshot. Instructions, prompts, review policy, architecture guidance, and Project context belong in [Markdown](../README.md#markdown-customization).
+`.merro/config.json` contains machine settings. Init writes all editable defaults without replacing existing files. `/merro config` shows the file location and effective Merro settings, filling omitted fields with defaults without rewriting the file. `null` preserves Pi inheritance rather than copying Pi settings into Merro. Edits hot reload on the next reconcile pass; an invalid edit keeps the previous settings and warns once. Worker runtime/model/thinking and `maxReviewRounds` are snapshotted when a plan is approved, so reloads affect only future plans; other settings (concurrency, merge, notify) apply immediately. Instructions, prompts, review policy, architecture guidance, and Project context belong in [Markdown](../README.md#markdown-customization).
 
 Common overrides:
 

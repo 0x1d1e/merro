@@ -396,6 +396,16 @@ export class MerroStore {
       this.#db.exec("BEGIN IMMEDIATE");
       try {
         this.#db.exec(MIGRATION_22);
+        // Pending proposals predating persisted numbers keep the queue position users already saw, so new
+        // proposals continue after them instead of colliding.
+        const legacy = this.#db.prepare(`
+          SELECT id FROM decisions
+          WHERE kind = 'issue' AND subject_type = 'IssueProposal' AND state = 'pending' AND json_extract(payload_json, '$.number') IS NULL
+          ORDER BY created_at, id
+        `).all() as Array<{ id: string }>;
+        legacy.forEach((row, index) => {
+          this.#db.prepare("UPDATE decisions SET payload_json = json_set(payload_json, '$.number', ?) WHERE id = ?").run(index + 1, row.id);
+        });
         this.#db.prepare("UPDATE schema_meta SET version = 22").run();
         this.#db.exec("COMMIT");
         version = 22;

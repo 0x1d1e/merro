@@ -182,3 +182,27 @@ test("/merro issue asks to open Main when none is attached", async () => {
   await merro.handler("issue list", { ui: { notify: (message) => messages.push(message) } });
   assert.match(messages[0]!, /Open Main/);
 });
+
+test("/merro watch targets the window inside and outside tmux", async () => {
+  const main = { async watchTarget() { return { session: "merro-app", window: "task-1" }; } } as unknown as MainOrchestrator;
+  const registry = new Map<string, CommandConfig>();
+  const calls: unknown[][] = [];
+  registerCommands({ registerCommand(name, config) { registry.set(name, config); } }, "/unused", main, undefined, {
+    async run(file: string, args: readonly string[]) { calls.push([file, ...args]); return { stdout: "", stderr: "" }; },
+  });
+  const messages: string[] = [];
+  const watch = () => registry.get("merro")!.handler("watch my-change", { ui: { notify: (message) => messages.push(message) } });
+  const previous = process.env.TMUX;
+  try {
+    delete process.env.TMUX;
+    await watch();
+    assert.deepEqual(calls, []);
+    assert.match(messages.at(-1)!, /tmux select-window -t '=merro-app:=task-1' && tmux attach-session -t '=merro-app'/);
+    assert.doesNotMatch(messages.at(-1)!, /attach-session -t '=merro-app:/);
+    process.env.TMUX = "/tmp/tmux-1/default,1,0";
+    await watch();
+    assert.deepEqual(calls, [["tmux", "switch-client", "-t", "=merro-app:=task-1"]]);
+  } finally {
+    if (previous === undefined) delete process.env.TMUX; else process.env.TMUX = previous;
+  }
+});

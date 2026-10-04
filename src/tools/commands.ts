@@ -89,7 +89,7 @@ async function runIssueCommand(main: MainOrchestrator, text: string): Promise<st
   throw new Error(issueUsage);
 }
 
-export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?: MainOrchestrator, onInitialized?: () => Promise<void>): void {
+export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?: MainOrchestrator, onInitialized?: () => Promise<void>, commands: Pick<typeof systemCommandRunner, "run"> = systemCommandRunner): void {
   const showStatus = async (ctx: CommandContext, full: boolean) => {
     const snapshot = main ? await main.publicSnapshot() : await withStore(cwd, presentWorkspace);
     report(ctx, full ? formatStatus(snapshot) : formatOverview(snapshot));
@@ -105,11 +105,13 @@ export function registerCommands(pi: PiExtensionLike, cwd = process.cwd(), main?
     if (!name) { report(ctx, "Usage: /merro watch <change>", "warning"); return; }
     const target = await main.watchTarget(name);
     if (!target) { report(ctx, `${name} has no running worker to watch.`); return; }
-    const spec = `=${target.session}:=${target.window}`;
+    const session = `=${target.session}`;
+    const window = `${session}:=${target.window}`;
     if (process.env.TMUX) {
-      await systemCommandRunner.run("tmux", ["switch-client", "-t", spec]);
+      // switch-client accepts a window target; attach-session does not, so outside tmux select the window first.
+      await commands.run("tmux", ["switch-client", "-t", window]);
       report(ctx, `Switched to ${target.window}.`);
-    } else report(ctx, `Watch ${name}:\n  tmux attach -t '${spec}'`);
+    } else report(ctx, `Watch ${name}:\n  tmux select-window -t '${window}' && tmux attach-session -t '${session}'`);
   };
   const runMerro = async (args: string, ctx: CommandContext) => {
     const [verb, ...rest] = args.trim().split(/\s+/).filter(Boolean);

@@ -197,9 +197,19 @@ function objectiveInput(args: Record<string, unknown>): ObjectiveStartInput | Na
   };
 }
 
+/**
+ * The user's raw latest message, captured by the host before the model sees it. Approval reads this, never a
+ * model-authored tool argument, so a model cannot correct "approvve" into an approval.
+ */
+export interface UserApprovalSource {
+  latest(): string | undefined;
+  /** Called once an approval is accepted so one user reply authorizes one approval. */
+  consume(): void;
+}
+
 /** Approval is deterministic: only the exact word counts, so a typo can never start work or merge. */
-function approvalRefusal(reply: unknown): string | null {
-  const text = typeof reply === "string" ? reply.trim() : "";
+function approvalRefusal(reply: string | undefined): string | null {
+  const text = reply?.trim() ?? "";
   if (text.toLowerCase() === "approve") return null;
   const choice = text.toLowerCase();
   if (choice === "edit") return "Tell me what to change.";
@@ -207,7 +217,7 @@ function approvalRefusal(reply: unknown): string | null {
   return `Unknown choice: ${text || "(empty)"}\nChoose: approve · edit · cancel`;
 }
 
-export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void {
+export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator, approvals: UserApprovalSource): void {
   pi.registerTool({ name: "merro_add_project", label: "Register Project", description: "Register a Git Project from the user's remote URL or supplied local path and semantic name. Remote URLs clone into this workspace's projects directory. Never scan home directories or require GitHub for registration.",
     parameters: Type.Object({ path: Type.String({ description: "Remote URL or supplied local checkout path." }), slug: Type.String() }, { additionalProperties: false }),
     async execute(_id, args) {
@@ -288,9 +298,9 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
       const planText = stageCount === 1 ? plans.map(planEntry).join("\n\n")
         : Array.from({ length: stageCount }, (_, index) => {
           const members = plans.filter((plan) => stageByChange.get(plan.change) === index + 1);
-          const heading = `Stage ${index + 1} · ${members.length} change${members.length === 1 ? "" : "s"}${index === 0 ? "" : ` · starts after stage ${index}`}`;
+          const heading = `Stage ${index + 1} · ${members.length} change${members.length === 1 ? "" : "s"}`;
           return `${heading}\n\n${members.map(planEntry).join("\n\n")}`;
-        }).join("\n\n");
+        }).join("\n\n") + "\n\nStages show dependency depth; each change starts as soon as its own prerequisites finish.";
       const prCount = plans.filter((plan) => plan.delivery === "pr").length;
       const local = plans.filter((plan) => plan.delivery === "local").map((plan) => `${plan.project}: local delivery to ${plan.targetBranch} after review (no push)`).join("\n");
       const totals = `${plans.length} change${plans.length === 1 ? "" : "s"}${stageCount > 1 ? ` in ${stageCount} stages` : ""} · ${prCount} pull request${prCount === 1 ? "" : "s"} · ${proposal.runnableImmediately} runnable immediately${local ? `\n${local}` : ""}`;
@@ -309,10 +319,11 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
       pi.sendMessage?.({ customType: "merro-proposal", content: message, display: true, details });
       return result(message, details);
     } });
-  pi.registerTool({ name: "merro_start_objective", label: "Approve plan", description: "Approve the single pending plan. Pass the user's literal reply in `reply`; only exactly 'approve' starts work, never a corrected or inferred spelling. Optionally select by semantic change name; never ask for an identifier or repeat the plan parameters.", parameters: Type.Object({ reply: Type.String(), change: Type.Optional(Type.String()) }, { additionalProperties: false }),
+  pi.registerTool({ name: "merro_start_objective", label: "Approve plan", description: "Approve the single pending plan. Merro checks the user's own latest message; only exactly 'approve' starts work, never a corrected or inferred spelling. Optionally select by semantic change name; never ask for an identifier or repeat the plan parameters.", parameters: Type.Object({ change: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, args) {
-      const refusal = approvalRefusal(args.reply);
+      const refusal = approvalRefusal(approvals.latest());
       if (refusal) return result(refusal);
+      approvals.consume();
       const started = await main.approveObjective(typeof args.change === "string" ? args.change : undefined);
       await main.runPass();
       return result(`Working: ${started.changeSets.map(changeName).join(", ")}.`);
@@ -320,11 +331,12 @@ export function registerMainTools(pi: MainToolAPI, main: MainOrchestrator): void
   pi.registerTool({ name: "merro_retry_change", label: "Retry change", description: "Retry one eligible blocked change after its cause is fixed. Infer the only eligible change when unambiguous; do not retry automatic or GitHub-policy blockers.",
     parameters: Type.Object({ change: Type.Optional(Type.String()) }, { additionalProperties: false }),
     async execute(_id, args) { return result(await main.retryChangeSet(typeof args.change === "string" ? args.change : undefined)); } });
-  pi.registerTool({ name: "merro_resolve_decision", label: "Approve or leave open", description: "Approve or decline a pending PR or local merge decision. Approving requires the user's literal reply in `reply`, exactly 'approve'; never a corrected or inferred spelling. Infer a unique decision; approving an already merged change succeeds idempotently.",
-    parameters: Type.Object({ change: Type.Optional(Type.String()), approved: Type.Boolean(), reply: Type.Optional(Type.String()) }, { additionalProperties: false }),
+  pi.registerTool({ name: "merro_resolve_decision", label: "Approve or leave open", description: "Approve or decline a pending PR or local merge decision. Approving requires the user's own latest message to be exactly 'approve'; never a corrected or inferred spelling. Infer a unique decision; approving an already merged change succeeds idempotently.",
+    parameters: Type.Object({ change: Type.Optional(Type.String()), approved: Type.Boolean() }, { additionalProperties: false }),
     async execute(_id, args) {
-      const refusal = args.approved === true ? approvalRefusal(args.reply) : null;
+      const refusal = args.approved === true ? approvalRefusal(approvals.latest()) : null;
       if (refusal) return result(refusal);
+      if (args.approved === true) approvals.consume();
       return result(await main.resolveDecisionForChange(typeof args.change === "string" ? args.change : undefined, args.approved === true));
     } });
   pi.registerTool({ name: "merro_restart_change", label: "Restart attempt", description: "After explicit user approval of changed requirements, stop the current attempt and start a fresh implementer. Never send instructions to a running worker.",

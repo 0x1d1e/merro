@@ -14,12 +14,12 @@ Public states are Working, Waiting, Needs you, Blocked and Done, derived from li
 
 Permanent notifications are reserved for conditions that need the user. Automatic recovery and waiting goes to the transient status line; permanent notifications are deduped per subject and re-arm when progress is reported for that subject. Diagnostics stay in `/merro <change>`; history is opt-in via `--history`.
 
-Approval is deterministic: tools require the user's literal `reply`, and only exactly `approve` approves. Other input gets `Unknown choice` with the valid choices.
+Approval is deterministic: the extension captures the raw user message from Pi's `input` event (ignoring extension-sourced input), and the approval tools read that, never a model-authored argument. Only exactly `approve` approves, and one reply authorizes one approval. Other input gets `Unknown choice` with the valid choices. `/merro approve` remains the escape hatch.
 
-Worker settings (model, thinking, runtime) are snapshotted per Objective at plan approval and used at launch; config hot reload affects only future plans. `maxReviewRounds` still reads live config.
+Worker settings (model, thinking, runtime) are captured at plan proposal and the review-round limit is materialized at approval; both are persisted per Objective, so config hot reload affects only future plans. Concurrency, merge, notify and similar operational settings stay live.
 
 Worker-proposed issues carry a persisted, monotonic number so `/merro issue approve N` never shifts after a dismissal.
 
 ## Consequences
 
-`merro_start_objective` and approving `merro_resolve_decision` require `reply`. Schema version 22 adds `objective_settings.worker_settings_json`.
+Approval tools gain no new parameters; `registerMainTools` requires a user-approval source. Schema version 22 adds `objective_settings.worker_settings_json`.

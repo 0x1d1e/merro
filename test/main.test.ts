@@ -27,18 +27,19 @@ import { registerMainTools, type MainToolAPI } from "../src/tools/main.js";
 import { taskWindowName, WorkerRuntime, type OwnedWorker, type WorkerLaunchInput, type WorkerPresence } from "../src/runtime/worker-runtime.js";
 import type { TaskRuntimeRecord } from "../src/store/model.js";
 
+const approveSource = { latest: () => "approve" as string | undefined, consume() {} };
 const BASE_COMMIT = "b".repeat(40);
 
 async function approveProposal(tools: Map<string, Parameters<MainToolAPI["registerTool"]>[0]>, args: Record<string, unknown>) {
   const input = { change: "test-change", delivery: "separate", ...args };
   await tools.get("merro_propose_objective")!.execute("propose", input);
-  return tools.get("merro_start_objective")!.execute("approve", { ...input, reply: "approve" });
+  return tools.get("merro_start_objective")!.execute("approve", input);
 }
 
 test("first-worker walkthrough registers a Project, approves work and reaches a reviewed PR", async (t) => {
   const harness = await createHarness(t, { together: true, registerProjects: false, projects: [{ slug: "my-app", issueNumbers: [42] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const call = async (name: string, args: Record<string, unknown> = {}) => {
     const tool = tools.get(name);
     assert.ok(tool, `Missing tool: ${name}`);
@@ -54,7 +55,7 @@ test("first-worker walkthrough registers a Project, approves work and reaches a 
   assert.match(proposed.content[0]?.text ?? "", /Approve · edit · cancel/);
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
-  assert.match((await call("merro_start_objective", { reply: "approve" })).content[0]?.text ?? "", /Working: fix-42\./);
+  assert.match((await call("merro_start_objective", {})).content[0]?.text ?? "", /Working: fix-42\./);
   assert.equal(harness.launches.length, 1);
   assert.match(harness.launches[0]?.taskFile ?? "", /Issues: #42/);
   for (let pass = 0; pass < 3; pass++) await harness.main.runPass();
@@ -130,7 +131,7 @@ test("combined plan delivers three issues as one change, branch, worker flow and
   harness.issues.get("kinetix:100")!.body = "Dependency-safe removal. Requires #97.";
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   const visible: string[] = [];
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { visible.push(JSON.stringify(message)); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { visible.push(JSON.stringify(message)); } }, harness.main, approveSource);
   const proposed = await tools.get("merro_propose_objective")!.execute("plan", { goal: "Harden plugin lifecycle safety", change: "plugin-lifecycle-safety", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [96, 97, 100] }] });
   visible.push(JSON.stringify(proposed));
   assert.match(proposed.content[0]!.text, /1 change · 1 pull request/);
@@ -139,7 +140,7 @@ test("combined plan delivers three issues as one change, branch, worker flow and
   assert.deepEqual(proposalDetails.relations, []);
   assert.equal(proposalDetails.runnableImmediately, 1);
   assert.deepEqual(proposalDetails.plans.map(({ change, issues }) => ({ change, issues })), [{ change: "plugin-lifecycle-safety", issues: [96, 97, 100] }]);
-  visible.push(JSON.stringify(await tools.get("merro_start_objective")!.execute("approve", { reply: "approve" })));
+  visible.push(JSON.stringify(await tools.get("merro_start_objective")!.execute("approve", {})));
   assert.equal(harness.launches.length, 1);
   assert.deepEqual(harness.issueBatches, [{ projectSlug: "kinetix", numbers: [96, 97, 100] }]);
   assert.equal(harness.launches[0]!.clonePath, join(harness.workspacePath, ".wt", "kinetix", "plugin-lifecycle-safety"));
@@ -319,16 +320,16 @@ test("authoritative proposal and approval persist exactly the acceptance graph",
   harness.issues.get("example:4")!.body = 'This issue requires #2.\nUses the utility from #3.\nExample: requires #3.\n> requires #3\n`requires #3`\nNot requires #3.\nMay depend on #3.';
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
   const displayed: string[] = [];
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { displayed.push(message.content); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); }, sendMessage(message) { displayed.push(message.content); } }, harness.main, approveSource);
   const args = { goal: "acceptance", change: "acceptance", delivery: "separate", project_slugs: ["example"], issues: [{ project_slug: "example", numbers: [1, 2, 3, 4] }] };
-  await assert.rejects(tools.get("merro_start_objective")!.execute("no-proposal", { reply: "approve" }), /No pending plan/);
+  await assert.rejects(tools.get("merro_start_objective")!.execute("no-proposal", {}), /No pending plan/);
   const proposed = await tools.get("merro_propose_objective")!.execute("proposal", args);
   const proposal = proposed.details as { relations: Array<{ from: string; to: string }> };
   assert.deepEqual(proposal.relations.map((edge) => [edge.from, edge.to]), [["acceptance-2", "acceptance"], ["acceptance-4", "acceptance-2"]]);
   assert.ok(displayed[0]?.includes("Approve · edit · cancel"));
   assert.ok(!displayed[0]?.includes(":issue-"));
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
-  await tools.get("merro_start_objective")!.execute("approved", { reply: "approve" });
+  await tools.get("merro_start_objective")!.execute("approved", {});
   const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
   try { assert.equal(store.listRelations().length, proposal.relations.length); } finally { store.close(); }
   assert.deepEqual(harness.launches.map((input) => input.changeSetId).sort(), ["example:issue-1:g1", "example:issue-3:g1"]);
@@ -337,7 +338,7 @@ test("authoritative proposal and approval persist exactly the acceptance graph",
 test("named Objective displays and approves a cross-Project dependency graph", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "runtime", issueNumbers: [159] }, { slug: "reference", issueNumbers: [74, 98] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const result = await tools.get("merro_propose_objective")!.execute("proposal", {
     goal: "Coordinate plugin work",
     change_sets: [
@@ -351,7 +352,9 @@ test("named Objective displays and approves a cross-Project dependency graph", a
   assert.match(displayed, /plugin-runtime\n  runtime #159/);
   assert.match(displayed, /plugin-reference\n  reference #74/);
   assert.match(displayed, /plugin-conformance\n  reference #98\n  after plugin-reference/);
-  assert.match(displayed, /3 changes in \d stages · 3 pull requests/);
+  assert.match(displayed, /3 changes in 2 stages · 3 pull requests/);
+  assert.match(displayed, /Stage 1 · 2 changes\n\nplugin-runtime\n  runtime #159\n\nplugin-reference\n  reference #74\n\nStage 2 · 1 change\n\nplugin-conformance\n  reference #98\n  after plugin-reference/);
+  assert.doesNotMatch(displayed, /starts after stage/);
   assert.doesNotMatch(displayed, /Branch:/);
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
 
@@ -410,7 +413,7 @@ test("Markdown roadmap interpretation preserves grouping, order, statuses, depen
     { slug: "kinetix-plugins", issueNumbers: [201, 202] },
   ], maxConcurrentTasks: 3, result: () => null });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const input = {
     goal: "Implement the roadmap",
     delivery_mode: "pr",
@@ -494,7 +497,7 @@ test("Markdown roadmap interpretation preserves grouping, order, statuses, depen
   changedUnresolved.statement = "after interfaces are stable";
   const pending = await harness.main.proposeObjective(changedInput);
   await assert.rejects(harness.main.startObjective(changedContext, pending.id), /proposal changed or expired/);
-  await tools.get("merro_start_objective")!.execute("approve", { reply: "approve" });
+  await tools.get("merro_start_objective")!.execute("approve", {});
   await writeFile(join(harness.workspacePath, "ROADMAP.md"), "# Changed roadmap\n- Replace the plan with issue #999.\n");
   await harness.main.runPass();
   assert.ok(harness.launches.length >= 2);
@@ -522,7 +525,7 @@ test("Markdown roadmap interpretation preserves grouping, order, statuses, depen
 test("pasted Markdown tables work without a Project heading or Status column", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [159, 160, 105, 101, 103] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const proposed = await tools.get("merro_propose_objective")!.execute("pasted-table", {
     goal: "Implement the Kinetix roadmap",
     markdown: [
@@ -614,7 +617,7 @@ test("pasted Markdown tables work without a Project heading or Status column", a
 test("Markdown sequencing and issue cells fail closed when their meaning is unknown", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2, 159, 160] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const proposeMarkdown = tools.get("merro_propose_objective")!;
   const projectMap = [{ heading: "Kinetix", project_slug: "kinetix" }];
 
@@ -675,7 +678,7 @@ test("Markdown sequencing and issue cells fail closed when their meaning is unkn
 test("Markdown dependency wording fails closed and 'last' waits for all earlier workstreams", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2, 3] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const proposeMarkdown = tools.get("merro_propose_objective")!;
 
   const unknown = await proposeMarkdown.execute("unknown-dependency", {
@@ -728,7 +731,7 @@ test("Markdown dependency wording fails closed and 'last' waits for all earlier 
 test("Markdown dependency qualifiers and alternatives remain unresolved in Main proposals", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2, 3] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const propose = tools.get("merro_propose_objective")!;
   const cases = [
     {
@@ -772,7 +775,7 @@ test("Markdown dependency qualifiers and alternatives remain unresolved in Main 
 test("Markdown roadmaps without executable work return read-only context", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const propose = tools.get("merro_propose_objective")!;
   const approve = tools.get("merro_start_objective")!;
   const scenarios: Array<{ label: string; markdown: string; unresolved: Array<[string, string]> }> = [
@@ -825,7 +828,7 @@ test("Markdown roadmaps without executable work return read-only context", async
     if (scenario.label === "context-only") {
       assert.deepEqual(details.planning.items.map(({ status }) => status), ["Done", "Parked", "Future"]);
     }
-    await assert.rejects(approve.execute("approve", { reply: "approve" }), /No pending plan/);
+    await assert.rejects(approve.execute("approve", {}), /No pending plan/);
     const snapshot = await harness.main.statusSnapshot();
     assert.deepEqual(snapshot.objectives, [], scenario.label);
     assert.deepEqual(snapshot.changeSets, [], scenario.label);
@@ -835,7 +838,7 @@ test("Markdown roadmaps without executable work return read-only context", async
 test("Markdown unresolved dependencies stay visible in mixed context and executable proposals", async (t) => {
   const harness = await createHarness(t, { projects: [{ slug: "kinetix", issueNumbers: [1, 2] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const proposed = await tools.get("merro_propose_objective")!.execute("mixed-roadmap", {
     goal: "Plan provider and future consumer work",
     markdown: [
@@ -876,7 +879,7 @@ test("full Kinetix roadmaps enter through Markdown, retain typed structure, and 
   await writeFile(roadmapPath, fixture);
   const markdown = await readFile(roadmapPath, "utf8");
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
 
   const proposed = await tools.get("merro_propose_objective")!.execute("full-roadmap", {
     goal: "Kinetix + Kinetix Plugins roadmap",
@@ -964,7 +967,7 @@ test("full Kinetix roadmaps enter through Markdown, retain typed structure, and 
   assert.doesNotMatch(text, /\{:\s|Finish credential interchange.*ChangeSet/);
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
 
-  await tools.get("merro_start_objective")!.execute("approve", { reply: "approve" });
+  await tools.get("merro_start_objective")!.execute("approve", {});
   assert.equal(harness.launches.length, 15);
   assert.ok(harness.launches.every((launch) => !launch.taskFile.includes("Finish credential interchange")
     && !launch.taskFile.includes("Cline Free research") && !launch.taskFile.includes("after interfaces stabilize")
@@ -1115,7 +1118,7 @@ test("named proposal displays preserved external relations with semantic names",
   await harness.main.startObjective({ goal: "Existing relation", projectSlugs: ["example"],
     issues: [{ projectSlug: "example", numbers: [1, 2] }], delivery: "separate" });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
 
   const result = await tools.get("merro_propose_objective")!.execute("proposal", {
     goal: "Share existing work",
@@ -1259,6 +1262,7 @@ interface HarnessOptions {
 }
 
 interface MainHarness {
+  config: MerroConfig;
   workspacePath: string;
   main: MainOrchestrator;
   projects: Map<string, Project>;
@@ -1612,21 +1616,23 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
   };
 
   const Main = options.together ? MainOrchestrator : SeparateChangesMain;
+  // One shared object like production, where config reloads mutate it in place.
+  const config: MerroConfig = {
+    ...DEFAULT_CONFIG,
+    git: { defaultDelivery: "pr" }, // This harness tests explicitly requested PR delivery.
+    sandbox: options.realWorkerPlan ? "docker" : "none",
+    maxConcurrentTasks: options.maxConcurrentTasks ?? 3,
+    notifyCommand: options.notifyCommand ?? null,
+    merge: { ...DEFAULT_CONFIG.merge, ...options.mergeConfig },
+    issues: { create: options.issuesCreate ?? DEFAULT_CONFIG.issues.create },
+    workers: {
+      implementer: { runtime: "pi", model: options.workerModels?.implement ?? null, thinking: options.workerThinking?.implement ?? null },
+      reviewer: { runtime: "pi", model: options.workerModels?.review ?? null, thinking: options.workerThinking?.review ?? null },
+    },
+  };
   const createMain = () => new Main({
     workspacePath,
-    config: {
-      ...DEFAULT_CONFIG,
-      git: { defaultDelivery: "pr" }, // This harness tests explicitly requested PR delivery.
-      sandbox: options.realWorkerPlan ? "docker" : "none",
-      maxConcurrentTasks: options.maxConcurrentTasks ?? 3,
-      notifyCommand: options.notifyCommand ?? null,
-      merge: { ...DEFAULT_CONFIG.merge, ...options.mergeConfig },
-      issues: { create: options.issuesCreate ?? DEFAULT_CONFIG.issues.create },
-      workers: {
-        implementer: { runtime: "pi", model: options.workerModels?.implement ?? null, thinking: options.workerThinking?.implement ?? null },
-        reviewer: { runtime: "pi", model: options.workerModels?.review ?? null, thinking: options.workerThinking?.review ?? null },
-      },
-    },
+    config,
     ...(options.commands ? { commands: options.commands } : {}),
     notify: (message) => { notifications.push(message); },
     progress: (message) => { progressMessages.push(message); },
@@ -1657,6 +1663,7 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
     deletedClones,
     cleanupCalls,
     restartMain: createMain,
+    config,
     branchPolicyBranches,
     setProjectState(projectSlug, update) {
       const current = projects.get(projectSlug);
@@ -1922,7 +1929,7 @@ test("approved label and milestone scope survives restart and discovers matching
   const original = harness.issues.get("example:7")!;
   harness.issues.set("example:7", { ...original, milestone: "v1" } as GitHubIssue);
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   await approveProposal(tools, {
     goal: "Ship all v1 features", project_slugs: ["example"],
     issues: [{ project_slug: "example", query: { labels: ["feature"], milestone: "v1" } }],
@@ -2815,7 +2822,7 @@ test("query scope failures keep a satisfied Objective Active until a fresh check
   let fail = false;
   const harness = await createHarness(t, { scopeFailure: () => fail });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   // The approval check finds work; the next check fails after all attached work becomes satisfied.
   await approveProposal(tools, {
     goal: "Ship features", project_slugs: ["example"],
@@ -2928,7 +2935,7 @@ for (const missingProject of ["api", "web"]) {
   test(`Objective approval rejects a missing ${missingProject} scope before persisting or scheduling`, async (t) => {
     const harness = await createHarness(t, { projects: [{ slug: "api", issueNumbers: [7] }, { slug: "web", issueNumbers: [8] }] });
     const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-    registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+    registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
     const approve = tools.get("merro_propose_objective");
     assert.ok(approve);
     await assert.rejects(approve.execute("approve", {
@@ -3141,6 +3148,9 @@ test("GitHub connection outage explains automatic recovery without replacing the
   assert.ok(messages.some((message) => /temporarily unavailable/.test(message)));
   assert.ok(messages.some((message) => /retry automatically/.test(message)));
   assert.doesNotMatch(messages.join("\n"), /merro-continue/);
+  const waitingDetails = formatChangeDetails((await harness.main.changeDetails(blocked.slug))!);
+  assert.match(waitingDetails, /Waiting/);
+  assert.match(waitingDetails, /error connecting to api\.github\.com/);
 
   unavailable = false;
   await harness.main.runPass();
@@ -3960,7 +3970,7 @@ test("Main tool exposes merge_conflict resolution", async (t) => {
   assert.ok(decision);
 
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   const resolve = tools.get("merro_resolve_decision");
   assert.ok(resolve);
   const result = await resolve.execute("call", { change: (await harness.main.statusSnapshot()).changeSets[0]!.slug, approved: false });
@@ -4883,7 +4893,7 @@ test("Worker-discovered dependencies become an approval-gated Objective before c
     },
   });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   await harness.main.startObjective({
     goal: "Implement the app change",
     projectSlugs: ["app"],
@@ -4909,10 +4919,10 @@ test("Worker-discovered dependencies become an approval-gated Objective before c
   const recoveredMain = harness.restartMain();
   await recoveredMain.runPass();
   assert.equal(harness.launches.length, 1, "Main restart must preserve the discovery gate without starting work");
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, recoveredMain);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, recoveredMain, approveSource);
   const approve = tools.get("merro_start_objective");
   assert.ok(approve);
-  assert.match((await approve.execute("approve", { reply: "approve" })).content[0]?.text ?? "", /Working:/);
+  assert.match((await approve.execute("approve", {})).content[0]?.text ?? "", /Working:/);
   assert.equal(harness.launches.at(-1)?.project.slug, "api");
 
   const afterApproval = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
@@ -5642,19 +5652,28 @@ test("an external merge completes the ChangeSet and resolves its pending merge D
   }
 });
 
-test("approval is deterministic: only the exact word approves, typos are refused", async (t) => {
+test("approval reads the raw user message, never a model-authored argument", async (t) => {
   const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [42] }] });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  let raw: string | undefined = "approvve";
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, { latest: () => raw, consume() { raw = undefined; } });
   await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
-  const start = (reply: string) => tools.get("merro_start_objective")!.execute("s", { reply });
-  assert.equal((await start("approvve")).content[0]?.text, "Unknown choice: approvve\nChoose: approve · edit · cancel");
-  assert.match((await start("cancel")).content[0]?.text ?? "", /Nothing was started/);
-  assert.match((await start("edit")).content[0]?.text ?? "", /what to change/);
+  // A model passing a "corrected" reply cannot change what the user actually typed.
+  const start = () => tools.get("merro_start_objective")!.execute("s", { reply: "approve" });
+  assert.equal((await start()).content[0]?.text, "Unknown choice: approvve\nChoose: approve · edit · cancel");
+  raw = "cancel";
+  assert.match((await start()).content[0]?.text ?? "", /Nothing was started/);
+  raw = "edit";
+  assert.match((await start()).content[0]?.text ?? "", /what to change/);
+  raw = undefined;
+  assert.match((await start()).content[0]?.text ?? "", /Unknown choice: \(empty\)/);
   await harness.main.runPass();
   assert.equal(harness.launches.length, 0);
-  assert.equal((await tools.get("merro_resolve_decision")!.execute("r", { approved: true, reply: "aprove" })).content[0]?.text, "Unknown choice: aprove\nChoose: approve · edit · cancel");
-  assert.match((await start("approve")).content[0]?.text ?? "", /Working/);
+  raw = "aprove";
+  assert.equal((await tools.get("merro_resolve_decision")!.execute("r", { approved: true })).content[0]?.text, "Unknown choice: aprove\nChoose: approve · edit · cancel");
+  raw = "approve";
+  assert.match((await start()).content[0]?.text ?? "", /Working/);
+  assert.equal(raw, undefined, "one reply authorizes one approval");
   assert.equal(harness.launches.length, 1);
 });
 
@@ -5665,7 +5684,7 @@ test("approved worker settings are snapshotted and used at launch", async (t) =>
     workerModels: { implement: "anthropic/claude-sonnet-4", review: "openai/gpt-4.1" },
   });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
   await approveProposal(tools, { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
   await harness.main.runPass();
   assert.equal(harness.launches[0]?.workerSettings?.implement.model, "anthropic/claude-sonnet-4");
@@ -5709,4 +5728,26 @@ test("issue proposal numbers stay stable after an earlier proposal is dismissed"
   await assert.rejects(harness.main.resolveIssueProposal(1, true), /No proposed issue 1/);
   assert.match(await harness.main.resolveIssueProposal(2, true), /Created example #/);
   assert.equal(harness.createdIssues[0]?.title, "Second");
+});
+
+test("hot-reloaded config never changes approved work, even across a Main restart", async (t) => {
+  const harness = await createHarness(t, {
+    together: true,
+    projects: [{ slug: "kinetix", issueNumbers: [42] }],
+    workerModels: { implement: "model/a", review: "model/a-review" },
+    result: () => null,
+  });
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main, approveSource);
+  harness.config.maxReviewRounds = 3;
+  await approveProposal(tools, { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  // Hot reload between approval and launch, then restart Main.
+  harness.config.workers = { implementer: { runtime: "pi", model: "model/b", thinking: null }, reviewer: { runtime: "pi", model: "model/b-review", thinking: null } };
+  harness.config.maxReviewRounds = 1;
+  await harness.restartMain().runPass();
+  assert.equal(harness.launches[0]?.workerSettings?.implement.model, "model/a");
+  assert.equal(harness.launches[0]?.workerSettings?.review.model, "model/a-review");
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.equal(store.listObjectives()[0]?.maxReviewRounds, 3); }
+  finally { store.close(); }
 });
