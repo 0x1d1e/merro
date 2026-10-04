@@ -2107,6 +2107,11 @@ test("incomplete v11 Objective scopes remain readable and reconcile after upgrad
     { projectSlug: "api", query: { labels: ["feature"] } }, { projectSlug: "web", numbers: [8] },
   ]);
   await restarted.runPass();
+  // v11 recorded no worker settings or review limit, so the upgraded work asks before starting.
+  assert.equal(harness.launches.length, 0);
+  assert.deepEqual((await restarted.publicSnapshot()).changes.map((change) => change.reason), ["worker settings", "worker settings"]);
+  await restarted.resolveDecisionForChange((await restarted.publicSnapshot()).changes[0]!.name, true);
+  await restarted.runPass();
   assert.deepEqual(harness.launches.map((launch) => launch.changeSetId).sort(), ["api:issue-7:g1", "web:issue-8:g1"]);
   assert.equal((await restarted.statusSnapshot()).changeSets.some((item) => item.issues.some((issue) => issue.number === 9)), false);
 });
@@ -3475,6 +3480,8 @@ test("local ChangeSet launches without querying an issue", async (t) => {
     store.createObjective({ id: "local-goal", goal: "Add local feature", projectSlugs: ["example"], priority: "normal", state: "Active" });
     store.createChangeSet({ id: "example:local:feature:g1", projectSlug: "example", slug: "feature", issues: [], generation: 1, state: "Ready", priority: "normal", readySince: new Date().toISOString(), blockedReason: null, blockedResumeState: null, guidance: "Implement local feature" });
     store.attachChangeSet("local-goal", "example:local:feature:g1");
+    store.saveObjectiveSettings("local-goal", { maxReviewRounds: 3 });
+    store.saveObjectiveWorkerSettings("local-goal", { implement: harness.config.workers.implementer, review: harness.config.workers.reviewer });
   } finally { store.close(); }
   await harness.main.runPass();
   assert.equal(harness.launches.length, 1);
@@ -5835,7 +5842,7 @@ test("new work for an Objective approved without recorded worker settings waits 
   const waiting = (await main.publicSnapshot()).changes.filter((change) => change.status === "Needs you");
   assert.deepEqual(waiting.map((change) => change.reason), ["worker settings", "worker settings"]);
   assert.ok(harness.notifications.some((message) => message.includes("add-export · Needs you")
-    && message.includes("Start its new work with implementer pi model/b, reviewer pi model/b-review (high thinking)?")
+    && message.includes("Start its work with implementer pi model/b, reviewer pi model/b-review (high thinking), up to 3 review rounds?")
     && message.includes("Approve: /merro approve add-export · Skip: /merro stop features")), harness.notifications.join("\n---\n"));
   await assert.rejects(main.resolveDecisionForChange("add-export", false), /Skip: \/merro stop features/);
 
@@ -5848,6 +5855,67 @@ test("new work for an Objective approved without recorded worker settings waits 
   const launched = harness.launches.slice(launchedBefore);
   assert.deepEqual(launched.map((launch) => launch.changeSetId).sort(), ["example:issue-7:g2", "example:issue-9:g1"]);
   assert.deepEqual([...new Set(launched.map((launch) => launch.workerSettings?.review.model))], ["model/b-review"]);
+});
+
+/** Simulates state approved before Merro snapshotted settings: no worker or review-round snapshot anywhere. */
+function forgetApprovedSettings(workspacePath: string, reviewRounds = true): void {
+  const database = new DatabaseSync(join(workspacePath, ".merro", "state.db"));
+  try { database.exec(`UPDATE objective_settings SET worker_settings_json = NULL${reviewRounds ? ", max_review_rounds = NULL" : ""}; DELETE FROM change_set_worker_settings;`); }
+  finally { database.close(); }
+}
+
+test("work approved before settings snapshots waits for settings and a review limit, and an approval records both", async (t) => {
+  const harness = await createHarness(t, { workerModels: { implement: "model/a", review: "model/a-review" } });
+  const { objective } = await harness.main.startObjective({ goal: "Legacy", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+  forgetApprovedSettings(harness.workspacePath);
+  harness.config.workers = { implementer: { runtime: "pi", model: "model/b", thinking: null }, reviewer: { runtime: "pi", model: "model/b-review", thinking: null } };
+  harness.config.maxReviewRounds = 5;
+  const main = harness.restartMain();
+  await main.runPass();
+  await main.runPass();
+  assert.equal(harness.launches.length, 0);
+  assert.deepEqual((await main.publicSnapshot()).changes.map((change) => change.reason), ["worker settings"]);
+  assert.equal(harness.notifications.filter((message) => message.includes("up to 5 review rounds?")).length, 1, harness.notifications.join("\n---\n"));
+  harness.config.maxReviewRounds = 2;
+  harness.config.workers.implementer.model = "model/c";
+  assert.equal(await main.resolveDecisionForChange("issue-7-for-example", true), "Approved worker settings for issue-7-for-example.");
+  await main.runPass();
+  assert.deepEqual(harness.launches.map((launch) => launch.workerSettings?.implement.model), ["model/b"]);
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { assert.equal(store.getObjective(objective.id)?.maxReviewRounds, 5); } finally { store.close(); }
+});
+
+test("a settings request ends when another owner supplies settings, and moves to the remaining owner when its Objective stops", async (t) => {
+  for (const scenario of ["supplied", "stopped"] as const) {
+    await t.test(scenario, async (t) => {
+      const harness = await createHarness(t, { workerModels: { implement: "model/a", review: "model/a-review" } });
+      const first = await harness.main.startObjective({ goal: "First owner", priority: "high", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+      if (scenario === "stopped") await harness.main.startObjective({ goal: "Second owner", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+      forgetApprovedSettings(harness.workspacePath, scenario === "stopped");
+      harness.config.workers = { implementer: { runtime: "pi", model: "model/b", thinking: null }, reviewer: { runtime: "pi", model: "model/b-review", thinking: null } };
+      const main = harness.restartMain();
+      await main.runPass();
+      assert.equal(harness.launches.length, 0);
+      assert.ok(harness.notifications.at(-1)?.includes("Skip: /merro stop first-owner"), harness.notifications.at(-1));
+      if (scenario === "supplied") {
+        // A newer Objective approved with recorded settings takes in the same change; its settings answer the request.
+        await main.startObjective({ goal: "Second owner", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+        await assert.rejects(main.resolveDecisionForChange("issue-7-for-example", true), /no longer needs settings approval|No pending decision/);
+        await main.runPass();
+        assert.equal((await main.statusSnapshot()).decisions.filter((decision) => decision.kind === "worker_settings").length, 0);
+        assert.deepEqual(harness.launches.map((launch) => launch.workerSettings?.implement.model), ["model/b"]);
+        return;
+      }
+      assert.equal(await main.stopObjectives(first.objective.id), 1);
+      const pending = (await main.statusSnapshot()).decisions.filter((decision) => decision.kind === "worker_settings");
+      assert.deepEqual(pending.map((decision) => (decision.payload as { objective: string }).objective), ["second-owner"]);
+      assert.ok(harness.notifications.at(-1)?.includes("Skip: /merro stop second-owner"), harness.notifications.at(-1));
+      assert.equal(harness.launches.length, 0);
+      await main.resolveDecisionForChange("issue-7-for-example", true);
+      await main.runPass();
+      assert.deepEqual(harness.launches.map((launch) => launch.workerSettings?.implement.model), ["model/b"]);
+    });
+  }
 });
 
 test("/merro approve approves the pending plan it names, and asks when a merge decision also waits", async (t) => {
@@ -5868,19 +5936,19 @@ test("/merro approve approves the pending plan it names, and asks when a merge d
 
   await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #43", change: "fix-43", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [43] }] });
   await run("approve");
-  assert.equal(messages.pop(), "A plan and a merge decision are both waiting. Use /merro approve plan or /merro approve merge <change>.");
+  assert.equal(messages.pop(), "A plan and a decision are both waiting. Use /merro approve plan or /merro approve decision <change>.");
   assert.deepEqual(harness.mergeCalls, []);
   await run("approve fix-43");
   assert.equal(messages.pop(), "Working: fix-43.");
-  // A plan whose goal and change both name the change awaiting merge needs the plan/merge qualifier, and the suggestion works.
+  // A plan whose goal and change both name the change awaiting merge needs the plan/decision qualifier, and the suggestion works.
   await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
   await run("approve fix-42");
-  assert.equal(messages.pop(), "The pending plan and a merge decision both name fix-42. Use /merro approve plan fix-42 or /merro approve merge fix-42.");
+  assert.equal(messages.pop(), "The pending plan and a decision both name fix-42. Use /merro approve plan fix-42 or /merro approve decision fix-42.");
   assert.deepEqual(harness.mergeCalls, []);
   await run("approve plan fix-42");
   assert.equal(messages.pop(), "Working: fix-42.");
   assert.deepEqual(harness.mergeCalls, []);
-  await run("approve merge fix-42");
+  await run("approve decision fix-42");
   assert.equal(harness.mergeCalls.length, 1);
 });
 
@@ -5908,6 +5976,12 @@ test("a user's approve survives a wrong change name but is spent once an approva
   await call("merro_resolve_decision", { change: "fix-42", approved: true });
   assert.equal(harness.mergeCalls.length, 1);
   assert.match(await call("merro_resolve_decision", { change: "fix-42", approved: true }), /^Unknown choice: \(empty\)/);
+
+  // Parallel tool calls cannot share one reply: the first claims it before awaiting.
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42 again", change: "fix-42-again", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  await say();
+  const parallel = await Promise.all([call("merro_start_objective", {}), call("merro_start_objective", {})]);
+  assert.equal(parallel.filter((text) => text.startsWith("Unknown choice")).length, 1, parallel.join(" | "));
 });
 
 test("the review-round limit is read when the plan is approved, not when it is proposed", async (t) => {

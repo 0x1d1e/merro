@@ -1,5 +1,5 @@
 import { changeName, issueNumbers } from "../domain/names.js";
-import type { BlockReason, ChangeSet, Task } from "../domain/model.js";
+import type { BlockReason, ChangeSet, ReviewRoundLimit, Task } from "../domain/model.js";
 import type { MerroStore } from "../store/store.js";
 import type { WorkerRoleSettings, WorkerSettings } from "../config.js";
 import { currentlyReviewedIds } from "./reviewed.js";
@@ -121,6 +121,10 @@ export function workerSettingsText(settings: WorkerSettings): string {
   return `${workerRoleText("implementer", settings.implement)}, ${workerRoleText("reviewer", settings.review)}`;
 }
 
+export function reviewRoundsText(limit: ReviewRoundLimit): string {
+  return limit === "unlimited" ? "unlimited review rounds" : `up to ${limit} review round${limit === 1 ? "" : "s"}`;
+}
+
 type PublicStatus = { status: UserChangeState; reason: string | null; owner: Owner; waitingFor: WaitingFor | null };
 
 function publicStatus(
@@ -187,9 +191,10 @@ export function presentWorkspace(store: MerroStore, options: PresentationOptions
     const action = decision.kind === "merge_conflict" ? "approve_fresh_attempt"
       : decision.kind === "worker_settings" ? "approve_worker_settings"
       : decision.kind === "local_merge" ? "approve_local_merge" : "approve_merge";
-    const settings = action === "approve_worker_settings" ? workerSettingsText(payload.settings as WorkerSettings) : null;
+    const settings = action === "approve_worker_settings"
+      ? `${workerSettingsText(payload.settings as WorkerSettings)}${payload.maxReviewRounds ? `, ${reviewRoundsText(payload.maxReviewRounds as ReviewRoundLimit)}` : ""}` : null;
     const summary = action === "approve_fresh_attempt" ? "Approve a fresh attempt to resolve merge conflicts?"
-      : settings ? `${String(payload.objective)} was approved before Merro recorded worker settings. Start with ${settings}?`
+      : settings ? `${String(payload.objective)} was approved before Merro recorded its worker settings. Start with ${settings}?`
       : action === "approve_local_merge" ? "Approve local merge?" : "Approve merge?";
     const objective = typeof payload.objective === "string" ? payload.objective : null;
     return { change: item ? changeName(item) : "change", action, pr, summary, objective };

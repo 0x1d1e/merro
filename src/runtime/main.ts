@@ -3,7 +3,7 @@ import { lstat, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { validateDirectory, type MerroConfig, type WorkerSettings } from "../config.js";
-import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate, type RequiresGate } from "../domain/model.js";
+import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate, type RequiresGate, type ReviewRoundLimit } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../domain/relations.js";
@@ -20,7 +20,7 @@ import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { requireWorkspace } from "./workspace.js";
 import { currentlyReviewedIds } from "./reviewed.js";
-import { formatChecks, objectiveName, presentChangeDetails, presentWorkspace, publicText, workerName, workerSettingsText } from "./presentation.js";
+import { formatChecks, objectiveName, presentChangeDetails, presentWorkspace, publicText, workerName, reviewRoundsText, workerSettingsText } from "./presentation.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
@@ -1016,10 +1016,10 @@ export class MainOrchestrator {
    * `/merro approve`: the typed command is itself the user's approval, so it approves the pending plan it names (or
    * the only thing waiting) and otherwise resolves a merge Decision.
    */
-  /** `/merro approve [plan|merge] [name]`; the qualifier is needed only when the plan and a merge Decision could both match. */
+  /** `/merro approve [plan|decision] [name]`; the qualifier is needed only when the plan and a pending Decision could both match. */
   async approvePending(target?: string): Promise<string> {
     const [first, ...rest] = target?.trim().split(/\s+/) ?? [];
-    const kind = first === "plan" || first === "merge" ? first : undefined;
+    const kind = first === "plan" || first === "decision" ? first : undefined;
     const requested = (kind ? rest.join(" ") : target?.trim()) || undefined;
     if (kind === "plan" || (!kind && this.#pendingPlanAccepts(requested))) {
       const decisionAlsoMatches = !kind && await this.#withStore((store) => store.pendingDecisions().some((decision) => {
@@ -1028,8 +1028,8 @@ export class MainOrchestrator {
       }));
       if (decisionAlsoMatches) {
         throw new Error(requested
-          ? `The pending plan and a merge decision both name ${semanticSlug(requested)}. Use /merro approve plan ${semanticSlug(requested)} or /merro approve merge ${semanticSlug(requested)}.`
-          : "A plan and a merge decision are both waiting. Use /merro approve plan or /merro approve merge <change>.");
+          ? `The pending plan and a decision both name ${semanticSlug(requested)}. Use /merro approve plan ${semanticSlug(requested)} or /merro approve decision ${semanticSlug(requested)}.`
+          : "A plan and a decision are both waiting. Use /merro approve plan or /merro approve decision <change>.");
       }
       const started = await this.approveObjective(requested);
       await this.runPass();
@@ -1554,6 +1554,7 @@ export class MainOrchestrator {
         const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds, issueCache);
         for (const id of scopeGates) relationGates.add(id);
         for (const id of discoveredGates) relationGates.add(id);
+        this.#settleSettingsDecisions(store);
         for (const decision of store.pendingDecisions()) {
           if (decision.kind === "worker_settings") relationGates.add(decision.subjectId);
         }
@@ -1581,6 +1582,8 @@ export class MainOrchestrator {
         });
         if (result.cycle) this.#blockCycle(store, result.cycle, new Set([...active.map((task) => task.changeSetId), ...orphans.changeSetIds]));
         for (const item of result.selected) {
+          const settingsOwner = this.#ownerNeedingSettings(store, item);
+          if (settingsOwner) { this.#askSettings(store, settingsOwner, item); continue; }
           if (item.state === "Ready") store.transitionChangeSet(item.id, "Implementing");
           await this.#launchTask(store, store.getChangeSet(item.id) ?? item, issueCache);
         }
@@ -2007,7 +2010,6 @@ export class MainOrchestrator {
     // A reopened issue continues the change it reopened, so it keeps that change's approved worker settings.
     const settings = store.changeSetWorkerSettings(previous.id) ?? store.objectiveWorkerSettings(owners[0]!.id);
     if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
-    else this.#askWorkerSettings(store, owners[0]!, item);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = "OPEN";
     store.saveChangeSetRuntime(runtime);
@@ -3241,29 +3243,75 @@ export class MainOrchestrator {
     this.#progress(`${changeName(item)} · The pull request's base changed; Merro is rechecking the changes.`);
   }
 
-  /**
-   * Objectives approved before Merro recorded worker settings (schema 22) have no snapshot to give new work.
-   * Live config was never approved for them, so new work waits until the user approves the settings it would use.
-   */
-  #askWorkerSettings(store: MerroStore, objective: Objective, item: ChangeSet): void {
-    const settings: WorkerSettings = { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
-    const objectiveSlug = objectiveName(objective.goal);
-    store.createDecision({ id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "worker_settings", payload: { objectiveId: objective.id, objective: objectiveSlug, settings } });
-    this.#notify(`${changeName(item)} · Needs you\n\n${objectiveSlug} was approved before Merro recorded worker settings. Start its new work with ${workerSettingsText(settings)}?\nApprove: /merro approve ${changeName(item)} · Skip: /merro stop ${objectiveSlug}`, "warning");
+  /** Active Objectives whose approved scope includes the ChangeSet, highest priority first. */
+  #activeOwners(store: MerroStore, item: ChangeSet): Objective[] {
+    return store.listObjectives()
+      .filter((objective) => objective.state === "Active" && store.listChangeSets(objective.id, true).some((owned) => owned.id === item.id))
+      .sort((left, right) => priorityRank(left.priority) - priorityRank(right.priority));
   }
 
-  /** Approving the settings for one change records them for its Objective, so its other waiting changes start too. */
+  /**
+   * Work approved before Merro snapshotted settings (schema 22 and earlier) has none, and live config was never approved for it.
+   * The ChangeSet takes an owner's worker snapshot when one exists; otherwise the returned owner must approve settings
+   * before another worker starts. An owner without a review-round snapshot needs the same approval.
+   */
+  #ownerNeedingSettings(store: MerroStore, item: ChangeSet): Objective | null {
+    const owners = this.#activeOwners(store, item);
+    if (!store.changeSetWorkerSettings(item.id)) {
+      const snapshot = owners.map((owner) => store.objectiveWorkerSettings(owner.id)).find((settings) => settings !== null);
+      if (snapshot) store.claimChangeSetWorkerSettings(item.id, snapshot);
+    }
+    return owners.find((owner) => owner.maxReviewRounds === null || owner.maxReviewRounds === undefined)
+      ?? (store.changeSetWorkerSettings(item.id) ? null : owners[0] ?? null);
+  }
+
+  /** Settings requests end once their Objective no longer needs to answer them: settings arrived another way, it stopped, or the change finished. */
+  #settleSettingsDecisions(store: MerroStore): void {
+    for (const decision of store.pendingDecisions()) {
+      if (decision.kind !== "worker_settings") continue;
+      const item = store.getChangeSet(decision.subjectId);
+      const owner = item && !terminal(item) ? this.#ownerNeedingSettings(store, item) : null;
+      const asked = decision.payload as { objectiveId?: string; settings?: WorkerSettings };
+      const current = item && store.changeSetWorkerSettings(item.id);
+      // A request whose change gained other settings would approve settings the change will not use; ask again.
+      const outdated = current && JSON.stringify(current) !== JSON.stringify(asked.settings);
+      if (owner?.id !== asked.objectiveId || outdated) store.resolveDecision(decision.id, "resolved");
+    }
+  }
+
+  #askSettings(store: MerroStore, objective: Objective, item: ChangeSet): void {
+    if (store.pendingDecisions().some((decision) => decision.kind === "worker_settings" && decision.subjectId === item.id)) return;
+    const settings: WorkerSettings = store.changeSetWorkerSettings(item.id) ?? store.objectiveWorkerSettings(objective.id)
+      ?? { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
+    const maxReviewRounds = objective.maxReviewRounds ?? this.#config.maxReviewRounds;
+    const objectiveSlug = objectiveName(objective.goal);
+    // One notification per Objective: approving any of its changes answers for all of them.
+    const alreadyAsked = store.pendingDecisions().some((decision) => decision.kind === "worker_settings"
+      && (decision.payload as { objectiveId?: string }).objectiveId === objective.id);
+    store.createDecision({
+      id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "worker_settings",
+      payload: { objectiveId: objective.id, objective: objectiveSlug, settings, maxReviewRounds },
+    });
+    if (!alreadyAsked) this.#notify(`${changeName(item)} · Needs you\n\n${objectiveSlug} was approved before Merro recorded its worker settings. Start its work with ${workerSettingsText(settings)}, ${reviewRoundsText(maxReviewRounds)}?\nApprove: /merro approve ${changeName(item)} · Skip: /merro stop ${objectiveSlug}`, "warning");
+  }
+
+  /** Approving settings for one change records them for its Objective, so its other waiting changes start too. */
   async #resolveWorkerSettingsDecision(decisionId: string): Promise<void> {
     await this.#withStore((store) => {
+      this.#settleSettingsDecisions(store);
       const decision = store.getDecision(decisionId);
-      if (decision?.state !== "pending" || decision.kind !== "worker_settings") throw new Error(`pending worker settings Decision not found: ${decisionId}`);
-      const { objectiveId, settings } = decision.payload as { objectiveId: string; settings: WorkerSettings };
-      if (!store.objectiveWorkerSettings(objectiveId)) store.saveObjectiveWorkerSettings(objectiveId, settings);
-      for (const pending of store.pendingDecisions()) {
-        if (pending.kind !== "worker_settings" || (pending.payload as { objectiveId?: string }).objectiveId !== objectiveId) continue;
-        store.claimChangeSetWorkerSettings(pending.subjectId, settings);
-        store.resolveDecision(pending.id, "approved");
+      const item = decision && store.getChangeSet(decision.subjectId);
+      if (decision?.state !== "pending" || decision.kind !== "worker_settings") {
+        throw new Error(`${item ? changeName(item) : "This change"} no longer needs settings approval; nothing changed.`);
       }
+      const { objectiveId, settings, maxReviewRounds } = decision.payload as { objectiveId: string; settings: WorkerSettings; maxReviewRounds?: ReviewRoundLimit };
+      store.resolveDecision(decision.id, "approved");
+      if (!store.objectiveWorkerSettings(objectiveId)) store.saveObjectiveWorkerSettings(objectiveId, settings);
+      const objective = store.getObjective(objectiveId);
+      if (objective && (objective.maxReviewRounds === null || objective.maxReviewRounds === undefined)) {
+        store.saveObjectiveSettings(objectiveId, { maxReviewRounds: maxReviewRounds ?? this.#config.maxReviewRounds });
+      }
+      this.#settleSettingsDecisions(store);
     });
   }
 
@@ -3286,7 +3334,6 @@ export class MainOrchestrator {
     store.createChangeSet(item);
     store.attachChangeSet(objective.id, item.id);
     if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
-    else this.#askWorkerSettings(store, objective, item);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = issue.state.toUpperCase();
     store.saveChangeSetRuntime(runtime);
