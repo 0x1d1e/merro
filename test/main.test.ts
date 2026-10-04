@@ -5463,6 +5463,37 @@ test("completion hooks can query Main and finish before publication begins", asy
   assert.deepEqual(events, ["implementation_complete", "review_complete", "merge_ready"]);
 });
 
+test("notifyCommand hooks still receive blocks that show as Waiting, without a permanent notification", async (t) => {
+  for (const kind of ["blocked", "publication_blocked"] as const) {
+    await t.test(kind, async (t) => {
+      const hookEvents: Array<{ event: string; message: string }> = [];
+      let failContentSync = false;
+      const harness = await createHarness(t, {
+        notifyCommand: "notify-test",
+        commands: { async run(_file, _args, options) { hookEvents.push({ event: options?.env?.MERRO_EVENT ?? "missing", message: options?.env?.MERRO_MESSAGE ?? "" }); return { stdout: "", stderr: "" }; } },
+        publicationFailure: () => kind === "publication_blocked" ? new Error("error connecting to api.github.com") : null,
+        pullRequestContentFailure: () => failContentSync,
+      });
+      await startDefaultObjective(harness.main);
+      for (let pass = 0; pass < 3; pass++) await harness.main.runPass();
+      if (kind === "blocked") {
+        const [number] = [...harness.pullRequests.keys()];
+        assert.ok(number);
+        harness.setPullRequest(number, { body: "## Summary\n\nUser edited this body." });
+        failContentSync = true;
+      }
+      for (let pass = 0; pass < 2; pass++) await harness.main.runPass();
+      const item = (await harness.main.statusSnapshot()).changeSets[0]!;
+      assert.equal(item.blockedReason, "github_unavailable");
+      assert.equal((await harness.main.publicSnapshot()).changes[0]?.status, "Waiting");
+      assert.deepEqual(harness.notifications.filter((message) => / · Blocked/.test(message)), []);
+      const delivered = hookEvents.filter((entry) => entry.event === kind);
+      assert.equal(delivered.length, 1, JSON.stringify(hookEvents));
+      assert.match(delivered[0]!.message, /^issue-7-for-example · Waiting · /);
+    });
+  }
+});
+
 test("publication failure preserves completed work and continues publishing after restart", async (t) => {
   let failure: Error | null = new Error("Remote branch diverged; reconcile the branch without force-pushing");
   const harness = await createHarness(t, {
@@ -5932,6 +5963,16 @@ test("a review running across the settings upgrade uses only the review limit th
   }
 });
 
+test("an unverifiable worker's inspect hint names the session it was started in after tmux.session changes", async (t) => {
+  const harness = await createHarness(t, { result: () => null, inspect: async () => ({ alive: true, identityMatches: false, reason: "foreign pane" }) });
+  await startDefaultObjective(harness.main);
+  await harness.main.runPass();
+  harness.config.tmux.session = "renamed";
+  await harness.main.runPass();
+  const warning = harness.notifications.find((message) => message.includes("cannot verify as its own"));
+  assert.ok(warning?.includes("Inspect: tmux list-panes -t =merro-example\n"), warning);
+});
+
 test("a user action on one change does not repeat warnings already shown for other changes", async (t) => {
   for (const action of ["approve", "retry", "restart"] as const) {
     await t.test(action, async (t) => {
@@ -5966,6 +6007,22 @@ test("a user action on one change does not repeat warnings already shown for oth
       assert.equal(warnings(), 1, harness.notifications.join("\n---\n"));
     });
   }
+});
+
+test("a settings request raised again after an earlier one settled notifies again", async (t) => {
+  const harness = await createHarness(t);
+  await harness.main.startObjective({ goal: "Legacy", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+  forgetApprovedSettings(harness.workspacePath);
+  const main = harness.restartMain();
+  await main.runPass();
+  const asked = () => harness.notifications.filter((message) => message.startsWith("issue-7-for-example · Needs you")).length;
+  assert.equal(asked(), 1);
+  // The request settles without any message in between, then the change still needs settings.
+  const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+  try { for (const decision of store.pendingDecisions()) store.resolveDecision(decision.id, "resolved"); } finally { store.close(); }
+  await main.runPass();
+  assert.equal((await main.statusSnapshot()).decisions.filter((decision) => decision.kind === "worker_settings" && decision.state === "pending").length, 1);
+  assert.equal(asked(), 2, harness.notifications.join("\n---\n"));
 });
 
 test("a settings request ends when another owner supplies settings, and moves to the remaining owner when its Objective stops", async (t) => {
@@ -6065,6 +6122,24 @@ test("a user's approve survives a wrong change name but is spent once an approva
   await say();
   const parallel = await Promise.all([call("merro_start_objective", {}), call("merro_start_objective", {})]);
   assert.equal(parallel.filter((text) => text.startsWith("Unknown choice")).length, 1, parallel.join(" | "));
+});
+
+test("a user's approve stays usable when the approved plan cannot start", async (t) => {
+  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [42] }] });
+  let current: { text: string; at: number } | undefined;
+  let latest: typeof current;
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main,
+    { latest: () => latest, consume() { latest = undefined; }, restore(reply) { if (reply === current) latest = reply; } });
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  current = latest = { text: "approve", at: Date.now() };
+  // The issue closes after the plan was shown, so the approved plan no longer matches what would start.
+  harness.setIssueState("kinetix", 42, "CLOSED");
+  const failure = await tools.get("merro_start_objective")!.execute("s", {}).then(() => null, (error: unknown) => error);
+  assert.ok(failure instanceof Error, "starting a plan whose issue closed must fail");
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
+  assert.equal(latest, current, "the reply is still usable after a start that did not happen");
 });
 
 test("the review-round limit is read when the plan is approved, not when it is proposed", async (t) => {

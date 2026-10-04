@@ -17,6 +17,6 @@ Advanced settings:
 - `sandbox`: `"none"` by default. Host Workers inherit normal HOME, Pi configuration, auth, models, packages, and extensions. Host mode is not a security sandbox; reviewer non-editing is contractual.
 - `sandbox: "docker"`: optional Docker isolation. Review mounts are read-only. Container providers must be reachable from Docker; `localhost` means the container. `network: "off"` requires Docker.
 - `workerGithub`: `false` by default. `true` passes a token from `gh auth token`. Worker push/PR/merge restrictions remain contractual; permissions and branch protection are the security boundary.
-- `notifyCommand`: optional hook for `implementation_complete`, `review_complete`, `publication_blocked`, `blocked`, `merge_ready`, and `objective_done`. Environment includes `MERRO_EVENT`, `MERRO_CHANGE`, and `MERRO_MESSAGE`. Review completion is delivered before publication or local delivery. Hook failures warn without aborting work.
+- `notifyCommand`: optional hook for `implementation_complete`, `review_complete`, `publication_blocked`, `blocked`, `merge_ready`, and `objective_done`. Environment includes `MERRO_EVENT`, `MERRO_CHANGE`, and `MERRO_MESSAGE`. Review completion is delivered before publication or local delivery. Blocks Merro retries itself (shown as Waiting, e.g. GitHub unavailable) are still delivered, once per cause. Hook failures warn without aborting work.
 
 The accepted schema and defaults are defined in [`src/config.ts`](../src/config.ts).

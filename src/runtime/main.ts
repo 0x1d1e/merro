@@ -989,15 +989,16 @@ export class MainOrchestrator {
    * `repliedAt` is when the user's approving message arrived; a plan proposed at or after it was never seen
    * by that reply, so it cannot authorize the plan.
    */
-  /** `accepted` fires once the approval is spent on this plan; earlier failures leave the user's reply usable. */
+  /** `accepted` fires once the approval started this plan; any failure before that leaves the user's reply usable. */
   async approveObjective(name?: string, options: { repliedAt?: number; accepted?: () => void } = {}): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
     const [entry] = this.#proposals;
     if (!entry) throw new Error("No pending plan. Propose a plan and obtain approval first.");
     const [id, proposal] = entry;
     if (options.repliedAt !== undefined && proposal.createdAt >= options.repliedAt) throw new StaleApprovalError();
     if (!this.#pendingPlanAccepts(name)) throw new Error("That name does not match the pending plan.");
+    const started = await this.startObjective(JSON.parse(proposal.input) as ObjectiveRequest, id);
     options.accepted?.();
-    return this.startObjective(JSON.parse(proposal.input) as ObjectiveRequest, id);
+    return started;
   }
 
   /** True when a plan is pending and `name`, if given, names it or one of its changes. */
@@ -2156,7 +2157,7 @@ export class MainOrchestrator {
         if (presence.alive) {
           if (!presence.identityMatches) {
             unsafeProjects.add(item.projectSlug);
-            this.#notify(`${changeName(item)} · Merro found background work it cannot verify as its own${presence.reason ? ` (${presence.reason})` : ""}.\nInspect: tmux list-panes -t =${this.#config.tmux.session}-${item.projectSlug}\nMerro will not adopt or stop it automatically.`, "warning");
+            this.#notify(`${changeName(item)} · Merro found background work it cannot verify as its own${presence.reason ? ` (${presence.reason})` : ""}.\n${runtime.tmuxSession ? `Inspect: tmux list-panes -t =${runtime.tmuxSession}\n` : runtime.containerId ? `Inspect: docker inspect ${runtime.containerId}\n` : ""}Merro will not adopt or stop it automatically.`, "warning");
           }
           continue;
         }
@@ -2665,8 +2666,13 @@ export class MainOrchestrator {
     store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable: true });
     const view = presentWorkspace(store, this.#presentationOptions()).changes.find((change) => change.name === changeName(item));
     const pr = store.getChangeSetRuntime(item.id)?.pullRequestNumber;
-    // Merro-owned waiting needs no one: show it transiently, never as a permanent notification.
-    if (view?.status === "Waiting") { this.#progress(`${changeName(item)} · Waiting · ${view.summary}`); return; }
+    // Merro-owned waiting needs no one: show it transiently, never as a permanent notification. Hooks still get the event.
+    if (view?.status === "Waiting") {
+      const waiting = `${changeName(item)} · Waiting · ${view.summary}`;
+      this.#progress(waiting);
+      this.#queueNotification("publication_blocked", item.id, `${waiting}\nDetails: ${detail}`);
+      return;
+    }
     const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "Merro could not open the pull request."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
     this.#notify(message, "warning");
     this.#queueNotification("publication_blocked", item.id, `${message}\nDetails: ${detail}`);
@@ -3173,7 +3179,13 @@ export class MainOrchestrator {
       .map((relation) => store.getChangeSet(relation.from)).filter((dependent): dependent is ChangeSet => dependent !== null)
       .map(changeName);
     const waiting = dependents.length ? `\nAlso waiting: ${dependents.join(", ")}.` : "";
-    if (view?.status === "Waiting") { this.#progress(`${changeName(item)} · Waiting · ${view.summary}`); return; }
+    // Merro-owned waiting shows transiently; hooks get the event once, not on every automatic recovery attempt.
+    if (view?.status === "Waiting") {
+      const text = `${changeName(item)} · Waiting · ${view.summary}`;
+      this.#progress(text);
+      if (previous?.reason !== reason || previous.detail !== detail) this.#queueNotification("blocked", item.id, `${text}${detail ? `\nDetails: ${detail}` : ""}`);
+      return;
+    }
     const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "This change needs attention."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${waiting}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
     // The guard above already proves this block is new, even when its text matches an earlier one.
     this.#notifiedBySubject.delete(publicText(changeName(item), this.#names));
@@ -3308,6 +3320,8 @@ export class MainOrchestrator {
       id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "worker_settings",
       payload: { objectiveId: objective.id, objective: objectiveSlug, settings, maxReviewRounds },
     });
+    // A request raised again after an earlier one settled is new, even when its text matches.
+    if (!alreadyAsked) this.#rearmNotifications(changeName(item));
     if (!alreadyAsked) this.#notify(`${changeName(item)} · Needs you\n\n${objectiveSlug} was approved before Merro recorded its worker settings. Start its work with ${workerSettingsText(settings)}, ${reviewRoundsText(maxReviewRounds)}?\nApprove: /merro approve ${changeName(item)} · Skip: /merro stop ${objectiveSlug}`, "warning");
   }
 
