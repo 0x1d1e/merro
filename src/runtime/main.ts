@@ -3204,7 +3204,6 @@ export class MainOrchestrator {
     this.#notifiedBySubject.delete(publicText(change, this.#names));
   }
 
-  /** The strictest approved limit; null while an owner has none approved, which never falls back to live config. */
   /**
    * True once per block shown as Waiting. Keyed by reason, not detail: transient gh errors carry varying text,
    * and recovery attempts re-block every pass.
@@ -3223,6 +3222,7 @@ export class MainOrchestrator {
     }
   }
 
+  /** The strictest approved limit; null while an owner has none approved, which never falls back to live config. */
   #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" | null {
     const limits = this.#activeOwners(store, item).map((objective) => objective.maxReviewRounds ?? null);
     if (limits.includes(null)) return null;

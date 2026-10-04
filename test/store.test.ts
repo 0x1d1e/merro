@@ -96,6 +96,31 @@ test("atomically commits nested store writes together or not at all", () => {
   }
 });
 
+test("a transaction whose commit fails rolls back and later transactions still commit", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "merro-commit-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "state.db");
+  const store = new MerroStore(path);
+  store.createProject({ slug: "p", path: "/tmp/p", baseRemote: "origin", pushRemote: "origin", defaultBranch: "main" });
+  // A deferred foreign key is checked only at COMMIT, so the statements succeed and the commit itself fails.
+  const other = new DatabaseSync(path);
+  other.exec(`CREATE TABLE probe(ref TEXT REFERENCES objectives(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER probe_bad AFTER INSERT ON objectives WHEN NEW.id = 'bad' BEGIN INSERT INTO probe VALUES ('missing'); END;`);
+  try {
+    for (const write of [
+      () => store.atomically(() => store.createObjective({ id: "bad", goal: "bad", priority: "normal", state: "Active", projectSlugs: ["p"] })),
+      () => store.createObjective({ id: "bad", goal: "bad", priority: "normal", state: "Active", projectSlugs: ["p"] }),
+    ]) assert.throws(write, /FOREIGN KEY/);
+    store.createObjective({ id: "good", goal: "good", priority: "normal", state: "Active", projectSlugs: ["p"] });
+    store.atomically(() => store.createObjective({ id: "also-good", goal: "also-good", priority: "normal", state: "Active", projectSlugs: ["p"] }));
+    // Another connection sees only committed rows.
+    assert.deepEqual(other.prepare("SELECT id FROM objectives ORDER BY id").all().map((row) => row.id), ["also-good", "good"]);
+  } finally {
+    other.close();
+    store.close();
+  }
+});
+
 test("store enforces one non-terminal generation per source", () => {
   const store = makeStore();
   try {

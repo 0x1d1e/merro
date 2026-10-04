@@ -514,14 +514,21 @@ export class MerroStore {
     this.#depth += 1;
   }
 
+  // A failed COMMIT (busy, deferred constraint) leaves the transaction open for the caller's rollback, so the level stays counted.
   #commit(): void {
-    this.#depth -= 1;
-    this.#db.exec(this.#depth === 0 ? "COMMIT" : `RELEASE nested_${this.#depth}`);
+    const level = this.#depth - 1;
+    this.#db.exec(level === 0 ? "COMMIT" : `RELEASE nested_${level}`);
+    this.#depth = level;
   }
 
+  // After any rollback attempt the level is abandoned: either undone, or already gone because SQLite rolled it back itself.
   #rollback(): void {
-    this.#depth -= 1;
-    this.#db.exec(this.#depth === 0 ? "ROLLBACK" : `ROLLBACK TO nested_${this.#depth}; RELEASE nested_${this.#depth}`);
+    const level = this.#depth - 1;
+    try {
+      this.#db.exec(level === 0 ? "ROLLBACK" : `ROLLBACK TO nested_${level}; RELEASE nested_${level}`);
+    } finally {
+      this.#depth = level;
+    }
   }
 
   createObjective(objective: Objective): void {
