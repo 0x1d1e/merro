@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 23;
 
 export const MIGRATION_19 = `
 ALTER TABLE relations ADD COLUMN gate TEXT CHECK (gate IN ('reviewed','done'));
@@ -324,4 +324,23 @@ ALTER TABLE work_item_runtime ADD COLUMN github_review_decision TEXT;
 
 export const MIGRATION_21 = `
 ALTER TABLE task_runtime ADD COLUMN agent TEXT CHECK (agent IN ('pi', 'claude'));
+`;
+
+export const MIGRATION_22 = `
+ALTER TABLE objective_settings ADD COLUMN worker_settings_json TEXT;
+`;
+
+// Idempotent: databases from earlier development builds reached version 22 with either this table or the column above.
+// Shared ChangeSets take the settings of the oldest Objective that approved them.
+export const MIGRATION_23 = `
+CREATE TABLE IF NOT EXISTS change_set_worker_settings (
+  work_item_id TEXT PRIMARY KEY REFERENCES work_items(id),
+  settings_json TEXT NOT NULL
+);
+INSERT OR IGNORE INTO change_set_worker_settings(work_item_id, settings_json)
+  SELECT ow.work_item_id, s.worker_settings_json FROM objective_work_items ow
+  JOIN objectives o ON o.id = ow.objective_id
+  JOIN objective_settings s ON s.objective_id = o.id
+  WHERE s.worker_settings_json IS NOT NULL
+  ORDER BY o.created_at, ow.rowid;
 `;

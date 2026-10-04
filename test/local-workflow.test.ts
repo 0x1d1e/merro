@@ -30,6 +30,8 @@ async function repository(root: string) {
   return { path, git };
 }
 
+const approveSource = { latest: () => ({ text: "approve", at: Number.POSITIVE_INFINITY }), consume() {}, restore() {} };
+
 test("first init creates complete config and short templates; repeated init never repairs or validates dependencies", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "merro-minimal-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -59,10 +61,10 @@ test("remote registration clones into configured workspace paths without GitHub 
   } });
   const config = validateConfig({ projectsDir: "owned/projects", worktreesDir: "owned/work" });
   const messages: string[] = [];
-  const main = new MainOrchestrator({ workspacePath: workspace, config, notify: (message) => { messages.push(message); },
+  const main = new MainOrchestrator({ workspacePath: workspace, config, notify: (message) => { messages.push(message); }, progress: (message) => { messages.push(message); },
     github: new Proxy({}, { get() { return () => { throw new Error("Registration must not call GitHub"); }; } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]> });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main, approveSource);
   const register = (path: string, slug: string) => tools.get("merro_add_project")!.execute("register", { path, slug });
   const remote = `file://${source.path}`;
   const registered = await register(remote, "app");
@@ -172,7 +174,7 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   };
   let main = new MainOrchestrator(options);
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main, approveSource);
   const call = (name: string, args: Record<string, unknown> = {}) => tools.get(name)!.execute(name, args);
   await call("merro_add_project", { path: "../repo", slug: "app" });
   if (scenario !== "with-remote") {
@@ -183,7 +185,7 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   assert.match(plan.content[0]!.text, /0 pull requests/);
   await main.runPass();
   assert.equal(launches.length, 0);
-  await call("merro_start_objective");
+  await call("merro_start_objective", {});
   main = new MainOrchestrator(options); // Approved delivery survives Main restart.
   if (scenario === "base-moved") {
     await writeFile(join(source.path, "external.txt"), "external change\n");
@@ -211,10 +213,11 @@ test(`tool flow approves, implements, reviews and delivers locally without gh: $
   assert.deepEqual(pendingMerge.decisions.map((decision) => decision.kind), ["local_merge"]);
   assert.equal(await readFile(join(source.path, "file.txt"), "utf8"), "base\n");
   const publicStatus = await main.publicSnapshot();
-  assert.equal(publicStatus.changes[0]!.status, "Ready to merge");
+  assert.equal(publicStatus.changes[0]!.status, "Needs you");
+  assert.equal(publicStatus.changes[0]!.reason, "ready to merge");
   assert.equal(publicStatus.decisions[0]!.summary, "Approve local merge?");
   const formattedStatus = await call("merro_status");
-  assert.match(formattedStatus.content[0]?.text ?? "", /Approve local merge\?/);
+  assert.match(formattedStatus.content[0]?.text ?? "", /Approve local merge: \/merro approve/);
   assert.match(formattedStatus.content[0]?.text ?? "", /Leave unchanged/);
   assert.doesNotMatch(formattedStatus.content[0]?.text ?? "", /Leave open/);
   if (scenario === "merge-declined") {
@@ -345,7 +348,7 @@ test(`checkout-detected delivery uses local mode for ${kind} remotes`, async (t)
   } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>;
   const main = new MainOrchestrator({ workspacePath: workspace, config: { ...DEFAULT_CONFIG }, github });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main, approveSource);
   await tools.get("merro_add_project")!.execute("register", { path: "../repo", slug: "app" });
   const proposal = await tools.get("merro_propose_objective")!.execute("plan", {
     goal: "Update the local project", change_sets: [{ name: "local-change", project_slug: "app" }],
@@ -375,7 +378,7 @@ test("checkout-detected delivery selects PRs for Projects with supported GitHub 
   } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>;
   const main = new MainOrchestrator({ workspacePath: workspace, config: { ...DEFAULT_CONFIG }, github });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main, approveSource);
   await tools.get("merro_add_project")!.execute("register", { path: "../repo", slug: "app" });
   const proposal = await tools.get("merro_propose_objective")!.execute("plan", {
     goal: "Update the remote-backed project", change_sets: [{ name: "remote-change", project_slug: "app" }],
@@ -403,7 +406,7 @@ test("supported GitHub remote failures do not fall back to local delivery", asyn
   } }) as NonNullable<ConstructorParameters<typeof MainOrchestrator>[0]["github"]>;
   const main = new MainOrchestrator({ workspacePath: workspace, config: { ...DEFAULT_CONFIG }, github });
   const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
-  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main);
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, main, approveSource);
   await tools.get("merro_add_project")!.execute("register", { path: "../repo", slug: "app" });
   await assert.rejects(tools.get("merro_propose_objective")!.execute("plan", {
     goal: "Update the remote project", change_sets: [{ name: "remote-change", project_slug: "app" }],

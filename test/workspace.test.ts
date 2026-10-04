@@ -60,7 +60,7 @@ for (const gitRepository of [false, true]) {
         const messages=[];
         await commands.get('merro').handler('config',{ui:{notify(message){messages.push(message)}}});
         assert.ok(messages[0].startsWith('Config: '+process.cwd()+'/.merro/config.json\\n\\n'));
-        assert.deepEqual(JSON.parse(messages[0].slice(messages[0].indexOf('{'))),${JSON.stringify(DEFAULT_CONFIG)});
+        assert.match(messages[0], /No overrides\\. Everything uses Merro defaults\\./);
       } finally { await events.get('session_shutdown')(); }`;
     const result = await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, MERRO_RUNTIME: "" } });
     assert.match(result.stdout, /Merro initialized in /);
@@ -113,7 +113,7 @@ test("/merro init excludes local state and preserves explicitly registered Proje
     await tools.get('merro_add_project').execute('register',{path:process.cwd(),slug:'kinetix'});`;
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", registration], { cwd, env });
   const config = join(cwd, ".merro", "config.json");
-  const customConfig = '{"max_concurrent_tasks":2,"max_review_rounds":3}\n';
+  const customConfig = '{"maxConcurrentTasks":2,"maxReviewRounds":3}\n';
   await writeFile(config, customConfig);
   await writeFile(join(cwd, ".merro", "runtime", "sentinel"), "preserved");
   await mkdir(join(cwd, ".merro", "projects"), { recursive: true });
@@ -179,6 +179,35 @@ test("Main reads current workspace and registered Project Markdown each turn whi
     await events.get('before_agent_start')(event);
     assert.deepEqual(options.sections,{other_extension:'Preserve this',merro_planning:options.sections.merro_planning});
     await events.get('session_shutdown')();`;
+  await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
+});
+
+test("only the user's own message in the current turn can approve", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "merro-approval-input-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await initializedState(cwd);
+  const startup = `import assert from 'node:assert/strict'; import merro from ${JSON.stringify(entrypoint)};
+    const tools=new Map(), events=new Map();
+    await merro({registerCommand(){},registerTool(tool){tools.set(tool.name,tool)},on(name,handler){events.set(name,handler)}});
+    const start=async()=>(await tools.get('merro_start_objective').execute('start',{reply:'approve'})).content[0].text;
+    const say=(text,source='interactive')=>assert.deepEqual(events.get('input')({text,source}),{action:'continue'});
+    say('approvve');
+    assert.equal(await start(),'Unknown choice: approvve\\nChoose: approve · edit · cancel');
+    say('approve'); say('Merro needs your attention','extension');
+    assert.match(await start(),/^Unknown choice: \\(empty\\)/);
+    // Pi ends the agent run before an automatic retry or post-compaction continuation; the reply still authorizes.
+    say('approve'); events.get('agent_end')?.();
+    await assert.rejects(start(),/No pending plan/);
+    // An approval that found nothing to approve leaves the reply usable for the rest of the turn.
+    await assert.rejects(start(),/No pending plan/);
+    await assert.rejects(tools.get('merro_resolve_decision').execute('resolve',{change:'missing',approved:true}));
+    await assert.rejects(start(),/No pending plan/);
+    say('Merro needs your attention','extension');
+    assert.match(await start(),/^Unknown choice: \\(empty\\)/);
+    say('approve'); events.get('agent_settled')();
+    assert.match(await start(),/^Unknown choice: \\(empty\\)/);
+    say('approve');
+    await assert.rejects(start(),/No pending plan/);`;
   await systemCommandRunner.run(process.execPath, ["--input-type=module", "-e", startup], { cwd, env: { MERRO_RUNTIME: "" } });
 });
 

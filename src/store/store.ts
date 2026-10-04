@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import type { WorkerSettings } from "../config.js";
 import {
   priorityRank,
   type BaseUpdate,
@@ -22,7 +23,7 @@ import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { effectiveRelations, normalizeRelation } from "../domain/relations.js";
 import { assertChangeSetTransition } from "../domain/change-set.js";
 import type { FinalSummaryRecord, ObjectiveSettingsRecord, ProjectSettingsRecord, TaskRuntimeRecord, ChangeSetRuntimeRecord } from "./model.js";
-import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, MIGRATION_21, SCHEMA_VERSION } from "./schema.js";
+import { MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6, MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11, MIGRATION_12, MIGRATION_16, MIGRATION_17, MIGRATION_19, MIGRATION_21, MIGRATION_22, MIGRATION_23, SCHEMA_VERSION } from "./schema.js";
 
 import { migratePublicationStates } from "./publication-migration.js";
 import { migrateLocalMergeState } from "./local-merge-migration.js";
@@ -120,6 +121,8 @@ function decisionFromRow(row: Record<string, unknown>): Decision {
 
 export class MerroStore {
   readonly #db: DatabaseSync;
+  /** Open transactions; nested ones are savepoints, so store methods compose inside `atomically`. */
+  #depth = 0;
 
   constructor(path: string) {
     this.#db = new DatabaseSync(path);
@@ -147,140 +150,84 @@ export class MerroStore {
       throw new Error(`unsupported Merro schema version ${String(row.version)}; expected 1-${SCHEMA_VERSION}`);
     }
     if (version < 2) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_2);
         this.#db.prepare("UPDATE schema_meta SET version = 2").run();
-        this.#db.exec("COMMIT");
-        version = 2;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 2;
     }
     if (version < 3) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_3);
         this.#db.prepare("UPDATE schema_meta SET version = 3").run();
-        this.#db.exec("COMMIT");
-        version = 3;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 3;
     }
     if (version < 4) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_4);
         this.#db.prepare("UPDATE schema_meta SET version = 4").run();
-        this.#db.exec("COMMIT");
-        version = 4;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 4;
     }
     if (version < 5) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_5);
         this.#db.prepare("UPDATE schema_meta SET version = 5").run();
-        this.#db.exec("COMMIT");
-        version = 5;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 5;
     }
     if (version < 6) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_6);
         this.#db.prepare("UPDATE schema_meta SET version = 6").run();
-        this.#db.exec("COMMIT");
-        version = 6;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 6;
     }
     if (version < 7) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_7);
         this.#db.prepare("UPDATE schema_meta SET version = 7").run();
-        this.#db.exec("COMMIT");
-        version = 7;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 7;
     }
     if (version < 8) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_8);
         this.#db.prepare("UPDATE schema_meta SET version = 8").run();
-        this.#db.exec("COMMIT");
-        version = 8;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 8;
     }
     if (version < 9) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_9);
         this.#db.prepare("UPDATE schema_meta SET version = 9").run();
-        this.#db.exec("COMMIT");
-        version = 9;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 9;
     }
     if (version < 10) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_10);
         this.#db.prepare("UPDATE schema_meta SET version = 10").run();
-        this.#db.exec("COMMIT");
-        version = 10;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 10;
     }
     if (version < 11) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_11);
         this.#db.prepare("UPDATE schema_meta SET version = 11").run();
-        this.#db.exec("COMMIT");
-        version = 11;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 11;
     }
     if (version < 12) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_12);
         this.#db.prepare("UPDATE schema_meta SET version = 12").run();
-        this.#db.exec("COMMIT");
-        version = 12;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 12;
     }
     if (version < 13) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         // v10-v12 could persist scopes for only some linked Projects. Preserve approved
         // scopes and recover missing selections from attached issues, never from the goal.
         for (const objective of this.#db.prepare("SELECT id, issue_scopes_json FROM objectives WHERE issue_scopes_json IS NOT NULL").all()) {
@@ -307,16 +254,11 @@ export class MerroStore {
           }
         }
         this.#db.prepare("UPDATE schema_meta SET version = 13").run();
-        this.#db.exec("COMMIT");
-        version = 13;
-      } catch (error) {
-        this.#db.exec("ROLLBACK");
-        throw error;
-      }
+      });
+      version = 13;
     }
     if (version < 14) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec("ALTER TABLE work_items ADD COLUMN slug TEXT; ALTER TABLE task_runtime ADD COLUMN window_id TEXT");
         const used = new Set<string>();
         for (const row of this.#db.prepare("SELECT * FROM work_items ORDER BY created_at, id").all()) {
@@ -339,57 +281,75 @@ export class MerroStore {
               AND w.state NOT IN ('Done', 'Obsolete', 'Cancelled') AND existing.value = incoming.value
           ); END;`);
         this.#db.prepare("UPDATE schema_meta SET version = 14").run();
-        this.#db.exec("COMMIT");
-        version = 14;
-      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+      });
+      version = 14;
     }
     if (version < 15) {
       migratePublicationStates(this.#db);
       version = 15;
     }
     if (version < 16) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_16);
         this.#db.prepare("UPDATE schema_meta SET version = 16").run();
-        this.#db.exec("COMMIT");
-        version = 16;
-      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+      });
+      version = 16;
     }
     if (version < 17) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_17);
         this.#db.prepare("UPDATE schema_meta SET version = 17").run();
-        this.#db.exec("COMMIT");
-        version = 17;
-      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+      });
+      version = 17;
     }
     if (version < 18) {
       migrateLocalMergeState(this.#db);
       version = 18;
     }
     if (version < 19) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_19);
         this.#db.prepare("UPDATE schema_meta SET version = 19").run();
-        this.#db.exec("COMMIT");
-        version = 19;
-      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+      });
+      version = 19;
     }
     if (version < 20) {
       migrateTeamReviewState(this.#db);
       version = 20;
     }
     if (version < 21) {
-      this.#db.exec("BEGIN IMMEDIATE");
-      try {
+      this.atomically(() => {
         this.#db.exec(MIGRATION_21);
         this.#db.prepare("UPDATE schema_meta SET version = 21").run();
-        this.#db.exec("COMMIT");
-        version = 21;
-      } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+      });
+      version = 21;
+    }
+    if (version < 22) {
+      this.atomically(() => {
+        this.#db.exec(MIGRATION_22);
+        this.#db.prepare("UPDATE schema_meta SET version = 22").run();
+      });
+      version = 22;
+    }
+    if (version < 23) {
+      this.atomically(() => {
+        const columns = this.#db.prepare("SELECT name FROM pragma_table_info('objective_settings')").all();
+        if (!columns.some((column) => column.name === "worker_settings_json")) this.#db.exec(MIGRATION_22);
+        this.#db.exec(MIGRATION_23);
+        // Pending proposals predating persisted numbers keep the queue position users already saw and continue after
+        // any already numbered, so no two proposals collide.
+        const legacy = this.#db.prepare(`
+          SELECT id FROM decisions
+          WHERE kind = 'issue' AND subject_type = 'IssueProposal' AND state = 'pending' AND json_extract(payload_json, '$.number') IS NULL
+          ORDER BY created_at, id
+        `).all() as Array<{ id: string }>;
+        const next = this.nextIssueProposalNumber();
+        legacy.forEach((row, index) => {
+          this.#db.prepare("UPDATE decisions SET payload_json = json_set(payload_json, '$.number', ?) WHERE id = ?").run(next + index, row.id);
+        });
+        this.#db.prepare("UPDATE schema_meta SET version = 23").run();
+      });
+      version = 23;
     }
     if (version !== SCHEMA_VERSION) {
       throw new Error(`unsupported Merro schema version ${version}; expected ${SCHEMA_VERSION}`);
@@ -462,11 +422,46 @@ export class MerroStore {
     };
   }
 
+  /** Runs `fn` as one transaction: every store write inside it commits together or not at all. */
+  atomically<T>(fn: () => T extends PromiseLike<unknown> ? never : T): T {
+    this.#begin();
+    try {
+      const result = fn();
+      this.#commit();
+      return result;
+    } catch (error) {
+      // The cause wins: a rollback that fails because SQLite already undid the transaction must not mask it.
+      try { this.#rollback(); } catch { /* level already abandoned; see #rollback */ }
+      throw error;
+    }
+  }
+
+  #begin(): void {
+    this.#db.exec(this.#depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT nested_${this.#depth}`);
+    this.#depth += 1;
+  }
+
+  // A failed COMMIT (busy, deferred constraint) leaves the transaction open for the caller's rollback, so the level stays counted.
+  #commit(): void {
+    const level = this.#depth - 1;
+    this.#db.exec(level === 0 ? "COMMIT" : `RELEASE nested_${level}`);
+    this.#depth = level;
+  }
+
+  // After any rollback attempt the level is abandoned: either undone, or already gone because SQLite rolled it back itself.
+  #rollback(): void {
+    const level = this.#depth - 1;
+    try {
+      this.#db.exec(level === 0 ? "ROLLBACK" : `ROLLBACK TO nested_${level}; RELEASE nested_${level}`);
+    } finally {
+      this.#depth = level;
+    }
+  }
+
   createObjective(objective: Objective): void {
     if (objective.projectSlugs.length === 0) throw new Error("Objective requires at least one Project");
     const timestamp = now();
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       this.#db.prepare(`
         INSERT INTO objectives(id, goal, priority, state, created_at, updated_at, issue_scopes_json)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -479,11 +474,7 @@ export class MerroStore {
           .run(objective.id, String(objective.maxReviewRounds));
       }
       this.appendEvent("Objective", objective.id, "created", objective);
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   restoreObjectiveIssueScopes(id: string, scopes: ObjectiveIssueScope[]): void {
@@ -520,6 +511,32 @@ export class MerroStore {
     this.appendEvent("Objective", id, "settings_changed", settings);
   }
 
+  /** Snapshots worker runtime settings approved with an Objective; ChangeSets it later gains inherit them. */
+  saveObjectiveWorkerSettings(id: string, settings: WorkerSettings): void {
+    this.#db.prepare(`
+      INSERT INTO objective_settings(objective_id, worker_settings_json) VALUES (?, ?)
+      ON CONFLICT(objective_id) DO UPDATE SET worker_settings_json = excluded.worker_settings_json
+    `).run(id, JSON.stringify(settings));
+  }
+
+  /** Null only for Objectives approved before settings were snapshotted. */
+  objectiveWorkerSettings(id: string): WorkerSettings | null {
+    const row = this.#db.prepare("SELECT worker_settings_json FROM objective_settings WHERE objective_id = ?").get(id);
+    return row?.worker_settings_json ? JSON.parse(String(row.worker_settings_json)) as WorkerSettings : null;
+  }
+
+  /** First approval wins: a ChangeSet keeps the worker settings it was approved with, even when another Objective shares it. */
+  claimChangeSetWorkerSettings(changeSetId: string, settings: WorkerSettings): void {
+    this.#db.prepare("INSERT OR IGNORE INTO change_set_worker_settings(work_item_id, settings_json) VALUES (?, ?)")
+      .run(changeSetId, JSON.stringify(settings));
+  }
+
+  /** Null only for ChangeSets approved before settings were snapshotted. */
+  changeSetWorkerSettings(changeSetId: string): WorkerSettings | null {
+    const row = this.#db.prepare("SELECT settings_json FROM change_set_worker_settings WHERE work_item_id = ?").get(changeSetId);
+    return row ? JSON.parse(String(row.settings_json)) as WorkerSettings : null;
+  }
+
   setObjectiveState(id: string, state: Objective["state"]): void {
     const row = this.#db.prepare("SELECT state FROM objectives WHERE id = ?").get(id);
     if (!row) throw new Error(`unknown Objective: ${id}`);
@@ -530,8 +547,7 @@ export class MerroStore {
 
   replaceRelations(relations: readonly Relation[]): void {
     const effective = effectiveRelations(relations.map(normalizeRelation));
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       this.#db.prepare("UPDATE relations SET active = 0 WHERE active = 1").run();
       const upsert = this.#db.prepare(`
         INSERT INTO relations(kind, from_work_item_id, to_work_item_id, confidence, rationale, evidence, gate, consumed_reviewed_commit, active, created_at)
@@ -552,11 +568,7 @@ export class MerroStore {
           relation.kind === "Requires" ? relation.gate ?? null : null, relation.consumedReviewedCommit ?? null, now());
       }
       this.appendEvent("Relations", "workspace", "replaced", effective);
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   #relationRebuild(analyzedIds: readonly string[], relations: readonly Relation[], occupiedChangeSetIds: readonly string[]) {
@@ -597,8 +609,7 @@ export class MerroStore {
     occupiedChangeSetIds: readonly string[] = [],
     explicitRelations: readonly Relation[] = [],
   ): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       const rebuild = this.#relationRebuild(analyzedIds, relations, occupiedChangeSetIds);
       const deactivate = this.#db.prepare("UPDATE relations SET active = 0 WHERE id = ?");
       for (const id of rebuild.deactivateIds) deactivate.run(id);
@@ -631,11 +642,7 @@ export class MerroStore {
       const rebuilt = this.listRelations();
       const previous = this.#db.prepare("SELECT payload_json FROM event_log WHERE entity_type = 'Relations' AND event_type = 'rebuilt' ORDER BY id DESC LIMIT 1").get();
       if (previous?.payload_json !== JSON.stringify(rebuilt)) this.appendEvent("Relations", "workspace", "rebuilt", rebuilt);
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   listRelations(includeInactive = false): Relation[] {
@@ -681,6 +688,15 @@ export class MerroStore {
   getDecision(id: string): Decision | null {
     const row = this.#db.prepare("SELECT * FROM decisions WHERE id = ?").get(id);
     return row ? decisionFromRow(row) : null;
+  }
+
+  /** Monotonic across resolved proposals so a displayed number is never reused for another proposal. */
+  nextIssueProposalNumber(): number {
+    const row = this.#db.prepare(`
+      SELECT MAX(CAST(json_extract(payload_json, '$.number') AS INTEGER)) AS highest FROM decisions
+      WHERE kind = 'issue' AND subject_type = 'IssueProposal'
+    `).get();
+    return Number(row?.highest ?? 0) + 1;
   }
 
   pendingDecisions(): Decision[] {
@@ -762,19 +778,14 @@ export class MerroStore {
   }
 
   markPullRequestRework(runtime: ChangeSetRuntimeRecord): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       const item = this.getChangeSet(runtime.changeSetId);
       if (!item || item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval") {
         throw new Error(`ChangeSet ${runtime.changeSetId} is not awaiting pull request review or merge`);
       }
       this.saveChangeSetRuntime(runtime);
       this.transitionChangeSet(item.id, "Implementing");
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   getTaskRuntime(taskId: string): TaskRuntimeRecord | null {
@@ -848,8 +859,7 @@ export class MerroStore {
     }
 
     const timestamp = now();
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       this.#db.prepare(`
         INSERT INTO work_items(
           id, project_slug, source_type, source_ref, generation, state, priority,
@@ -864,11 +874,7 @@ export class MerroStore {
         .run(item.id, item.guidance ?? "");
       this.#db.prepare("INSERT INTO work_item_runtime(work_item_id) VALUES (?)").run(item.id);
       this.appendEvent("ChangeSet", item.id, "created", item);
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   availableChangeName(name: string, reserved: ReadonlySet<string> = new Set()): string {
@@ -1004,8 +1010,7 @@ export class MerroStore {
   }
 
   completeLocalChangeSet(id: string, commit: string): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       const item = this.getChangeSet(id);
       const review = this.listTasks(id).at(-1);
       if (item?.delivery !== "local" || item.state !== "AwaitingLocalMerge" || this.activeTask(id)
@@ -1028,21 +1033,18 @@ export class MerroStore {
         .run(id, JSON.stringify({ change: item.slug, delivery: "local", branch: item.targetBranch, baseCommit: runtime.baseCommit, commit }), now());
       this.appendEvent("ChangeSet", id, "final_summary_written", { createdAt: now() });
       this.appendEvent("ChangeSet", id, "completed", { reason: "local_delivery", commit });
-      this.#db.exec("COMMIT");
-    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+    });
   }
 
   completeChangeSetAfterMerge(id: string, payload: unknown): boolean {
     const serialized = JSON.stringify(payload);
     if (serialized === undefined) throw new Error("final summary must be JSON serializable");
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    return this.atomically(() => {
       const item = this.getChangeSet(id);
       if (!item) throw new Error(`unknown ChangeSet: ${id}`);
       const existing = this.getFinalSummary(id);
       if (existing) {
         if (item.state !== "Done") throw new Error(`ChangeSet ${id} has a final summary but is not Done`);
-        this.#db.exec("COMMIT");
         return false;
       }
       if (item.state !== "AwaitingMerge" && item.state !== "AwaitingApproval" && item.state !== "Blocked" && item.state !== "PublishBlocked" && item.state !== "Publishing" && item.state !== "Done") {
@@ -1067,12 +1069,8 @@ export class MerroStore {
         });
       }
       this.appendEvent("ChangeSet", id, "final_summary_written", { createdAt });
-      this.#db.exec("COMMIT");
       return true;
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   completeChangeSetAfterExternalMerge(id: string): void {
@@ -1165,19 +1163,14 @@ export class MerroStore {
     if (input.runtime && input.runtime.taskId !== input.id) {
       throw new Error("Task runtime identity does not match Task ID");
     }
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       this.#db.prepare(`
         INSERT INTO tasks(id, work_item_id, role, attempt, status, started_at)
         VALUES (?, ?, ?, ?, 'active', ?)
       `).run(input.id, input.changeSetId, input.role, input.attempt, now());
       if (input.runtime) this.saveTaskRuntime(input.runtime);
       this.appendEvent("Task", input.id, "created", { ...input, runtime: undefined });
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   finalizeTask(input: {
@@ -1214,17 +1207,12 @@ export class MerroStore {
   }
 
   finalizePassingReview(input: { id: string; summary: string; resultJson: string; reviewedCommit: string }): void {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.atomically(() => {
       const task = this.getTask(input.id);
       if (!task || task.role !== "review") throw new Error("Passing review requires a review Task");
       this.finalizeTask({ ...input, outcome: "pass" });
       this.transitionChangeSet(task.changeSetId, "Reviewed");
-      this.#db.exec("COMMIT");
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   getTask(id: string): Task | null {
@@ -1296,8 +1284,7 @@ export class MerroStore {
   }
 
   stopActiveObjectives(objectiveId?: string): number {
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    return this.atomically(() => {
       const requested = objectiveId === undefined ? null : this.getObjective(objectiveId);
       if (objectiveId !== undefined && !requested) throw new Error(`unknown Objective: ${objectiveId}`);
       const objectives = requested
@@ -1324,17 +1311,13 @@ export class MerroStore {
         if (this.activeTask(item.id)) continue;
         this.transitionChangeSet(item.id, "Obsolete");
         for (const decision of this.pendingDecisions()) {
-          if ((decision.kind === "merge" || decision.kind === "merge_conflict" || decision.kind === "local_merge") && decision.subjectId === item.id) {
+          if ((decision.kind === "merge" || decision.kind === "merge_conflict" || decision.kind === "local_merge" || decision.kind === "worker_settings") && decision.subjectId === item.id) {
             this.resolveDecision(decision.id, "resolved");
           }
         }
       }
-      this.#db.exec("COMMIT");
       return objectives.length;
-    } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   hasEvent(entityType: string, entityId: string, eventType: string): boolean {

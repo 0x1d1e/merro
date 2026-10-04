@@ -4,7 +4,7 @@ import { chmod, copyFile, link, lstat, mkdir, readdir, readFile, rm, stat, write
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { MerroConfig } from "../config.js";
+import type { MerroConfig, WorkerSettings } from "../config.js";
 import type { BaseUpdate, Project, TaskRole } from "../domain/model.js";
 import { semanticSlug } from "../domain/names.js";
 import type { ProjectSettingsRecord, TaskRuntimeRecord } from "../store/model.js";
@@ -48,6 +48,8 @@ export interface WorkerLaunchInput {
   expectedCommit: string;
   baseUpdate?: BaseUpdate | null;
   projectSettings: ProjectSettingsRecord | null;
+  /** Settings snapshotted at plan approval, or approved by the user for older Objectives. */
+  workerSettings?: WorkerSettings | null;
   dependencies?: readonly WorkerDependencyMount[];
 }
 
@@ -199,7 +201,7 @@ export class WorkerRuntime {
     if (sandbox === "none" && network === "off") {
       throw new Error("network=off requires Docker sandboxing");
     }
-    const agent = this.#agentFor(input.role, sandbox);
+    const agent = this.#agentFor(input.role, sandbox, input.workerSettings);
     const scratchPath = join(this.#workspacePath, "tasks", safeName(input.taskName));
     return {
       taskId: input.taskId,
@@ -220,8 +222,8 @@ export class WorkerRuntime {
     };
   }
 
-  #agentFor(role: TaskRole, sandbox: "docker" | "none"): AgentRuntime {
-    const settings = role === "implement" ? this.#config.workers.implementer : this.#config.workers.reviewer;
+  #agentFor(role: TaskRole, sandbox: "docker" | "none", snapshot?: WorkerSettings | null): AgentRuntime {
+    const settings = snapshot?.[role] ?? (role === "implement" ? this.#config.workers.implementer : this.#config.workers.reviewer);
     const agent = agentRuntime(settings.runtime);
     if (!agent.sandboxes.includes(sandbox)) {
       throw new Error(`workers.${role === "implement" ? "implementer" : "reviewer"}.runtime=${agent.kind} does not support sandbox=${sandbox}`);
@@ -269,15 +271,15 @@ export class WorkerRuntime {
       MERRO_TASK_SCRATCH: TASK_MOUNT,
       ...(workerGuidance ? { MERRO_WORKER_GUIDANCE_PATH: sandbox === "docker" ? join(TASK_MOUNT, "worker-guidance.md") : workerGuidancePath } : {}),
     };
-    const workerGithub = input.projectSettings?.workerGithub ?? this.#config.worker_github === "on";
+    const workerGithub = input.projectSettings?.workerGithub ?? this.#config.workerGithub;
     if (workerGithub) {
       const token = (await this.#commands.run("gh", ["auth", "token"], { cwd: input.project.path })).stdout.trim();
       if (!token || /[\r\n]/.test(token)) throw new Error("gh auth token returned an invalid worker token");
       environment.GH_TOKEN = token;
     }
 
-    const settings = input.role === "implement" ? this.#config.workers.implementer : this.#config.workers.reviewer;
-    const agent = this.#agentFor(input.role, sandbox);
+    const settings = input.workerSettings?.[input.role] ?? (input.role === "implement" ? this.#config.workers.implementer : this.#config.workers.reviewer);
+    const agent = this.#agentFor(input.role, sandbox, input.workerSettings);
     const piArgs = agent.command({
       role: input.role, taskId: input.taskId, settings, runtimeRoot: join(TASK_MOUNT, "merro-runtime"),
       taskFilePath: `${CLONE_MOUNT}/.merro-task.md`, guidance: workerGuidance,

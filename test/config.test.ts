@@ -12,15 +12,15 @@ test("config applies documented defaults", () => {
       reviewer: { runtime: "pi", model: null, thinking: null },
     },
     issues: { create: "approval" },
-    merge: { auto: false, method: "squash", delete_branch: true },
+    merge: { auto: false, method: "squash", deleteBranch: true },
     git: { defaultDelivery: "auto" },
     tmux: { session: "merro" },
-    max_concurrent_tasks: 3,
-    max_review_rounds: 3,
+    maxConcurrentTasks: 3,
+    maxReviewRounds: 3,
     sandbox: "none",
     network: "on",
-    worker_github: "off",
-    notify_command: null,
+    workerGithub: false,
+    notifyCommand: null,
   });
   assert.deepEqual(validateConfig({}), DEFAULT_CONFIG);
 });
@@ -43,7 +43,7 @@ test("minimal runtime settings accept paths and per-role overrides without promp
 });
 
 test("config rejects invalid concurrency", () => {
-  assert.throws(() => validateConfig({ max_concurrent_tasks: 0 }), /max_concurrent_tasks/);
+  assert.throws(() => validateConfig({ maxConcurrentTasks: 0 }), /maxConcurrentTasks/);
 });
 
 test("config migrates legacy per-role settings to canonical output", () => {
@@ -113,11 +113,11 @@ test("reviewer does not inherit the implementer runtime or model", () => {
 });
 
 test("issue and merge policies validate", () => {
-  const config = validateConfig({ issues: { create: "auto" }, merge: { auto: true, method: "rebase", delete_branch: false } });
+  const config = validateConfig({ issues: { create: "auto" }, merge: { auto: true, method: "rebase", deleteBranch: false } });
   assert.deepEqual(config.issues, { create: "auto" });
-  assert.deepEqual(config.merge, { auto: true, method: "rebase", delete_branch: false });
+  assert.deepEqual(config.merge, { auto: true, method: "rebase", deleteBranch: false });
   for (const input of [
     { issues: { create: "yes" } }, { issues: { other: 1 } }, { merge: { auto: "true" } },
-    { merge: { method: "fast-forward" } }, { merge: { delete_branch: 1 } }, { merge: { extra: true } },
+    { merge: { method: "fast-forward" } }, { merge: { deleteBranch: 1 } }, { merge: { extra: true } },
   ]) assert.throws(() => validateConfig(input));
 });

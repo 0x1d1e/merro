@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import type { MerroConfig, WorkerSettings } from "../config.js";
-import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate, type RequiresGate } from "../domain/model.js";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { validateDirectory, type MerroConfig, type WorkerSettings } from "../config.js";
+import { priorityRank, type Objective, type ObjectiveIssueScope, type Priority, type DeliveryMode, type Project, type Relation, type Task, type TaskRole, type ChangeSet, type BaseUpdate, type RequiresGate, type ReviewRoundLimit } from "../domain/model.js";
 import { matchesIssueScope, parseObjectiveIssueScopes } from "../domain/objective.js";
 import { assertProjectSlug } from "../domain/project.js";
 import { analyzeIssueRelations, findRequiresCycle, normalizeRelation } from "../domain/relations.js";
@@ -19,7 +19,8 @@ import { normalizedVerification, renderPullRequestContent, withRelatedPullReques
 import { MainLock } from "./main-lock.js";
 import { changeName, issueNumbers, semanticSlug } from "../domain/names.js";
 import { requireWorkspace } from "./workspace.js";
-import { formatChecks, objectiveName, presentChangeDetails, presentWorkspace, publicText, workerName } from "./presentation.js";
+import { currentlyReviewedIds } from "./reviewed.js";
+import { formatChecks, objectiveName, presentChangeDetails, presentWorkspace, publicText, workerName, reviewRoundsText, workerSettingsText } from "./presentation.js";
 import { systemCommandRunner, type CommandRunner } from "./commands.js";
 import { taskWindowName, WorkerRuntime, type WorkerPresence } from "./worker-runtime.js";
 import { GitClient } from "../vcs/git.js";
@@ -60,9 +61,13 @@ export interface ObjectivePlanningContext {
   unresolved: Array<{ workstream: string; projectSlug: string; statement: string }>;
 }
 
+/** The user's approval predates the plan or decision it would authorize. */
+export class StaleApprovalError extends Error {
+  constructor() { super("This appeared after your reply, so it is not approved yet. Review it, then reply approve."); }
+}
+
 export interface ObjectiveProposal {
   id: string;
-  workerSettings: WorkerSettings;
   changeSets: ChangeSet[];
   branches: Record<string, string>;
   relations: Relation[];
@@ -116,7 +121,7 @@ const emptyRuntime = (changeSetId: string): ChangeSetRuntimeRecord => ({
   infrastructureRetries: 0, implementationAttempt: 0, lastReworkTrigger: null, lastReconciledAt: null,
 });
 
-type ObjectiveGraph = Omit<ObjectiveProposal, "id" | "workerSettings">;
+type ObjectiveGraph = Omit<ObjectiveProposal, "id">;
 
 function relationKey(relation: Relation): string {
   return `${relation.kind}\0${relation.from}\0${relation.to}`;
@@ -448,7 +453,25 @@ export class MainOrchestrator {
   readonly #workspacePath: string;
   readonly #stateDirectory: string;
   get #workRoot(): string { return join(this.#workspacePath, this.#config.worktreesDir); }
+  /** Recorded clone paths stay authoritative after worktreesDir changes: a clone created as <root>/<project>/<change> is removed from that root. */
+  #cloneRoot(item: ChangeSet, clonePath: string): string {
+    const workspace = resolve(this.#workspacePath);
+    const clone = resolve(clonePath);
+    const root = dirname(dirname(clone));
+    if (basename(clone) !== changeName(item) || basename(dirname(clone)) !== item.projectSlug) return this.#workRoot;
+    try {
+      const directory = validateDirectory(relative(workspace, root), "worktreesDir");
+      const projects = this.#config.projectsDir;
+      if (directory === projects || directory.startsWith(`${projects}${sep}`) || projects.startsWith(`${directory}${sep}`)) return this.#workRoot;
+      return join(workspace, directory);
+    } catch {
+      return this.#workRoot;
+    }
+  }
   readonly #config: MerroConfig;
+  readonly #notifiedBySubject = new Map<string, string>();
+  /** Block reason whose Waiting hook was delivered, per ChangeSet; kept while that block lasts, across automatic recovery attempts. */
+  readonly #waitingHooked = new Map<string, string>();
   readonly #notify: (message: string, level?: "info" | "warning" | "error") => void;
   readonly #progress: (message: string) => void;
   readonly #git: GitAdapter;
@@ -456,18 +479,34 @@ export class MainOrchestrator {
   readonly #workers: WorkerAdapter;
   readonly #commands: CommandRunner;
   #storeQueue: Promise<unknown> = Promise.resolve();
-  readonly #proposals = new Map<string, { input: string; graph: string; names: string[] }>();
+  readonly #proposals = new Map<string, { input: string; graph: string; names: string[]; createdAt: number }>();
   readonly #pendingNotifications: Array<{ event: string; subjectId: string; message: string }> = [];
   readonly #reviewNotificationsInFlight = new Set<string>();
   readonly #names = new Map<string, string>();
+  /** Live workers Merro cannot verify as its own, from the latest safety check; they still occupy capacity. */
+  #orphanedTaskCount = 0;
 
   constructor(options: MainOptions) {
     this.#workspacePath = resolve(options.workspacePath);
     this.#stateDirectory = join(this.#workspacePath, ".merro");
     this.#config = options.config;
     const notify = options.notify ?? ((message: string) => console.log(message));
-    this.#notify = (message, level) => notify(publicText(message, this.#names), level);
-    this.#progress = (message) => options.progress?.(publicText(message, this.#names));
+    // Reconciliation re-derives the same conditions every pass; an equivalent message per subject is shown once until it changes.
+    // Progress, new blocks and user actions on a change re-arm only that subject, so a condition that recurs after its change moved on is shown again.
+    const lastBySubject = this.#notifiedBySubject;
+    this.#notify = (message, level) => {
+      const text = publicText(message, this.#names);
+      const subject = text.split(/\n| · /, 1)[0]!;
+      if (lastBySubject.get(subject) === text) return;
+      lastBySubject.set(subject, text);
+      notify(text, level);
+    };
+    this.#progress = (message) => {
+      const text = publicText(message, this.#names);
+      // Progress means the subject's state moved on, so an identical later warning is new information.
+      lastBySubject.delete(text.split(/\n| · /, 1)[0]!);
+      options.progress?.(text);
+    };
     const commands = options.commands ?? systemCommandRunner;
     this.#commands = commands;
     this.#git = options.git ?? new GitClient(commands);
@@ -535,23 +574,26 @@ export class MainOrchestrator {
     return { issue, ...started };
   }
 
-  /** Issues proposed by workers under issues.create=approval, oldest first; the 1-based position is the user-facing handle. */
+  /** Issues proposed by workers under issues.create=approval, oldest first; the persisted `position` is the stable user-facing handle. */
   async issueProposals(): Promise<Array<{ position: number; projectSlug: string; title: string; body: string; change: string }>> {
-    return this.#withStore((store) => this.#pendingIssueProposals(store).map(({ payload }, index) => ({ position: index + 1, ...payload })));
+    return this.#withStore((store) => this.#pendingIssueProposals(store).map(({ payload, position }) => ({ ...payload, position })));
   }
 
   #pendingIssueProposals(store: MerroStore) {
     return store.pendingDecisions().filter((decision) => decision.kind === "issue" && decision.subjectType === "IssueProposal")
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-      .map((decision) => {
-        const payload = decision.payload as { projectSlug: string; title: string; body: string; change: string };
-        return { decision, payload };
-      });
+      .map((decision, index) => {
+        const payload = decision.payload as { projectSlug: string; title: string; body: string; change: string; number?: number };
+        // Proposals stored before numbers were persisted fall back to their queue position.
+        return { decision, payload, position: payload.number ?? index + 1 };
+      })
+      // Persisted numbers are monotonic, so they order proposals created within the same timestamp.
+      .sort((left, right) => left.position - right.position);
   }
 
   async resolveIssueProposal(position: number, approved: boolean): Promise<string> {
     return this.#withStore(async (store) => {
-      const entry = this.#pendingIssueProposals(store)[position - 1];
+      const entry = this.#pendingIssueProposals(store).find((candidate) => candidate.position === position);
       if (!entry) throw new Error(`No proposed issue ${position}. See /merro issue list.`);
       if (!approved) {
         store.resolveDecision(entry.decision.id, "rejected");
@@ -585,9 +627,10 @@ export class MainOrchestrator {
       }
       store.createDecision({
         id: randomUUID(), subjectType: "IssueProposal", subjectId: randomUUID(), kind: "issue",
-        payload: { projectSlug: project.slug, title: proposal.title, body, change: changeName(item) },
+        payload: { projectSlug: project.slug, title: proposal.title, body, change: changeName(item), number: store.nextIssueProposalNumber() },
       });
-      this.#notify(`${changeName(item)} · Proposed issue: ${proposal.title}\nCreate it? /merro issue approve · Dismiss: /merro issue dismiss`, "warning");
+      const position = this.#pendingIssueProposals(store).at(-1)!.position;
+      this.#notify(`${changeName(item)} proposed a follow-up\n\n${position}. ${proposal.title}\nApprove: /merro issue approve ${position} · Dismiss: /merro issue dismiss ${position}`, "warning");
     }
   }
 
@@ -602,11 +645,22 @@ export class MainOrchestrator {
   }
 
   async publicSnapshot(): Promise<ReturnType<typeof presentWorkspace>> {
-    return this.#withStore((store) => presentWorkspace(store));
+    return this.#withStore((store) => presentWorkspace(store, this.#presentationOptions()));
   }
 
   async changeDetails(name: string) {
-    return this.#withStore((store) => presentChangeDetails(store, semanticSlug(name)));
+    return this.#withStore((store) => presentChangeDetails(store, semanticSlug(name), this.#presentationOptions()));
+  }
+
+  /** Resolves the live tmux window of a change's active worker, or null when none is running. */
+  async watchTarget(name: string): Promise<{ session: string; window: string } | null> {
+    return this.#withStore((store) => {
+      const item = store.listChangeSets().find((candidate) => changeName(candidate) === semanticSlug(name));
+      if (!item) throw new Error(`Unknown change: ${name}`);
+      const active = store.activeTask(item.id);
+      const record = active && store.getTaskRuntime(active.id);
+      return record?.tmuxSession && record.tmuxWindow ? { session: record.tmuxSession, window: record.tmuxWindow } : null;
+    });
   }
 
   async statusSummary(): Promise<ReturnType<MerroStore["statusSummary"]>> {
@@ -641,7 +695,7 @@ export class MainOrchestrator {
       } else {
         if (!this.#git.cloneProject) throw new Error("Git adapter cannot clone a remote Project");
         await this.#ensureWorkspaceDirectory(this.#config.projectsDir);
-        this.#notify(`Cloning -> ./${this.#config.projectsDir}/${slug}`);
+        this.#progress(`Cloning -> ./${this.#config.projectsDir}/${slug}`);
         await this.#git.cloneProject(path, projectPath);
       }
     } else {
@@ -673,14 +727,10 @@ export class MainOrchestrator {
   async #recordObjectiveProposal(store: MerroStore, input: ObjectiveRequest): Promise<ObjectiveProposal> {
     const prepared = await this.#prepareObjective(store, input);
     const id = randomUUID();
-    const workerSettings: WorkerSettings = {
-      implement: { ...this.#config.workers.implementer },
-      review: { ...this.#config.workers.reviewer },
-    };
-    const proposal = { id, workerSettings, ...prepared.graph };
+    const proposal = { id, ...prepared.graph };
     this.#proposals.clear();
     this.#proposals.set(id, { input: JSON.stringify(input), graph: proposalFingerprint(prepared.graph, prepared.projects),
-      names: prepared.graph.changeSets.map((item) => changeName(item)) });
+      names: prepared.graph.changeSets.map((item) => changeName(item)), createdAt: Date.now() });
     return proposal;
   }
 
@@ -866,7 +916,7 @@ export class MainOrchestrator {
     const activeIds = store.listTasks().filter((task) => task.status === "active" && relatedIds.has(task.changeSetId)).map((task) => task.changeSetId);
     const unresolvedIds = new Set(unresolved.map((item) => item.changeSetId));
     const runnableImmediately = schedule({ changeSets: participants, relations: effective, activeTaskCount: 0,
-      maxConcurrentTasks: "unlimited", activeChangeSetIds: activeIds, reviewedChangeSetIds: [...this.#reviewedChangeSetIds(store)] }).selected
+      maxConcurrentTasks: "unlimited", activeChangeSetIds: activeIds, reviewedChangeSetIds: [...currentlyReviewedIds(store)] }).selected
       .filter((item) => ids.has(item.id) && !unresolvedIds.has(item.id)).length;
     return { projects, issueScopes, approvedIssueScopes, issueRows, automaticRelations, explicitRelations,
       graph: { changeSets, branches: Object.fromEntries(changeSets.map((item) => [item.id,
@@ -889,60 +939,109 @@ export class MainOrchestrator {
         }
       }
       await this.#validateNewExplicitRelations(store, graph.changeSets, graph.relations, explicitRelations);
-      if (proposalId !== undefined) this.#proposals.delete(proposalId);
-
-      const objective: Objective = {
-        id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
-        projectSlugs: projects.map((project) => project.slug),
-        issueScopes: approvedIssueScopes,
-        ...(input.maxReviewRounds === undefined ? {} : { maxReviewRounds: input.maxReviewRounds }),
-      };
-      store.createObjective(objective);
-      this.#names.set(objective.id, objective.goal);
-      const items: ChangeSet[] = [];
-      for (const planned of graph.changeSets) {
-        if (!store.getChangeSet(planned.id)) store.createChangeSet(planned);
-        store.attachChangeSet(objective.id, planned.id);
-        const item = store.getChangeSet(planned.id)!;
-        this.#names.set(item.id, changeName(item));
-        const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
-        if (!runtime.branchName) {
-          const approvedBranch = graph.branches[item.id];
-          if (!approvedBranch) throw new Error(`Approved branch is missing for ${changeName(item)}`);
-          store.saveChangeSetRuntime({ ...runtime, branchName: approvedBranch });
+      // All writes commit together, and the proposal is spent only once they have: a failure leaves no partial plan and the plan still pending.
+      const started = store.atomically(() => {
+        const objective: Objective = {
+          id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
+          projectSlugs: projects.map((project) => project.slug),
+          issueScopes: approvedIssueScopes,
+          // Materialized at approval so a later config reload cannot change an approved Objective's review limit.
+          maxReviewRounds: input.maxReviewRounds ?? this.#config.maxReviewRounds,
+        };
+        store.createObjective(objective);
+        const workerSettings: WorkerSettings = { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
+        store.saveObjectiveWorkerSettings(objective.id, workerSettings);
+        const items: ChangeSet[] = [];
+        for (const planned of graph.changeSets) {
+          if (!store.getChangeSet(planned.id)) store.createChangeSet(planned);
+          store.attachChangeSet(objective.id, planned.id);
+          store.claimChangeSetWorkerSettings(planned.id, workerSettings);
+          const item = store.getChangeSet(planned.id)!;
+          const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
+          if (!runtime.branchName) {
+            const approvedBranch = graph.branches[item.id];
+            if (!approvedBranch) throw new Error(`Approved branch is missing for ${changeName(item)}`);
+            store.saveChangeSetRuntime({ ...runtime, branchName: approvedBranch });
+          }
+          if (priorityRank(objective.priority) < priorityRank(item.priority)) store.setChangeSetPriority(item.id, objective.priority);
+          items.push(store.getChangeSet(item.id)!);
         }
-        if (priorityRank(objective.priority) < priorityRank(item.priority)) store.setChangeSetPriority(item.id, objective.priority);
-        items.push(store.getChangeSet(item.id)!);
-      }
-      store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations, [], explicitRelations);
-      for (const item of items) {
-        if (item.state !== "Blocked" || item.blockedReason !== "task_failed" || item.blockedResumeState !== "Implementing") continue;
-        const latest = store.listTasks(item.id).at(-1);
-        if (latest?.role !== "implement" || latest.outcome !== "failed" || !latest.resultJson) continue;
-        let suggestions: DependencySuggestion[] | undefined;
-        try { suggestions = parseImplementResult(JSON.parse(latest.resultJson)).dependency_suggestions; } catch { continue; }
-        if (!suggestions?.length) continue;
-        const approved = suggestions.every((suggestion) => store.listRelations().some((relation) => {
-          const prerequisite = store.getChangeSet(relation.to);
-          return relation.kind === "Requires" && relation.from === item.id && (relation.gate ?? "done") === suggestion.gate
-            && prerequisite?.projectSlug === suggestion.project_slug && issueNumbers(prerequisite).includes(suggestion.issue_number);
-        }));
-        if (approved) store.transitionChangeSet(item.id, "Implementing");
-      }
-      return { objective, changeSets: items.map((item) => store.getChangeSet(item.id)!) };
+        store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations, [], explicitRelations);
+        for (const item of items) {
+          if (item.state !== "Blocked" || item.blockedReason !== "task_failed" || item.blockedResumeState !== "Implementing") continue;
+          const latest = store.listTasks(item.id).at(-1);
+          if (latest?.role !== "implement" || latest.outcome !== "failed" || !latest.resultJson) continue;
+          let suggestions: DependencySuggestion[] | undefined;
+          try { suggestions = parseImplementResult(JSON.parse(latest.resultJson)).dependency_suggestions; } catch { continue; }
+          if (!suggestions?.length) continue;
+          const approved = suggestions.every((suggestion) => store.listRelations().some((relation) => {
+            const prerequisite = store.getChangeSet(relation.to);
+            return relation.kind === "Requires" && relation.from === item.id && (relation.gate ?? "done") === suggestion.gate
+              && prerequisite?.projectSlug === suggestion.project_slug && issueNumbers(prerequisite).includes(suggestion.issue_number);
+          }));
+          if (approved) store.transitionChangeSet(item.id, "Implementing");
+        }
+        return { objective, changeSets: items.map((item) => store.getChangeSet(item.id)!) };
+      });
+      if (proposalId !== undefined) this.#proposals.delete(proposalId);
+      for (const item of started.changeSets) this.#names.set(item.id, changeName(item));
+      this.#names.set(started.objective.id, started.objective.goal);
+      return started;
     });
   }
 
-  async approveObjective(name?: string): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
+  /**
+   * `repliedAt` is when the user's approving message arrived; a plan proposed at or after it was never seen
+   * by that reply, so it cannot authorize the plan.
+   */
+  /** `accepted` fires once the approval started this plan; any failure before that leaves the user's reply usable. */
+  async approveObjective(name?: string, options: { repliedAt?: number; accepted?: () => void } = {}): Promise<{ objective: Objective; changeSets: ChangeSet[] }> {
     const [entry] = this.#proposals;
     if (!entry) throw new Error("No pending plan. Propose a plan and obtain approval first.");
     const [id, proposal] = entry;
+    if (options.repliedAt !== undefined && proposal.createdAt >= options.repliedAt) throw new StaleApprovalError();
+    if (!this.#pendingPlanAccepts(name)) throw new Error("That name does not match the pending plan.");
+    const started = await this.startObjective(JSON.parse(proposal.input) as ObjectiveRequest, id);
+    options.accepted?.();
+    return started;
+  }
+
+  /** True when a plan is pending and `name`, if given, names it or one of its changes. */
+  #pendingPlanAccepts(name?: string): boolean {
+    const [entry] = this.#proposals;
+    if (!entry) return false;
+    if (!name) return true;
+    const proposal = entry[1];
     const input = JSON.parse(proposal.input) as ObjectiveRequest;
-    const acceptedNames = ["changeSlug" in input ? input.changeSlug : undefined, input.goal,
+    return ["changeSlug" in input ? input.changeSlug : undefined, input.goal,
       ...("changeSets" in input ? input.changeSets.map((item) => item.name) : []), ...proposal.names]
-      .filter((candidate): candidate is string => candidate !== undefined).map(semanticSlug);
-    if (name && !acceptedNames.includes(semanticSlug(name))) throw new Error("That name does not match the pending plan.");
-    return this.startObjective(input, id);
+      .filter((candidate): candidate is string => candidate !== undefined).map(semanticSlug).includes(semanticSlug(name));
+  }
+
+  /**
+   * `/merro approve`: the typed command is itself the user's approval, so it approves the pending plan it names (or
+   * the only thing waiting) and otherwise resolves a merge Decision.
+   */
+  /** `/merro approve [plan|decision] [name]`; the qualifier is needed only when the plan and a pending Decision could both match. */
+  async approvePending(target?: string): Promise<string> {
+    const [first, ...rest] = target?.trim().split(/\s+/) ?? [];
+    const kind = first === "plan" || first === "decision" ? first : undefined;
+    const requested = (kind ? rest.join(" ") : target?.trim()) || undefined;
+    if (kind === "plan" || (!kind && this.#pendingPlanAccepts(requested))) {
+      const decisionAlsoMatches = !kind && await this.#withStore((store) => store.pendingDecisions().some((decision) => {
+        const item = decision.subjectType === "ChangeSet" ? store.getChangeSet(decision.subjectId) : null;
+        return !!item && (!requested || changeName(item) === semanticSlug(requested));
+      }));
+      if (decisionAlsoMatches) {
+        throw new Error(requested
+          ? `The pending plan and a decision both name ${semanticSlug(requested)}. Use /merro approve plan ${semanticSlug(requested)} or /merro approve decision ${semanticSlug(requested)}.`
+          : "A plan and a decision are both waiting. Use /merro approve plan or /merro approve decision <change>.");
+      }
+      const started = await this.approveObjective(requested);
+      await this.runPass();
+      return `Working: ${started.changeSets.map(changeName).join(", ")}.`;
+    }
+    return this.resolveDecisionForChange(requested, true);
   }
 
   async restartChange(name: string, requirements: string): Promise<void> {
@@ -950,6 +1049,7 @@ export class MainOrchestrator {
     await this.#withStore(async (store) => {
       let item = store.listChangeSets().find((item) => item.slug === semanticSlug(name));
       if (!item || terminal(item)) throw new Error("No active change matches that name.");
+      this.#rearmNotifications(changeName(item)); // A user action starts a new conversation about the change.
       if (!store.hasActiveObjectiveForChangeSet(item.id)) throw new Error("The objective is stopped. Approve a new plan first.");
       const { projectSlug, slug } = item;
       const assertWorkerSafety = async () => {
@@ -992,7 +1092,8 @@ export class MainOrchestrator {
     await this.runPass();
   }
 
-  async resolveDecisionForChange(name: string | undefined, approved: boolean): Promise<string> {
+  /** `accepted` fires once the approval is spent on a selected Decision; selection failures leave the user's reply usable. */
+  async resolveDecisionForChange(name: string | undefined, approved: boolean, options: { repliedAt?: number; accepted?: () => void } = {}): Promise<string> {
     const requested = name?.trim() || undefined;
     const alreadyMerged = () => this.#withStore((store) => {
       const exact = requested ? store.getChangeSet(requested) : null;
@@ -1011,14 +1112,24 @@ export class MainOrchestrator {
     } catch (error) {
       if (approved) {
         const message = await alreadyMerged();
-        if (message) return message;
+        if (message) { options.accepted?.(); return message; }
       }
       throw error;
     }
-    const kind = await this.#withStore((store) => store.getDecision(decisionId)?.kind);
+    const decision = await this.#withStore((store) => store.getDecision(decisionId));
+    const subject = decision && await this.#withStore((store) => store.getChangeSet(decision.subjectId));
+    if (subject) this.#rearmNotifications(changeName(subject)); // A user action starts a new conversation about the change.
+    if (!approved && decision?.kind === "worker_settings") {
+      const { objective } = decision.payload as { objective: string };
+      throw new Error(`New work waits for worker settings. Approve: /merro approve ${semanticSlug(requested ?? "") || "<change>"} · Skip: /merro stop ${objective}`);
+    }
+    if (approved && options.repliedAt !== undefined && decision && Date.parse(decision.createdAt) >= options.repliedAt) throw new StaleApprovalError();
+    options.accepted?.();
+    const kind = decision?.kind;
     let localMergeOutcome: LocalMergeOutcome | undefined;
     try {
       if (kind === "merge_conflict") await this.resolveMergeConflictDecision(decisionId, approved ? "resolved" : "abandon");
+      else if (kind === "worker_settings") await this.#resolveWorkerSettingsDecision(decisionId);
       else if (kind === "local_merge") localMergeOutcome = await this.resolveLocalMergeDecision(decisionId, approved);
       else await this.resolveMergeDecision(decisionId, approved);
     } catch (error) {
@@ -1035,6 +1146,7 @@ export class MainOrchestrator {
       return item && runtime ? { name: changeName(item), state: item.state, pr: runtime.pullRequestNumber, targetBranch: item.targetBranch } : null;
     });
     if (!resolved) return "Decision resolved.";
+    if (kind === "worker_settings") return `Approved worker settings for ${resolved.name}.`;
     if (kind === "local_merge") {
       if (!approved) return `Local merge declined for ${resolved.name}; no changes applied.`;
       if (localMergeOutcome === "done") return `Applied locally: ${resolved.name} · ${resolved.targetBranch}.`;
@@ -1144,6 +1256,7 @@ export class MainOrchestrator {
       return { name: changeName(item) };
     });
     if ("message" in result) return result.message;
+    this.#rearmNotifications(result.name); // A user action starts a new conversation about the change.
     await this.runPass();
     return `Retrying ${result.name}.`;
   }
@@ -1253,7 +1366,7 @@ export class MainOrchestrator {
         store.resolveDecision(decisionId, "resolved");
         runtime.reviewedDiffHash = null;
         store.saveChangeSetRuntime(runtime);
-        this.#notify(`${changeName(item)} · Merge approval expired because the pull request changed. Review is next.`, "warning");
+        this.#progress(`${changeName(item)} · Merge approval expired because the pull request changed. Review is next.`);
         return;
       }
       if (runtime.reviewedDiffHash === null) {
@@ -1262,7 +1375,7 @@ export class MainOrchestrator {
       }
 
       mergeAttempted = true;
-      await this.#github.merge(project, runtime.pullRequestNumber, pullRequest.headRefOid, { method: this.#config.merge.method, deleteBranch: this.#config.merge.delete_branch });
+      await this.#github.merge(project, runtime.pullRequestNumber, pullRequest.headRefOid, { method: this.#config.merge.method, deleteBranch: this.#config.merge.deleteBranch });
       mergeCommandSucceeded = true;
       pullRequest = await this.#github.pullRequest(project, runtime.pullRequestNumber);
       if (!pullRequest.mergedAt) throw new Error("GitHub did not report the pull request as merged");
@@ -1399,6 +1512,10 @@ export class MainOrchestrator {
     await this.runPass();
   }
 
+  #presentationOptions() {
+    return { maxConcurrentTasks: this.#config.maxConcurrentTasks, orphanedTaskCount: this.#orphanedTaskCount };
+  }
+
   async runPass(): Promise<void> {
     // Completion hooks may query Main, so release ownership before delivering them.
     // A fresh pass rechecks worker and GitHub truth before deferred publication.
@@ -1444,6 +1561,10 @@ export class MainOrchestrator {
         const relationGates = await this.#rebuildRelations(store, unavailableProjects, orphans.changeSetIds, issueCache);
         for (const id of scopeGates) relationGates.add(id);
         for (const id of discoveredGates) relationGates.add(id);
+        this.#settleSettingsDecisions(store);
+        for (const decision of store.pendingDecisions()) {
+          if (decision.kind === "worker_settings") relationGates.add(decision.subjectId);
+        }
         for (const relation of store.listRelations()) {
           if (relation.kind !== "Requires") continue;
           const prerequisite = store.getChangeSet(relation.to);
@@ -1451,7 +1572,7 @@ export class MainOrchestrator {
             relationGates.add(relation.from);
           }
         }
-        const reviewedChangeSetIds = this.#reviewedChangeSetIds(store);
+        const reviewedChangeSetIds = currentlyReviewedIds(store);
         this.#deriveReady(store, unavailableProjects, relationGates, unsafeProjects, orphans.changeSetIds, reviewedChangeSetIds);
         const tasks = store.listTasks();
         const active = tasks.filter((task) => task.status === "active");
@@ -1464,14 +1585,18 @@ export class MainOrchestrator {
           reviewedChangeSetIds: [...reviewedChangeSetIds],
           activeTaskCount: active.length + orphans.count,
           activeChangeSetIds: [...active.map((task) => task.changeSetId), ...orphans.changeSetIds],
-          maxConcurrentTasks: this.#config.max_concurrent_tasks,
+          maxConcurrentTasks: this.#config.maxConcurrentTasks,
         });
         if (result.cycle) this.#blockCycle(store, result.cycle, new Set([...active.map((task) => task.changeSetId), ...orphans.changeSetIds]));
         for (const item of result.selected) {
+          const settingsOwner = this.#ownerNeedingSettings(store, item);
+          if (settingsOwner) { this.#askSettings(store, settingsOwner, item); continue; }
+          if (this.#reviewCapReached(store, item)) continue;
           if (item.state === "Ready") store.transitionChangeSet(item.id, "Implementing");
           await this.#launchTask(store, store.getChangeSet(item.id) ?? item, issueCache);
         }
         await this.#finishObjectives(store, unavailableProjects, unsafeProjects, issueCache);
+        this.#settleWaitingHooks(store);
       } finally {
         // Cover exceptional exits and Tasks finalized by failed launches after scheduling.
         if (finalizedTaskCount() !== inventoriedFinalizedTaskCount) {
@@ -1499,12 +1624,12 @@ export class MainOrchestrator {
       // Hooks run after ownership and serialization are released; they may query Main.
       for (const notification of notifications) {
         try {
-          await this.#commands.run("bash", ["-lc", this.#config.notify_command!], {
+          await this.#commands.run("bash", ["-lc", this.#config.notifyCommand!], {
             cwd: this.#workspacePath,
             env: { MERRO_EVENT: notification.event, MERRO_CHANGE: this.#names.get(notification.subjectId) ?? "change", MERRO_MESSAGE: publicText(notification.message, this.#names) },
           });
         } catch (error) {
-          this.#notify(`notify_command failed: ${errorText(error)}`, "warning");
+          this.#notify(`notifyCommand failed: ${errorText(error)}`, "warning");
         } finally {
           if (notification.event === "review_complete") this.#reviewNotificationsInFlight.delete(notification.subjectId);
         }
@@ -1586,7 +1711,7 @@ export class MainOrchestrator {
         ? parseImplementResult(JSON.parse(implementationTask.resultJson))
         : null;
       const instructions = role === "implement" ? await this.#repositoryInstructions(clonePath) : [];
-      const reviewedChangeSetIds = this.#reviewedChangeSetIds(store);
+      const reviewedChangeSetIds = currentlyReviewedIds(store);
       const directDependencies = store.listRelations().filter((relation) => relation.kind === "Requires" && relation.from === item.id)
         .flatMap((relation) => {
           const dependency = store.getChangeSet(relation.to);
@@ -1671,6 +1796,7 @@ export class MainOrchestrator {
       const launchInput = {
         taskId, changeSetId: item.id, changeSlug: slug, taskName, role, project, clonePath,
         taskFile: publicText(taskFile, this.#names), expectedCommit, baseUpdate, projectSettings,
+        workerSettings: store.changeSetWorkerSettings(item.id),
         ...(workerSystemPrompt ? { systemPrompt: workerSystemPrompt } : {}),
         dependencies: dependencyMounts.map(({ mount }) => mount),
       };
@@ -1760,7 +1886,7 @@ export class MainOrchestrator {
             this.#block(store, item, "project_unavailable", `Project reconciliation failed: ${cause}`);
           }
         }
-        this.#notify(`${current.slug} · Project is unavailable. Merro will retry automatically.`, "warning");
+        this.#progress(`${current.slug} · Project is unavailable. Merro will retry automatically.`);
       }
     }
     return unavailable;
@@ -1890,6 +2016,9 @@ export class MainOrchestrator {
     };
     store.createChangeSet(item);
     for (const owner of owners) store.attachChangeSet(owner.id, item.id);
+    // A reopened issue continues the change it reopened, so it keeps that change's approved worker settings.
+    const settings = store.changeSetWorkerSettings(previous.id) ?? store.objectiveWorkerSettings(owners[0]!.id);
+    if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = "OPEN";
     store.saveChangeSetRuntime(runtime);
@@ -1985,9 +2114,10 @@ export class MainOrchestrator {
         // An incomplete inventory cannot prove that a clone is unowned.
         unsafeProjects.add(project.slug);
         for (const item of store.listChangeSets().filter((candidate) => candidate.projectSlug === project.slug)) changeSetIds.add(item.id);
-        this.#notify(`${project.slug} · Merro could not inspect background work: ${errorText(error)}. New work is paused to protect changes; it will check again automatically.`, "warning");
+        this.#progress(`${project.slug} · Merro could not inspect background work: ${errorText(error)}. New work is paused to protect changes; it will check again automatically.`);
       }
     }
+    this.#orphanedTaskCount = orphanIds.size;
     return { unsafeProjects, count: orphanIds.size, changeSetIds, liveTaskIds };
   }
 
@@ -2027,13 +2157,13 @@ export class MainOrchestrator {
         } catch (inspectionError) {
           const detail = `Merro could not verify current work for ${changeName(item)}; reconciliation will retry: ${errorText(inspectionError)}`;
           if (item.issues.length) this.#blockForGitHubUnavailable(store, item, detail);
-          else this.#notify(`${changeName(item)} · Could not inspect the active work: ${errorText(inspectionError)}. Scheduling is paused; Merro will retry automatically.`, "warning");
+          else this.#progress(`${changeName(item)} · Could not inspect the active work: ${errorText(inspectionError)}. Scheduling is paused; Merro will retry automatically.`);
           continue;
         }
         if (presence.alive) {
           if (!presence.identityMatches) {
             unsafeProjects.add(item.projectSlug);
-            this.#notify(`${changeName(item)} · Merro cannot verify the current process${presence.reason ? `: ${presence.reason}` : ""}. Scheduling is paused until it can be checked safely.`, "warning");
+            this.#notify(`${changeName(item)} · Merro found background work it cannot verify as its own${presence.reason ? ` (${presence.reason})` : ""}.\n${runtime.tmuxSession ? `Inspect: tmux list-panes -t =${runtime.tmuxSession}\n` : runtime.containerId ? `Inspect: docker inspect ${runtime.containerId}\n` : ""}Merro will not adopt or stop it automatically.`, "warning");
           }
           continue;
         }
@@ -2104,10 +2234,10 @@ export class MainOrchestrator {
         const clonePath = store.getChangeSetRuntime(item.id)?.clonePath;
         if (needed || !clonePath) continue;
         try {
-          await this.#git.deleteClone(join(this.#workspacePath, this.#config.worktreesDir), clonePath);
+          await this.#git.deleteClone(this.#cloneRoot(item, clonePath), clonePath);
           store.appendEvent("ChangeSet", item.id, "dependency_clone_cleanup_complete", {});
         } catch (error) {
-          this.#notify(`${changeName(item)} · Dependency clone cleanup failed: ${errorText(error)}. Merro will retry automatically.`, "warning");
+          this.#progress(`${changeName(item)} · Dependency clone cleanup failed: ${errorText(error)}. Merro will retry automatically.`);
         }
       }
     }
@@ -2131,7 +2261,7 @@ export class MainOrchestrator {
         store.markTaskCleanupCompleted(task.id);
       } catch (error) {
         const item = store.getChangeSet(task.changeSetId);
-        this.#notify(`${item ? changeName(item) : "A completed change"} · Cleanup failed: ${errorText(error)}. Merro will retry automatically.`, "warning");
+        this.#progress(`${item ? changeName(item) : "A completed change"} · Cleanup failed: ${errorText(error)}. Merro will retry automatically.`);
       }
     }
   }
@@ -2199,10 +2329,8 @@ export class MainOrchestrator {
       workRuntime.reviewRound += 1;
       store.saveChangeSetRuntime(workRuntime);
       store.transitionChangeSet(item.id, "Implementing");
-      const limit = this.#reviewLimit(store, item);
-      if (limit !== "unlimited" && workRuntime.reviewRound >= limit) {
-        this.#block(store, item, "review_cap", `Reached review cap. Blocking findings:\n${review.findings.filter((finding) => finding.severity === "blocking").map((finding) => `- ${finding.summary}`).join("\n")}`);
-      }
+      // An unapproved limit is settled before the next worker; see #reviewCapReached.
+      this.#reviewCapReached(store, store.getChangeSet(item.id) ?? item);
       return;
     }
 
@@ -2542,9 +2670,16 @@ export class MainOrchestrator {
     store.transitionChangeSet(item.id, "PublishBlocked", reason);
     if (automaticRetry && previous?.reason === reason && previous.detail === detail) return;
     store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable: true });
-    const view = presentWorkspace(store).changes.find((change) => change.name === changeName(item));
+    const view = presentWorkspace(store, this.#presentationOptions()).changes.find((change) => change.name === changeName(item));
     const pr = store.getChangeSetRuntime(item.id)?.pullRequestNumber;
-    const message = `${changeName(item)}\nBlocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "Merro could not open the pull request."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
+    // Merro-owned waiting needs no one: show it transiently, never as a permanent notification. Hooks still get the event.
+    if (view?.status === "Waiting") {
+      const waiting = `${changeName(item)} · Waiting · ${view.summary}`;
+      this.#progress(waiting);
+      if (this.#firstWaitingHook(item, reason)) this.#queueNotification("publication_blocked", item.id, `${waiting}\nDetails: ${detail}`);
+      return;
+    }
+    const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "Merro could not open the pull request."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
     this.#notify(message, "warning");
     this.#queueNotification("publication_blocked", item.id, `${message}\nDetails: ${detail}`);
   }
@@ -2778,7 +2913,7 @@ export class MainOrchestrator {
           },
         });
         if (autoReady) {
-          this.#notify(`${changeName(item)} · Review passed and GitHub checks are green. Merging PR #${pullRequest.number} (${this.#config.merge.method}).`);
+          this.#progress(`${changeName(item)} · Review passed and GitHub checks are green. Merging PR #${pullRequest.number} (${this.#config.merge.method}).`);
           await this.#executeMergeDecision(store, decisionId, true);
           continue;
         }
@@ -2798,7 +2933,7 @@ export class MainOrchestrator {
     if (terminal(current)) return;
     if (current.state === "Blocked") {
       if (current.blockedReason !== "github_unavailable" || !current.blockedResumeState) {
-        this.#notify(`${changeName(current)} remains blocked. Merro will check again automatically.`, "warning");
+        this.#progress(`${changeName(current)} remains blocked. Merro will check again automatically.`);
         return;
       }
       store.transitionChangeSet(current.id, current.blockedResumeState);
@@ -2823,7 +2958,7 @@ export class MainOrchestrator {
     if (item.state !== "AwaitingApproval") store.transitionChangeSet(item.id, "AwaitingApproval");
     if (shouldNotify) {
       const message = `${changeName(item)} · Awaiting required team review for PR #${pullRequest.number}. GitHub requires review from a configured team for files changed by this PR. Merro will continue automatically once GitHub reports the merge requirement satisfied.`;
-      this.#notify(message, "warning");
+      this.#progress(message);
       this.#queueNotification("team_review_pending", item.id, message);
     }
   }
@@ -2872,7 +3007,7 @@ export class MainOrchestrator {
     if (runtime.clonePath && neededReviewedCheckout) store.appendEvent("ChangeSet", item.id, "dependency_clone_retained", {});
     if (runtime.clonePath && this.#git.deleteClone && !unsafeProjects.has(item.projectSlug) && !neededReviewedCheckout) {
       try {
-        await this.#git.deleteClone(this.#workRoot, runtime.clonePath);
+        await this.#git.deleteClone(this.#cloneRoot(item, runtime.clonePath), runtime.clonePath);
       } catch (error) {
         this.#notify(`${changeName(item)} is done, but Merro could not remove its working copy: ${errorText(error)}. Remove it manually if disk space is a concern.`, "warning");
       }
@@ -2954,43 +3089,15 @@ export class MainOrchestrator {
       } catch (error) {
         gated.add(item.id);
         const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
-        this.#notify(`${changeName(item)} · Merro could not refresh dependency information. It will retry automatically. Details: ${detail}`, "warning");
+        this.#progress(`${changeName(item)} · Merro could not refresh dependency information. It will retry automatically. Details: ${detail}`);
       }
     }
     store.rebuildAutomaticRelations(analyzed, relations, [...occupiedChangeSetIds]);
     return gated;
   }
 
-  #reviewedChangeSetIds(store: MerroStore): Set<string> {
-    const reviewedStates = new Set(["Reviewed", "Publishing", "AwaitingMerge", "AwaitingApproval", "AwaitingLocalMerge", "PublishBlocked", "Done"]);
-    const ids = new Set<string>();
-    for (const item of store.listChangeSets()) {
-      const blockedAfterReview = item.state === "Blocked" && item.blockedResumeState !== null
-        && reviewedStates.has(item.blockedResumeState);
-      if (!reviewedStates.has(item.state) && !blockedAfterReview) continue;
-      const latestReview = store.listTasks(item.id).filter((task) => task.role === "review").at(-1);
-      if (latestReview?.outcome === "pass" && latestReview.reviewedCommit) ids.add(item.id);
-    }
-    // A passing review based on stale prerequisites cannot unlock further work.
-    const relations = store.listRelations();
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const relation of relations) {
-        if (relation.kind !== "Requires" || relation.gate !== "reviewed" || !ids.has(relation.from)
-          || store.getChangeSet(relation.from)?.state === "Done") continue;
-        const review = store.listTasks(relation.to).filter((task) => task.role === "review").at(-1);
-        if (!ids.has(relation.to) || !relation.consumedReviewedCommit || relation.consumedReviewedCommit !== review?.reviewedCommit) {
-          ids.delete(relation.from);
-          changed = true;
-        }
-      }
-    }
-    return ids;
-  }
-
   #reconcileReviewedDependencies(store: MerroStore, unsafeProjects: ReadonlySet<string>): Set<string> {
-    const eligible = this.#reviewedChangeSetIds(store);
+    const eligible = currentlyReviewedIds(store);
     const stale = new Set<string>();
     for (const relation of store.listRelations()) {
       if (relation.kind !== "Requires") continue;
@@ -3020,7 +3127,7 @@ export class MainOrchestrator {
           prerequisite: relation.to, consumedCommit: relation.consumedReviewedCommit ?? null,
           currentReviewedCommit: review?.reviewedCommit ?? null,
         });
-        this.#notify(`${changeName(item)} · Approved prerequisite changed; waiting for its passing review, then revalidating with a fresh implementation and review.`, "warning");
+        this.#progress(`${changeName(item)} · Approved prerequisite changed; waiting for its passing review, then revalidating with a fresh implementation and review.`);
       }
     }
     return stale;
@@ -3072,24 +3179,67 @@ export class MainOrchestrator {
     if (!changed) return;
     if (current.state !== "Blocked" || current.blockedReason !== reason) store.transitionChangeSet(item.id, "Blocked", reason);
     store.appendEvent("ChangeSet", item.id, "blocked", { reason, detail, retryable });
-    const view = presentWorkspace(store).changes.find((change) => change.name === changeName(item));
+    const view = presentWorkspace(store, this.#presentationOptions()).changes.find((change) => change.name === changeName(item));
     const pr = store.getChangeSetRuntime(item.id)?.pullRequestNumber;
     const dependents = store.listRelations().filter((relation) => relation.kind === "Requires" && relation.to === item.id)
       .map((relation) => store.getChangeSet(relation.from)).filter((dependent): dependent is ChangeSet => dependent !== null)
       .map(changeName);
     const waiting = dependents.length ? `\nAlso waiting: ${dependents.join(", ")}.` : "";
-    const message = `${changeName(item)}\nBlocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "This change needs attention."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${waiting}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
+    // Merro-owned waiting shows transiently; hooks get the event once per block, not on every automatic recovery attempt.
+    if (view?.status === "Waiting") {
+      const text = `${changeName(item)} · Waiting · ${view.summary}`;
+      this.#progress(text);
+      if (this.#firstWaitingHook(item, reason)) this.#queueNotification("blocked", item.id, `${text}${detail ? `\nDetails: ${detail}` : ""}`);
+      return;
+    }
+    const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "This change needs attention."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${waiting}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
+    // The guard above already proves this block is new, even when its text matches an earlier one.
+    this.#notifiedBySubject.delete(publicText(changeName(item), this.#names));
     this.#notify(message, "warning");
     this.#queueNotification("blocked", item.id, `${message}${detail ? `\nDetails: ${detail}` : ""}`);
   }
 
-  #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" {
-    const limits = store.listObjectives()
-      .filter((objective) => objective.state === "Active"
-        && store.listChangeSets(objective.id, true).some((changeSet) => changeSet.id === item.id))
-      .map((objective) => objective.maxReviewRounds ?? this.#config.max_review_rounds);
+  /** Notification dedupe is per subject; a user action on one change never re-shows warnings about others. */
+  #rearmNotifications(change: string): void {
+    this.#notifiedBySubject.delete(publicText(change, this.#names));
+  }
+
+  /**
+   * True once per block shown as Waiting. Keyed by reason, not detail: transient gh errors carry varying text,
+   * and recovery attempts re-block every pass.
+   */
+  #firstWaitingHook(item: ChangeSet, reason: string): boolean {
+    if (this.#waitingHooked.get(item.id) === reason) return false;
+    this.#waitingHooked.set(item.id, reason);
+    return true;
+  }
+
+  /** A pass that ends with the change no longer blocked for that reason ends the block, so a later one is delivered again. */
+  #settleWaitingHooks(store: MerroStore): void {
+    for (const [id, reason] of this.#waitingHooked) {
+      const item = store.getChangeSet(id);
+      if (!item || (item.state !== "Blocked" && item.state !== "PublishBlocked") || item.blockedReason !== reason) this.#waitingHooked.delete(id);
+    }
+  }
+
+  /** The strictest approved limit; null while an owner has none approved, which never falls back to live config. */
+  #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" | null {
+    const limits = this.#activeOwners(store, item).map((objective) => objective.maxReviewRounds ?? null);
+    if (limits.includes(null)) return null;
     if (limits.length === 0 || limits.every((limit) => limit === "unlimited")) return "unlimited";
-    return Math.min(...limits.filter((limit): limit is number => limit !== "unlimited"));
+    return Math.min(...limits.filter((limit): limit is number => limit !== null && limit !== "unlimited"));
+  }
+
+  /** Blocks rejected work that used its approved review rounds, so no implementer starts past the cap. */
+  #reviewCapReached(store: MerroStore, item: ChangeSet): boolean {
+    const round = store.getChangeSetRuntime(item.id)?.reviewRound ?? 0;
+    const limit = this.#reviewLimit(store, item);
+    if (item.state !== "Implementing" || round === 0 || limit === null || limit === "unlimited" || round < limit) return false;
+    const review = store.listTasks(item.id).filter((task) => task.role === "review" && task.outcome === "reject").at(-1);
+    let findings: Array<{ severity?: string; summary?: string }> = [];
+    try { findings = (JSON.parse(review?.resultJson ?? "{}") as { findings?: typeof findings }).findings ?? []; } catch { /* findings stay in /merro <change> */ }
+    this.#block(store, item, "review_cap", `Reached review cap. Blocking findings:\n${findings.filter((finding) => finding.severity === "blocking").map((finding) => `- ${finding.summary}`).join("\n")}`);
+    return true;
   }
 
   #reviewContext(json: string): string {
@@ -3129,7 +3279,7 @@ export class MainOrchestrator {
   }
 
   #queueNotification(event: string, subjectId: string, message: string): void {
-    if (this.#config.notify_command?.trim()) {
+    if (this.#config.notifyCommand?.trim()) {
       this.#pendingNotifications.push({ event, subjectId, message });
       if (event === "review_complete") this.#reviewNotificationsInFlight.add(subjectId);
     }
@@ -3145,10 +3295,87 @@ export class MainOrchestrator {
     this.#progress(`${changeName(item)} · The pull request's base changed; Merro is rechecking the changes.`);
   }
 
+  /** Active Objectives whose approved scope includes the ChangeSet, highest priority first. */
+  #activeOwners(store: MerroStore, item: ChangeSet): Objective[] {
+    return store.listObjectives()
+      .filter((objective) => objective.state === "Active" && store.listChangeSets(objective.id, true).some((owned) => owned.id === item.id))
+      .sort((left, right) => priorityRank(left.priority) - priorityRank(right.priority));
+  }
+
+  /**
+   * Work approved before Merro snapshotted settings (schema 22 and earlier) has none, and live config was never approved for it.
+   * The ChangeSet takes an owner's worker snapshot when one exists; otherwise the returned owner must approve settings
+   * before another worker starts. An owner without a review-round snapshot needs the same approval.
+   */
+  #ownerNeedingSettings(store: MerroStore, item: ChangeSet): Objective | null {
+    const owners = this.#activeOwners(store, item);
+    if (!store.changeSetWorkerSettings(item.id)) {
+      const snapshot = owners.map((owner) => store.objectiveWorkerSettings(owner.id)).find((settings) => settings !== null);
+      if (snapshot) store.claimChangeSetWorkerSettings(item.id, snapshot);
+    }
+    return owners.find((owner) => owner.maxReviewRounds === null || owner.maxReviewRounds === undefined)
+      ?? (store.changeSetWorkerSettings(item.id) ? null : owners[0] ?? null);
+  }
+
+  /** Settings requests end once their Objective no longer needs to answer them: settings arrived another way, it stopped, or the change finished. */
+  #settleSettingsDecisions(store: MerroStore): void {
+    for (const decision of store.pendingDecisions()) {
+      if (decision.kind !== "worker_settings") continue;
+      const item = store.getChangeSet(decision.subjectId);
+      const owner = item && !terminal(item) ? this.#ownerNeedingSettings(store, item) : null;
+      const asked = decision.payload as { objectiveId?: string; settings?: WorkerSettings };
+      const current = item && store.changeSetWorkerSettings(item.id);
+      // A request whose change gained other settings would approve settings the change will not use; ask again.
+      const outdated = current && JSON.stringify(current) !== JSON.stringify(asked.settings);
+      if (owner?.id !== asked.objectiveId || outdated) store.resolveDecision(decision.id, "resolved");
+    }
+  }
+
+  #askSettings(store: MerroStore, objective: Objective, item: ChangeSet): void {
+    if (store.pendingDecisions().some((decision) => decision.kind === "worker_settings" && decision.subjectId === item.id)) return;
+    const settings: WorkerSettings = store.changeSetWorkerSettings(item.id) ?? store.objectiveWorkerSettings(objective.id)
+      ?? { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
+    const maxReviewRounds = objective.maxReviewRounds ?? this.#config.maxReviewRounds;
+    const objectiveSlug = objectiveName(objective.goal);
+    // One notification per Objective: approving any of its changes answers for all of them.
+    const alreadyAsked = store.pendingDecisions().some((decision) => decision.kind === "worker_settings"
+      && (decision.payload as { objectiveId?: string }).objectiveId === objective.id);
+    store.createDecision({
+      id: randomUUID(), subjectType: "ChangeSet", subjectId: item.id, kind: "worker_settings",
+      payload: { objectiveId: objective.id, objective: objectiveSlug, settings, maxReviewRounds },
+    });
+    // A request raised again after an earlier one settled is new, even when its text matches.
+    if (!alreadyAsked) this.#rearmNotifications(changeName(item));
+    if (!alreadyAsked) this.#notify(`${changeName(item)} · Needs you\n\n${objectiveSlug} was approved before Merro recorded its worker settings. Start its work with ${workerSettingsText(settings)}, ${reviewRoundsText(maxReviewRounds)}?\nApprove: /merro approve ${changeName(item)} · Skip: /merro stop ${objectiveSlug}`, "warning");
+  }
+
+  /** Approving settings for one change records them for its Objective, so its other waiting changes start too. */
+  async #resolveWorkerSettingsDecision(decisionId: string): Promise<void> {
+    await this.#withStore((store) => {
+      this.#settleSettingsDecisions(store);
+      const decision = store.getDecision(decisionId);
+      const item = decision && store.getChangeSet(decision.subjectId);
+      if (decision?.state !== "pending" || decision.kind !== "worker_settings") {
+        throw new Error(`${item ? changeName(item) : "This change"} no longer needs settings approval; nothing changed.`);
+      }
+      const { objectiveId, settings, maxReviewRounds } = decision.payload as { objectiveId: string; settings: WorkerSettings; maxReviewRounds?: ReviewRoundLimit };
+      store.resolveDecision(decision.id, "approved");
+      if (!store.objectiveWorkerSettings(objectiveId)) store.saveObjectiveWorkerSettings(objectiveId, settings);
+      const objective = store.getObjective(objectiveId);
+      if (objective && (objective.maxReviewRounds === null || objective.maxReviewRounds === undefined)) {
+        store.saveObjectiveSettings(objectiveId, { maxReviewRounds: maxReviewRounds ?? this.#config.maxReviewRounds });
+      }
+      this.#settleSettingsDecisions(store);
+    });
+  }
+
   #attachIssue(store: MerroStore, objective: Objective, projectSlug: string, issue: GitHubIssue): ChangeSet {
+    // Issues entering approved scope run with the settings their Objective was approved with.
+    const settings = store.objectiveWorkerSettings(objective.id);
     const existing = store.findNonTerminalChangeSet(projectSlug, [issue.number]);
     if (existing) {
       store.attachChangeSet(objective.id, existing.id);
+      if (settings) store.claimChangeSetWorkerSettings(existing.id, settings);
       if (priorityRank(objective.priority) < priorityRank(existing.priority)) store.setChangeSetPriority(existing.id, objective.priority);
       return store.getChangeSet(existing.id)!;
     }
@@ -3160,6 +3387,7 @@ export class MainOrchestrator {
     };
     store.createChangeSet(item);
     store.attachChangeSet(objective.id, item.id);
+    if (settings) store.claimChangeSetWorkerSettings(item.id, settings);
     const runtime = emptyRuntime(item.id);
     runtime.lastIssueState = issue.state.toUpperCase();
     store.saveChangeSetRuntime(runtime);
@@ -3210,7 +3438,7 @@ export class MainOrchestrator {
             if (item.projectSlug === scope.projectSlug) schedulingGates.add(item.id);
           }
           const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
-          this.#notify(`${objectiveName(objective.goal)} · Could not refresh the approved GitHub scope for ${scope.projectSlug}. Merro will retry automatically. Details: ${detail}`, "warning");
+          this.#progress(`${objectiveName(objective.goal)} · Could not refresh the approved GitHub scope for ${scope.projectSlug}. Merro will retry automatically. Details: ${detail}`);
         }
       }
       for (const item of store.listChangeSets(objective.id)) {
@@ -3235,7 +3463,7 @@ export class MainOrchestrator {
           refreshed = false;
           schedulingGates.add(item.id);
           const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
-          this.#notify(`${changeName(item)} · Could not verify whether it is still in the approved GitHub scope. Merro will retry automatically. Details: ${detail}`, "warning");
+          this.#progress(`${changeName(item)} · Could not verify whether it is still in the approved GitHub scope. Merro will retry automatically. Details: ${detail}`);
         }
       }
       const attached = new Map<string, ChangeSet>();
@@ -3266,7 +3494,7 @@ export class MainOrchestrator {
     } catch (error) {
       for (const item of store.listChangeSets(objective.id)) schedulingGates.add(item.id);
       const detail = conciseDiagnostic(publicText(errorText(error), this.#names));
-      this.#notify(`${objectiveName(objective.goal)} · Could not refresh its approved GitHub scope. Merro will retry automatically. Details: ${detail}`, "warning");
+      this.#progress(`${objectiveName(objective.goal)} · Could not refresh its approved GitHub scope. Merro will retry automatically. Details: ${detail}`);
       return false;
     }
   }
