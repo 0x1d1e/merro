@@ -48,7 +48,7 @@ export interface WorkerLaunchInput {
   expectedCommit: string;
   baseUpdate?: BaseUpdate | null;
   projectSettings: ProjectSettingsRecord | null;
-  /** Settings snapshotted at plan approval; falls back to live config for older Objectives. */
+  /** Settings snapshotted at plan approval, or approved by the user for older Objectives. */
   workerSettings?: WorkerSettings | null;
   dependencies?: readonly WorkerDependencyMount[];
 }

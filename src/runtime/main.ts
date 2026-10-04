@@ -490,7 +490,7 @@ export class MainOrchestrator {
     this.#config = options.config;
     const notify = options.notify ?? ((message: string) => console.log(message));
     // Reconciliation re-derives the same conditions every pass; an equivalent message per subject is shown once until it changes.
-    // Progress and new blocks re-arm a subject, so a condition that recurs after its change moved on is shown again.
+    // Progress, new blocks and user actions on a change re-arm only that subject, so a condition that recurs after its change moved on is shown again.
     const lastBySubject = this.#notifiedBySubject;
     this.#notify = (message, level) => {
       const text = publicText(message, this.#names);
@@ -1039,11 +1039,11 @@ export class MainOrchestrator {
   }
 
   async restartChange(name: string, requirements: string): Promise<void> {
-    this.#notifiedBySubject.clear(); // A user action starts a new conversation about the change.
     if (!requirements.trim()) throw new Error("Describe the changed requirements for the fresh attempt.");
     await this.#withStore(async (store) => {
       let item = store.listChangeSets().find((item) => item.slug === semanticSlug(name));
       if (!item || terminal(item)) throw new Error("No active change matches that name.");
+      this.#rearmNotifications(changeName(item)); // A user action starts a new conversation about the change.
       if (!store.hasActiveObjectiveForChangeSet(item.id)) throw new Error("The objective is stopped. Approve a new plan first.");
       const { projectSlug, slug } = item;
       const assertWorkerSafety = async () => {
@@ -1088,7 +1088,6 @@ export class MainOrchestrator {
 
   /** `accepted` fires once the approval is spent on a selected Decision; selection failures leave the user's reply usable. */
   async resolveDecisionForChange(name: string | undefined, approved: boolean, options: { repliedAt?: number; accepted?: () => void } = {}): Promise<string> {
-    this.#notifiedBySubject.clear(); // A user action starts a new conversation about the change.
     const requested = name?.trim() || undefined;
     const alreadyMerged = () => this.#withStore((store) => {
       const exact = requested ? store.getChangeSet(requested) : null;
@@ -1112,6 +1111,8 @@ export class MainOrchestrator {
       throw error;
     }
     const decision = await this.#withStore((store) => store.getDecision(decisionId));
+    const subject = decision && await this.#withStore((store) => store.getChangeSet(decision.subjectId));
+    if (subject) this.#rearmNotifications(changeName(subject)); // A user action starts a new conversation about the change.
     if (!approved && decision?.kind === "worker_settings") {
       const { objective } = decision.payload as { objective: string };
       throw new Error(`New work waits for worker settings. Approve: /merro approve ${semanticSlug(requested ?? "") || "<change>"} · Skip: /merro stop ${objective}`);
@@ -1196,7 +1197,6 @@ export class MainOrchestrator {
   }
 
   async retryChangeSet(name?: string): Promise<string> {
-    this.#notifiedBySubject.clear(); // A user action starts a new conversation about the change.
     const result = await this.#withStore((store) => {
       const requested = name?.trim() || undefined;
       const changes = store.listChangeSets();
@@ -1250,6 +1250,7 @@ export class MainOrchestrator {
       return { name: changeName(item) };
     });
     if ("message" in result) return result.message;
+    this.#rearmNotifications(result.name); // A user action starts a new conversation about the change.
     await this.runPass();
     return `Retrying ${result.name}.`;
   }
@@ -1584,6 +1585,7 @@ export class MainOrchestrator {
         for (const item of result.selected) {
           const settingsOwner = this.#ownerNeedingSettings(store, item);
           if (settingsOwner) { this.#askSettings(store, settingsOwner, item); continue; }
+          if (this.#reviewCapReached(store, item)) continue;
           if (item.state === "Ready") store.transitionChangeSet(item.id, "Implementing");
           await this.#launchTask(store, store.getChangeSet(item.id) ?? item, issueCache);
         }
@@ -2320,10 +2322,8 @@ export class MainOrchestrator {
       workRuntime.reviewRound += 1;
       store.saveChangeSetRuntime(workRuntime);
       store.transitionChangeSet(item.id, "Implementing");
-      const limit = this.#reviewLimit(store, item);
-      if (limit !== "unlimited" && workRuntime.reviewRound >= limit) {
-        this.#block(store, item, "review_cap", `Reached review cap. Blocking findings:\n${review.findings.filter((finding) => finding.severity === "blocking").map((finding) => `- ${finding.summary}`).join("\n")}`);
-      }
+      // An unapproved limit is settled before the next worker; see #reviewCapReached.
+      this.#reviewCapReached(store, store.getChangeSet(item.id) ?? item);
       return;
     }
 
@@ -3181,13 +3181,29 @@ export class MainOrchestrator {
     this.#queueNotification("blocked", item.id, `${message}${detail ? `\nDetails: ${detail}` : ""}`);
   }
 
-  #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" {
-    const limits = store.listObjectives()
-      .filter((objective) => objective.state === "Active"
-        && store.listChangeSets(objective.id, true).some((changeSet) => changeSet.id === item.id))
-      .map((objective) => objective.maxReviewRounds ?? this.#config.maxReviewRounds);
+  /** Notification dedupe is per subject; a user action on one change never re-shows warnings about others. */
+  #rearmNotifications(change: string): void {
+    this.#notifiedBySubject.delete(publicText(change, this.#names));
+  }
+
+  /** The strictest approved limit; null while an owner has none approved, which never falls back to live config. */
+  #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" | null {
+    const limits = this.#activeOwners(store, item).map((objective) => objective.maxReviewRounds ?? null);
+    if (limits.includes(null)) return null;
     if (limits.length === 0 || limits.every((limit) => limit === "unlimited")) return "unlimited";
-    return Math.min(...limits.filter((limit): limit is number => limit !== "unlimited"));
+    return Math.min(...limits.filter((limit): limit is number => limit !== null && limit !== "unlimited"));
+  }
+
+  /** Blocks rejected work that used its approved review rounds, so no implementer starts past the cap. */
+  #reviewCapReached(store: MerroStore, item: ChangeSet): boolean {
+    const round = store.getChangeSetRuntime(item.id)?.reviewRound ?? 0;
+    const limit = this.#reviewLimit(store, item);
+    if (item.state !== "Implementing" || round === 0 || limit === null || limit === "unlimited" || round < limit) return false;
+    const review = store.listTasks(item.id).filter((task) => task.role === "review" && task.outcome === "reject").at(-1);
+    let findings: Array<{ severity?: string; summary?: string }> = [];
+    try { findings = (JSON.parse(review?.resultJson ?? "{}") as { findings?: typeof findings }).findings ?? []; } catch { /* findings stay in /merro <change> */ }
+    this.#block(store, item, "review_cap", `Reached review cap. Blocking findings:\n${findings.filter((finding) => finding.severity === "blocking").map((finding) => `- ${finding.summary}`).join("\n")}`);
+    return true;
   }
 
   #reviewContext(json: string): string {

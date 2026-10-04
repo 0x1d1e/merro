@@ -5885,6 +5885,89 @@ test("work approved before settings snapshots waits for settings and a review li
   try { assert.equal(store.getObjective(objective.id)?.maxReviewRounds, 5); } finally { store.close(); }
 });
 
+test("a review running across the settings upgrade uses only the review limit the user approved", async (t) => {
+  for (const [shown, live, capped] of [[1, 5, true], [5, 1, false]] as const) {
+    await t.test(`shown ${shown}, live ${live}`, async (t) => {
+      let review: WorkerLaunchInput | undefined;
+      const harness = await createHarness(t, {
+        inspect: async () => ({ alive: true, identityMatches: true, reason: null }),
+        result(input, _number, result) {
+          if (input.role !== "review") return result;
+          review = input;
+          return null;
+        },
+      });
+      const { objective } = await harness.main.startObjective({ goal: "Legacy", projectSlugs: ["example"], issues: [{ projectSlug: "example", numbers: [7] }] });
+      await harness.main.runPass();
+      await harness.main.runPass();
+      assert.equal(harness.launches.map((launch) => launch.role).join(","), "implement,review");
+      forgetApprovedSettings(harness.workspacePath);
+      harness.config.maxReviewRounds = shown;
+      const main = harness.restartMain();
+      // The review that started before the upgrade now rejects.
+      await writeFile(join(harness.workspacePath, "worker-results", review!.taskId, "result.json"), JSON.stringify({ task_id: review!.taskId, status: "reject", summary: "A blocking issue remains.", reviewed_commit: review!.expectedCommit, findings: [{ severity: "blocking", summary: "Handle the empty response." }], verification: [] }));
+      await main.runPass();
+      const waiting = await main.statusSnapshot();
+      assert.equal(waiting.changeSets[0]?.state, "Implementing");
+      assert.equal(waiting.changeSets[0]?.blockedReason, null);
+      assert.deepEqual((await main.publicSnapshot()).changes.map((change) => change.reason), ["worker settings"]);
+      assert.ok(harness.notifications.at(-1)?.includes(`up to ${shown} review round${shown === 1 ? "" : "s"}?`), harness.notifications.at(-1));
+      assert.equal(harness.launches.length, 2);
+
+      harness.config.maxReviewRounds = live;
+      await main.resolveDecisionForChange("issue-7-for-example", true);
+      await main.runPass();
+      const store = new MerroStore(join(harness.workspacePath, ".merro", "state.db"));
+      try { assert.equal(store.getObjective(objective.id)?.maxReviewRounds, shown); } finally { store.close(); }
+      const after = await main.statusSnapshot();
+      if (capped) {
+        assert.equal(after.changeSets[0]?.blockedReason, "review_cap");
+        assert.match(harness.notifications.at(-1) ?? "", /Reached review cap[\s\S]*Handle the empty response/);
+        assert.equal(harness.launches.length, 2);
+      } else {
+        assert.equal(after.changeSets[0]?.state, "Implementing");
+        assert.equal(harness.launches.map((launch) => launch.role).join(","), "implement,review,implement");
+      }
+    });
+  }
+});
+
+test("a user action on one change does not repeat warnings already shown for other changes", async (t) => {
+  for (const action of ["approve", "retry", "restart"] as const) {
+    await t.test(action, async (t) => {
+      // app's worker stays unverifiable, so every pass re-derives its warning; lib reaches its review cap or waits for settings.
+      const harness = await createHarness(t, {
+        projects: [{ slug: "app", issueNumbers: [1] }, { slug: "lib", issueNumbers: [5] }],
+        inspect: async () => ({ alive: true, identityMatches: false, reason: "foreign pane" }),
+        result(input, _number, result) {
+          if (input.project.slug === "app") return null;
+          if (input.role !== "review") return result;
+          return { task_id: input.taskId, status: "reject", summary: "A blocking issue remains.", reviewed_commit: input.expectedCommit, findings: [{ severity: "blocking", summary: "Fix it." }], verification: [] };
+        },
+      });
+      await harness.main.startObjective({ goal: "App", projectSlugs: ["app"], issues: [{ projectSlug: "app", numbers: [1] }] });
+      const libObjective = await harness.main.startObjective({ goal: "Lib", projectSlugs: ["lib"], issues: [{ projectSlug: "lib", numbers: [5] }], maxReviewRounds: 1 });
+      if (action === "approve") {
+        const database = new DatabaseSync(join(harness.workspacePath, ".merro", "state.db"));
+        try { database.prepare("UPDATE objective_settings SET worker_settings_json = NULL, max_review_rounds = NULL WHERE objective_id = ?").run(libObjective.objective.id); }
+        finally { database.close(); }
+      }
+      await harness.main.runPass();
+      await harness.main.runPass();
+      await harness.main.runPass();
+      const lib = (await harness.main.statusSnapshot()).changeSets.find((item) => item.projectSlug === "lib")!;
+      if (action !== "approve") assert.equal(lib.blockedReason, "review_cap");
+      const warnings = () => harness.notifications.filter((message) => message.includes("cannot verify as its own")).length;
+      assert.equal(warnings(), 1, harness.notifications.join("\n---\n"));
+      if (action === "approve") assert.equal(await harness.main.resolveDecisionForChange(lib.slug, true), `Approved worker settings for ${lib.slug}.`);
+      else if (action === "retry") assert.match(await harness.main.retryChangeSet(lib.slug), /^Retrying/);
+      else await harness.main.restartChange(lib.slug, "Use the new requirements.");
+      await harness.main.runPass();
+      assert.equal(warnings(), 1, harness.notifications.join("\n---\n"));
+    });
+  }
+});
+
 test("a settings request ends when another owner supplies settings, and moves to the remaining owner when its Objective stops", async (t) => {
   for (const scenario of ["supplied", "stopped"] as const) {
     await t.test(scenario, async (t) => {

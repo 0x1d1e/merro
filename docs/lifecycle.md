@@ -29,7 +29,7 @@ idle unfinished work -> Obsolete | Cancelled
 
 Successful implementation requires at least one reported verification command, all with zero exit codes, before review. Main validates result and commit integrity; it does not independently rerun repository CI. Manual-only results cannot unlock review.
 
-Review receives all issue contents and acceptance criteria, complete base-to-head diff, latest successful implementation summary/verification, prior findings, guidance and repository instructions. No implementer conversation history. Rejection is not a Task failure; its findings go to a fresh implementer on the same branch. `maxReviewRounds` defaults to 3. At the cap, Blocked(review_cap); explicit continuation grants a new round.
+Review receives all issue contents and acceptance criteria, complete base-to-head diff, latest successful implementation summary/verification, prior findings, guidance and repository instructions. No implementer conversation history. Rejection is not a Task failure; its findings go to a fresh implementer on the same branch. `maxReviewRounds` defaults to 3. The cap is the strictest approved limit among active owners, checked before the next implementer starts; at the cap, Blocked(review_cap); explicit continuation grants a new round. While an owner has no approved limit, a rejection still returns the change to Implementing, and the cap is decided only after the user approves one.
 
 Changed requirements require stopping the exact owned Worker, confirming exit, cancelling its Task and restoring the attempt base before launching a fresh implementer. Never send steering input to a running Worker. Finalized Task commits/history remain immutable.
 
