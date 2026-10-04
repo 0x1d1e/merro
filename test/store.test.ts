@@ -72,6 +72,30 @@ test("v18 migration adds reviewed-dependency metadata and separates pending Deci
   } finally { migrated.close(); }
 });
 
+test("atomically commits nested store writes together or not at all", () => {
+  const store = makeStore();
+  const change: Parameters<MerroStore["createChangeSet"]>[0] = { id: "c", projectSlug: "p", slug: "c", issues: [{ projectSlug: "p", number: 1 }], generation: 1, state: "Ready", priority: "normal", readySince: null, blockedReason: null, blockedResumeState: null };
+  try {
+    assert.throws(() => store.atomically(() => {
+      store.createObjective({ id: "o1", goal: "o1", priority: "normal", state: "Active", projectSlugs: ["p"] });
+      store.createChangeSet(change);
+      throw new Error("later step failed");
+    }), /later step failed/);
+    assert.equal(store.listObjectives().length, 0);
+    assert.equal(store.getChangeSet("c"), null);
+    // A failed nested write rolls back only itself; the surrounding transaction still commits.
+    store.atomically(() => {
+      store.createChangeSet(change);
+      assert.throws(() => store.createChangeSet(change));
+      store.createObjective({ id: "o2", goal: "o2", priority: "normal", state: "Active", projectSlugs: ["p"] });
+    });
+    assert.deepEqual(store.listObjectives().map((objective) => objective.id), ["o2"]);
+    assert.ok(store.getChangeSet("c"));
+  } finally {
+    store.close();
+  }
+});
+
 test("store enforces one non-terminal generation per source", () => {
   const store = makeStore();
   try {

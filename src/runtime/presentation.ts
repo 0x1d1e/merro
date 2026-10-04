@@ -68,7 +68,8 @@ function reviewResult(tasks: Task[]): "passed" | "changes requested" | "not revi
 type BlockView = { summary: string; next: string | null; waitingKind?: "github_availability" | "worker_exit" };
 
 /** Merro-owned conditions carry `waitingKind`: no `Next:` and no user command. */
-function blockMessage(reason: BlockReason, detail: string, retryable: boolean | null, name: string, reviewPassed = false, localDelivery = false): BlockView {
+/** `awaitingPublication`: review passed and the work has not reached a pull request yet. */
+function blockMessage(reason: BlockReason, detail: string, retryable: boolean | null, name: string, awaitingPublication = false, localDelivery = false): BlockView {
   if (reason === "policy_unknown") {
     const rule = detail.match(/unsupported (?:merge requirement|branch rule) '([^']+)'/i)?.[1];
     if (retryable === false) return {
@@ -79,7 +80,7 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
   }
   if (reason === "github_unavailable" || reason === "project_unavailable") {
     if (localDelivery && reason === "project_unavailable") return { summary: "The canonical Project checkout is unavailable.", next: "Restore the checkout; Merro continues automatically afterward." };
-    const summary = reviewPassed
+    const summary = awaitingPublication
       ? reason === "project_unavailable" ? "Review complete, publication blocked while this GitHub Project is unavailable."
         : "Review complete, publication blocked while GitHub is unavailable."
       : reason === "project_unavailable" ? "This GitHub Project is temporarily unavailable."
@@ -106,7 +107,7 @@ function blockMessage(reason: BlockReason, detail: string, retryable: boolean | 
     ? { summary: oneLine(detail) || "Local delivery is blocked.", next: `Check the canonical checkout, then /merro retry ${name}.` }
     : { summary: `GitHub could not merge this pull request: ${oneLine(detail)}`, next: `Check the pull request, then /merro retry ${name} if needed.` };
   if (reason === "publication_failed") return {
-    summary: reviewPassed ? "Review complete, publication blocked: Merro could not open or update the pull request." : "Merro could not open or update the pull request.",
+    summary: awaitingPublication ? "Review complete, publication blocked: Merro could not open or update the pull request." : "Merro could not open or update the pull request.",
     next: `See /merro ${name} for details; then /merro retry ${name} after fixing the cause.`,
   };
   if (reason === "structural_rejected") return { summary: `GitHub rejected the change: ${oneLine(detail)}`, next: `Fix the cause, then /merro retry ${name}.` };
@@ -235,7 +236,7 @@ export function presentWorkspace(store: MerroStore, options: PresentationOptions
       const latestReview = tasks.filter((task) => task.role === "review").at(-1);
       const latestBlock = store.latestBlock(item.id);
       const blocked = item.blockedReason
-        ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, changeName(item), review === "passed", item.delivery === "local")
+        ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, changeName(item), review === "passed" && !runtime?.pullRequestNumber, item.delivery === "local")
         : null;
       const waiting = waitingOn(item);
       const firstDependency = unfinished(item)[0];
@@ -286,7 +287,7 @@ export function presentChangeDetails(store: MerroStore, name: string, options: P
   const current = presentWorkspace(store, options).changes.find((change) => change.name === name)!;
   const latestBlock = store.latestBlock(item.id);
   const block = item.blockedReason
-    ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, name, current.review === "passed", item.delivery === "local")
+    ? blockMessage(item.blockedReason, latestBlock?.detail ?? "", latestBlock?.retryable ?? null, name, current.review === "passed" && !runtime?.pullRequestNumber, item.delivery === "local")
     : null;
   const blocked = block ? {
     message: block.summary, next: block.next,

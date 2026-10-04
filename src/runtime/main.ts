@@ -470,6 +470,8 @@ export class MainOrchestrator {
   }
   readonly #config: MerroConfig;
   readonly #notifiedBySubject = new Map<string, string>();
+  /** Block reason whose Waiting hook was delivered, per ChangeSet; kept while that block lasts, across automatic recovery attempts. */
+  readonly #waitingHooked = new Map<string, string>();
   readonly #notify: (message: string, level?: "info" | "warning" | "error") => void;
   readonly #progress: (message: string) => void;
   readonly #git: GitAdapter;
@@ -937,51 +939,54 @@ export class MainOrchestrator {
         }
       }
       await this.#validateNewExplicitRelations(store, graph.changeSets, graph.relations, explicitRelations);
-      if (proposalId !== undefined) this.#proposals.delete(proposalId);
-
-      const objective: Objective = {
-        id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
-        projectSlugs: projects.map((project) => project.slug),
-        issueScopes: approvedIssueScopes,
-        // Materialized at approval so a later config reload cannot change an approved Objective's review limit.
-        maxReviewRounds: input.maxReviewRounds ?? this.#config.maxReviewRounds,
-      };
-      store.createObjective(objective);
-      const workerSettings: WorkerSettings = { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
-      store.saveObjectiveWorkerSettings(objective.id, workerSettings);
-      this.#names.set(objective.id, objective.goal);
-      const items: ChangeSet[] = [];
-      for (const planned of graph.changeSets) {
-        if (!store.getChangeSet(planned.id)) store.createChangeSet(planned);
-        store.attachChangeSet(objective.id, planned.id);
-        store.claimChangeSetWorkerSettings(planned.id, workerSettings);
-        const item = store.getChangeSet(planned.id)!;
-        this.#names.set(item.id, changeName(item));
-        const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
-        if (!runtime.branchName) {
-          const approvedBranch = graph.branches[item.id];
-          if (!approvedBranch) throw new Error(`Approved branch is missing for ${changeName(item)}`);
-          store.saveChangeSetRuntime({ ...runtime, branchName: approvedBranch });
+      // All writes commit together, and the proposal is spent only once they have: a failure leaves no partial plan and the plan still pending.
+      const started = store.atomically(() => {
+        const objective: Objective = {
+          id: randomUUID(), goal: input.goal.trim(), priority: input.priority ?? "normal", state: "Active",
+          projectSlugs: projects.map((project) => project.slug),
+          issueScopes: approvedIssueScopes,
+          // Materialized at approval so a later config reload cannot change an approved Objective's review limit.
+          maxReviewRounds: input.maxReviewRounds ?? this.#config.maxReviewRounds,
+        };
+        store.createObjective(objective);
+        const workerSettings: WorkerSettings = { implement: { ...this.#config.workers.implementer }, review: { ...this.#config.workers.reviewer } };
+        store.saveObjectiveWorkerSettings(objective.id, workerSettings);
+        const items: ChangeSet[] = [];
+        for (const planned of graph.changeSets) {
+          if (!store.getChangeSet(planned.id)) store.createChangeSet(planned);
+          store.attachChangeSet(objective.id, planned.id);
+          store.claimChangeSetWorkerSettings(planned.id, workerSettings);
+          const item = store.getChangeSet(planned.id)!;
+          const runtime = store.getChangeSetRuntime(item.id) ?? emptyRuntime(item.id);
+          if (!runtime.branchName) {
+            const approvedBranch = graph.branches[item.id];
+            if (!approvedBranch) throw new Error(`Approved branch is missing for ${changeName(item)}`);
+            store.saveChangeSetRuntime({ ...runtime, branchName: approvedBranch });
+          }
+          if (priorityRank(objective.priority) < priorityRank(item.priority)) store.setChangeSetPriority(item.id, objective.priority);
+          items.push(store.getChangeSet(item.id)!);
         }
-        if (priorityRank(objective.priority) < priorityRank(item.priority)) store.setChangeSetPriority(item.id, objective.priority);
-        items.push(store.getChangeSet(item.id)!);
-      }
-      store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations, [], explicitRelations);
-      for (const item of items) {
-        if (item.state !== "Blocked" || item.blockedReason !== "task_failed" || item.blockedResumeState !== "Implementing") continue;
-        const latest = store.listTasks(item.id).at(-1);
-        if (latest?.role !== "implement" || latest.outcome !== "failed" || !latest.resultJson) continue;
-        let suggestions: DependencySuggestion[] | undefined;
-        try { suggestions = parseImplementResult(JSON.parse(latest.resultJson)).dependency_suggestions; } catch { continue; }
-        if (!suggestions?.length) continue;
-        const approved = suggestions.every((suggestion) => store.listRelations().some((relation) => {
-          const prerequisite = store.getChangeSet(relation.to);
-          return relation.kind === "Requires" && relation.from === item.id && (relation.gate ?? "done") === suggestion.gate
-            && prerequisite?.projectSlug === suggestion.project_slug && issueNumbers(prerequisite).includes(suggestion.issue_number);
-        }));
-        if (approved) store.transitionChangeSet(item.id, "Implementing");
-      }
-      return { objective, changeSets: items.map((item) => store.getChangeSet(item.id)!) };
+        store.rebuildAutomaticRelations(items.map((item) => item.id), automaticRelations, [], explicitRelations);
+        for (const item of items) {
+          if (item.state !== "Blocked" || item.blockedReason !== "task_failed" || item.blockedResumeState !== "Implementing") continue;
+          const latest = store.listTasks(item.id).at(-1);
+          if (latest?.role !== "implement" || latest.outcome !== "failed" || !latest.resultJson) continue;
+          let suggestions: DependencySuggestion[] | undefined;
+          try { suggestions = parseImplementResult(JSON.parse(latest.resultJson)).dependency_suggestions; } catch { continue; }
+          if (!suggestions?.length) continue;
+          const approved = suggestions.every((suggestion) => store.listRelations().some((relation) => {
+            const prerequisite = store.getChangeSet(relation.to);
+            return relation.kind === "Requires" && relation.from === item.id && (relation.gate ?? "done") === suggestion.gate
+              && prerequisite?.projectSlug === suggestion.project_slug && issueNumbers(prerequisite).includes(suggestion.issue_number);
+          }));
+          if (approved) store.transitionChangeSet(item.id, "Implementing");
+        }
+        return { objective, changeSets: items.map((item) => store.getChangeSet(item.id)!) };
+      });
+      if (proposalId !== undefined) this.#proposals.delete(proposalId);
+      for (const item of started.changeSets) this.#names.set(item.id, changeName(item));
+      this.#names.set(started.objective.id, started.objective.goal);
+      return started;
     });
   }
 
@@ -1591,6 +1596,7 @@ export class MainOrchestrator {
           await this.#launchTask(store, store.getChangeSet(item.id) ?? item, issueCache);
         }
         await this.#finishObjectives(store, unavailableProjects, unsafeProjects, issueCache);
+        this.#settleWaitingHooks(store);
       } finally {
         // Cover exceptional exits and Tasks finalized by failed launches after scheduling.
         if (finalizedTaskCount() !== inventoriedFinalizedTaskCount) {
@@ -2670,7 +2676,7 @@ export class MainOrchestrator {
     if (view?.status === "Waiting") {
       const waiting = `${changeName(item)} · Waiting · ${view.summary}`;
       this.#progress(waiting);
-      this.#queueNotification("publication_blocked", item.id, `${waiting}\nDetails: ${detail}`);
+      if (this.#firstWaitingHook(item, reason)) this.#queueNotification("publication_blocked", item.id, `${waiting}\nDetails: ${detail}`);
       return;
     }
     const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "Merro could not open the pull request."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
@@ -3179,11 +3185,11 @@ export class MainOrchestrator {
       .map((relation) => store.getChangeSet(relation.from)).filter((dependent): dependent is ChangeSet => dependent !== null)
       .map(changeName);
     const waiting = dependents.length ? `\nAlso waiting: ${dependents.join(", ")}.` : "";
-    // Merro-owned waiting shows transiently; hooks get the event once, not on every automatic recovery attempt.
+    // Merro-owned waiting shows transiently; hooks get the event once per block, not on every automatic recovery attempt.
     if (view?.status === "Waiting") {
       const text = `${changeName(item)} · Waiting · ${view.summary}`;
       this.#progress(text);
-      if (previous?.reason !== reason || previous.detail !== detail) this.#queueNotification("blocked", item.id, `${text}${detail ? `\nDetails: ${detail}` : ""}`);
+      if (this.#firstWaitingHook(item, reason)) this.#queueNotification("blocked", item.id, `${text}${detail ? `\nDetails: ${detail}` : ""}`);
       return;
     }
     const message = `${changeName(item)} · Blocked${pr ? ` · PR #${pr}` : ""}\n\n${view?.blocked?.message ?? "This change needs attention."}${view?.blocked?.next ? `\nNext: ${view.blocked.next}` : ""}${waiting}${detail ? `\nDetails: ${conciseDiagnostic(publicText(detail, this.#names))}` : ""}`;
@@ -3199,6 +3205,24 @@ export class MainOrchestrator {
   }
 
   /** The strictest approved limit; null while an owner has none approved, which never falls back to live config. */
+  /**
+   * True once per block shown as Waiting. Keyed by reason, not detail: transient gh errors carry varying text,
+   * and recovery attempts re-block every pass.
+   */
+  #firstWaitingHook(item: ChangeSet, reason: string): boolean {
+    if (this.#waitingHooked.get(item.id) === reason) return false;
+    this.#waitingHooked.set(item.id, reason);
+    return true;
+  }
+
+  /** A pass that ends with the change no longer blocked for that reason ends the block, so a later one is delivered again. */
+  #settleWaitingHooks(store: MerroStore): void {
+    for (const [id, reason] of this.#waitingHooked) {
+      const item = store.getChangeSet(id);
+      if (!item || (item.state !== "Blocked" && item.state !== "PublishBlocked") || item.blockedReason !== reason) this.#waitingHooked.delete(id);
+    }
+  }
+
   #reviewLimit(store: MerroStore, item: ChangeSet): number | "unlimited" | null {
     const limits = this.#activeOwners(store, item).map((objective) => objective.maxReviewRounds ?? null);
     if (limits.includes(null)) return null;

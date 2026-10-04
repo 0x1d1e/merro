@@ -1248,7 +1248,7 @@ interface HarnessOptions {
   scopeFailure?: (projectSlug: string) => boolean;
   ownedWorkers?: (project: Project) => Promise<OwnedWorker[]>;
   pullRequestFailure?: (number: number) => boolean;
-  pullRequestContentFailure?: () => boolean;
+  pullRequestContentFailure?: () => boolean | Error;
   deleteCloneFailure?: boolean;
   cleanupFailure?: boolean | (() => boolean);
   taskArtifacts?: boolean;
@@ -1441,7 +1441,8 @@ async function createHarness(t: test.TestContext, options: HarnessOptions = {}):
         ? { ...pullRequest, mergeable: "CONFLICTING" } : pullRequest;
     },
     async syncPullRequestContent(_project: Project, pullRequest: GitHubPullRequest, body: string, notes: string) {
-      if (options.pullRequestContentFailure?.()) throw new Error("GitHub PR content update unavailable");
+      const contentFailure = options.pullRequestContentFailure?.();
+      if (contentFailure) throw contentFailure instanceof Error ? contentFailure : new Error("GitHub PR content update unavailable");
       pullRequests.set(pullRequest.number, { ...pullRequest, body });
       reviewComments.set(pullRequest.number, notes);
     },
@@ -5468,11 +5469,14 @@ test("notifyCommand hooks still receive blocks that show as Waiting, without a p
     await t.test(kind, async (t) => {
       const hookEvents: Array<{ event: string; message: string }> = [];
       let failContentSync = false;
+      // gh stderr varies per attempt (addresses, request ids), so the same outage never repeats its text.
+      let attempt = 0;
+      const transient = () => new Error(`error connecting to api.github.com (request ${attempt++})`);
       const harness = await createHarness(t, {
         notifyCommand: "notify-test",
         commands: { async run(_file, _args, options) { hookEvents.push({ event: options?.env?.MERRO_EVENT ?? "missing", message: options?.env?.MERRO_MESSAGE ?? "" }); return { stdout: "", stderr: "" }; } },
-        publicationFailure: () => kind === "publication_blocked" ? new Error("error connecting to api.github.com") : null,
-        pullRequestContentFailure: () => failContentSync,
+        publicationFailure: () => kind === "publication_blocked" ? transient() : null,
+        pullRequestContentFailure: () => failContentSync && transient(),
       });
       await startDefaultObjective(harness.main);
       for (let pass = 0; pass < 3; pass++) await harness.main.runPass();
@@ -5490,6 +5494,19 @@ test("notifyCommand hooks still receive blocks that show as Waiting, without a p
       const delivered = hookEvents.filter((entry) => entry.event === kind);
       assert.equal(delivered.length, 1, JSON.stringify(hookEvents));
       assert.match(delivered[0]!.message, /^issue-7-for-example · Waiting · /);
+      // Only work that has not reached a PR yet is waiting to be published.
+      assert.match(delivered[0]!.message, kind === "blocked" ? /Waiting · GitHub is temporarily unavailable\./ : /Waiting · Review complete, publication blocked/);
+      if (kind === "blocked") {
+        // A later, separate outage is a new block and reaches hooks again.
+        failContentSync = false;
+        await harness.main.runPass();
+        assert.notEqual((await harness.main.publicSnapshot()).changes[0]?.status, "Waiting");
+        const [number] = [...harness.pullRequests.keys()];
+        harness.setPullRequest(number!, { body: "## Summary\n\nEdited again." });
+        failContentSync = true;
+        for (let pass = 0; pass < 2; pass++) await harness.main.runPass();
+        assert.equal(hookEvents.filter((entry) => entry.event === kind).length, 2, JSON.stringify(hookEvents));
+      }
     });
   }
 });
@@ -6140,6 +6157,31 @@ test("a user's approve stays usable when the approved plan cannot start", async 
   assert.ok(failure instanceof Error, "starting a plan whose issue closed must fail");
   assert.equal((await harness.main.statusSnapshot()).objectives.length, 0);
   assert.equal(latest, current, "the reply is still usable after a start that did not happen");
+});
+
+test("an approved plan that fails partway through starting leaves nothing behind and stays pending", async (t) => {
+  const harness = await createHarness(t, { together: true, projects: [{ slug: "kinetix", issueNumbers: [42] }] });
+  let current: { text: string; at: number } | undefined;
+  let latest: typeof current;
+  const tools = new Map<string, Parameters<MainToolAPI["registerTool"]>[0]>();
+  registerMainTools({ registerTool(tool) { tools.set(tool.name, tool); } }, harness.main,
+    { latest: () => latest, consume() { latest = undefined; }, restore(reply) { if (reply === current) latest = reply; } });
+  await tools.get("merro_propose_objective")!.execute("p", { goal: "Fix #42", change: "fix-42", project_slugs: ["kinetix"], issues: [{ project_slug: "kinetix", numbers: [42] }] });
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  current = latest = { text: "approve", at: Date.now() };
+  // The store fails after the Objective and its ChangeSet were already written.
+  const db = new DatabaseSync(join(harness.workspacePath, ".merro", "state.db"));
+  db.exec("CREATE TRIGGER fail_runtime BEFORE INSERT ON work_item_runtime BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+  const failure = await tools.get("merro_start_objective")!.execute("s", {}).then(() => null, (error: unknown) => error);
+  assert.match(String(failure), /disk full/);
+  const snapshot = await harness.main.statusSnapshot();
+  assert.equal(snapshot.objectives.length, 0, "no half-written Objective");
+  assert.equal(snapshot.changeSets.length, 0, "no half-written ChangeSet");
+  assert.equal(latest, current, "the reply is still usable");
+  db.exec("DROP TRIGGER fail_runtime");
+  db.close();
+  assert.match((await tools.get("merro_start_objective")!.execute("s", {})).content[0]?.text ?? "", /Working/, "the same approval starts the plan once the store recovers");
+  assert.equal((await harness.main.statusSnapshot()).objectives.length, 1);
 });
 
 test("the review-round limit is read when the plan is approved, not when it is proposed", async (t) => {
