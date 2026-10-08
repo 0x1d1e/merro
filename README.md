@@ -1,5 +1,10 @@
 # Merro
 
+> [!WARNING]
+> **Obsolete project**
+>
+> Merro is obsolete. With the right configuration, `pi-subagents` can achieve essentially the same workflow. Prefer `pi-subagents` for new setups.
+
 Merro is a minimal **Pi + tmux + Git** project lead. One Main Pi talks to you, plans work, and runs implementers and independent reviewers visibly in tmux. GitHub is optional.
 
 ## Quick start
